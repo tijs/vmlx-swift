@@ -3308,9 +3308,11 @@ public actor BatchEngine {
                 promptTokenIds: promptTokens,
                 input: slot.originalInput)
             var sharedPromptRederivedStates: [Int: [MLXArray]]?
+            let anchorBoundaries = slot.parameters.ssmAnchorBoundaries
             let sharedPromptAdditionalBoundaries = Array(Set(
                 slot.originalInput.cachePrefixTokenCounts
                     + [sharedPromptStripBoundary].compactMap { $0 }
+                    + anchorBoundaries
             ))
             // A path-dependent hybrid chat prompt has one canonical reusable
             // boundary: the prompt with its trailing generation scaffold

@@ -149,6 +149,16 @@ public struct GenerateParameters: Sendable {
     /// still follows `maxKVSize`). For correctness-bounded A/B only.
     public var maxKVWindowSize: Int? = nil
 
+    /// Mei patch 0005 (default OFF): additional SSM companion anchor
+    /// boundaries — absolute token offsets into the prompt — stored in
+    /// addition to the engine's own largest-boundary set. Early
+    /// transcript anchors (role-turn starts) let a mid-transcript
+    /// diverging agentic edit restore the recurrent state from the
+    /// nearest retained boundary instead of falling back to a full
+    /// prefill. Offsets are validated engine-side (0 < offset <= prompt
+    /// length; Set-deduped); [] = upstream behavior exactly.
+    public var ssmAnchorBoundaries: [Int] = []
+
     /// Runtime accelerator selection for generation.
     ///
     /// Defaults to `VMLX_ACCELERATOR` when present, otherwise `.metal`.
@@ -2878,8 +2888,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         guard originalInput.cachePromptIntent != .auxiliary else { return }
 
         var sharedPromptRederivedStates: [Int: [MLXArray]]?
+        let anchorBoundaries = cacheInitParameters?.ssmAnchorBoundaries ?? []
         let sharedPromptAdditionalBoundaries = Array(Set(
-            cachePrefixTokenCounts + [hybridStripBoundary].compactMap { $0 }
+            cachePrefixTokenCounts + [hybridStripBoundary].compactMap { $0 } + anchorBoundaries
         ))
         // When a hybrid prompt exposes a generation-suffix-stripped boundary,
         // that is the canonical cross-turn checkpoint.  Full-prompt and
