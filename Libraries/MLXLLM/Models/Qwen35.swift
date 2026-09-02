@@ -1405,6 +1405,12 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
             if layer.isLinear {
                 return MambaCache()
             }
+            // Experimental bounded-window probe (Mei patch 0004): a
+            // smaller ring bounds per-step attention cost; generation
+            // capacity still follows maxKVSize.
+            if let window = parameters?.maxKVWindowSize, window > 0 {
+                return RotatingKVCache(maxSize: window, keep: 4)
+            }
             if let maxKVSize = parameters?.maxKVSize {
                 return RotatingKVCache(maxSize: maxKVSize, keep: 4)
             }

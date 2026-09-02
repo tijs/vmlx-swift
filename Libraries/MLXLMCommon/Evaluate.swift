@@ -140,6 +140,15 @@ public struct GenerateParameters: Sendable {
     /// a multi-minute prefill tax at 45K (Mei cliff characterization).
     public var compiledDecodeMaxPromptOffset: Int? = nil
 
+    /// EXPERIMENTAL bounded-window probe: when set, rotating KV layers
+    /// size their ring to this many tokens (sink keep + recent window)
+    /// instead of `maxKVSize`. Attention then scans at most the ring
+    /// contents per decode step, making decode nearly context-independent
+    /// — at the cost of dropping context older than the window for a
+    /// full-attention model. Generation capacity is NOT reduced (that
+    /// still follows `maxKVSize`). For correctness-bounded A/B only.
+    public var maxKVWindowSize: Int? = nil
+
     /// Runtime accelerator selection for generation.
     ///
     /// Defaults to `VMLX_ACCELERATOR` when present, otherwise `.metal`.
@@ -309,6 +318,7 @@ public struct GenerateParameters: Sendable {
         enableCompiledDecode: Bool = false,
         compiledMaxCacheLength: Int? = nil,
         compiledDecodeMaxPromptOffset: Int? = nil,
+        maxKVWindowSize: Int? = nil,
         accelerationMode: AccelerationMode? = nil,
         enableCompiledBatchDecode: Bool = false,
         compiledBatchBuckets: [Int] = [1, 2, 4],
@@ -336,6 +346,7 @@ public struct GenerateParameters: Sendable {
         self.enableCompiledDecode = enableCompiledDecode
         self.compiledMaxCacheLength = compiledMaxCacheLength
         self.compiledDecodeMaxPromptOffset = compiledDecodeMaxPromptOffset
+        self.maxKVWindowSize = maxKVWindowSize
         self.accelerationMode =
             accelerationMode ?? AccelerationRuntime.requestedMode()
         self.enableCompiledBatchDecode = enableCompiledBatchDecode
