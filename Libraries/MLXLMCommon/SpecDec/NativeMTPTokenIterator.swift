@@ -836,7 +836,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let sharedPromptStripBoundary = TokenIterator.hybridStripBoundaryIndex(
                 coordinator: coordinator,
                 promptTokenIds: promptTokenIds,
-                input: originalInput)
+                input: originalInput,
+                cache: self.cache)
             let isReusablePrefixWarmup =
                 originalInput.cachePromptIntent == .reusablePrefixWarmup
             // Same canonical-boundary policy as the solo TokenIterator,

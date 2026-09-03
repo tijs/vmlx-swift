@@ -1896,6 +1896,13 @@ public struct TokenIterator: TokenIteratorProtocol {
             // leaf also owns the rotating ring companion. Pool/CCA/affine and
             // every unsupported cache type remain disk-only.
             if !coordinator.isPagedIncompatible {
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    let names = self.cache.map { String(describing: type(of: $0)) }.joined(separator: ",")
+                    var admitTrace = "[vmlx][cache/admit] cannotUse=\(cacheCannotUsePagedCoordinatorRestore(self.cache)) "
+                    admitTrace += "canUseRotatingCompanion=\(cacheCanUsePagedWithRotatingCompanion(self.cache)) "
+                    admitTrace += "incompatible=\(coordinator.isPagedIncompatible) cache=[\(names)]\n"
+                    FileHandle.standardError.write(Data(admitTrace.utf8))
+                }
                 if cacheCannotUsePagedCoordinatorRestore(self.cache) {
                     if cacheCanUsePagedWithRotatingCompanion(self.cache) {
                         coordinator.setPagedBoundaryCompanionRequired(true)
@@ -2182,7 +2189,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.hybridStripBoundary = Self.hybridStripBoundaryIndex(
             coordinator: self.cacheCoordinator,
             promptTokenIds: self.promptTokenIds,
-            input: input)
+            input: input,
+            cache: self.cache)
         self.diskSeedBoundary = Self.diskSeedBoundaryIndex(
             coordinator: self.cacheCoordinator,
             promptTokenIds: self.promptTokenIds,
@@ -2294,14 +2302,27 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// assistant's reply, so the full-prompt key never matches again, but this
     /// boundary does — it is what gives hybrid models cross-turn prefix reuse.
     ///
-    /// Returns `nil` when the boundary cannot pay for itself: dense models reuse
-    /// via the post-answer boundary, media inputs are excluded, and with every
-    /// cache tier disabled the store would be dropped. `VMLX_HYBRID_STRIPPED_STORE=0`
-    /// disables it outright.
+    /// Also emits the boundary for non-hybrid topologies that cannot serve a
+    /// growing-turn prefix match from any other tier: rotating paged
+    /// companion caches (`requiresPagedBoundaryCompanion`, mixed rotating+KV)
+    /// and standalone rotating/SWA caches (`cacheHasStandaloneRotatingWindowState`,
+    /// e.g. Gemma4 all-rotating recurrent layers, Gemma3/Mistral SWA). For
+    /// these, companion/ring state only exists at stored boundaries, so a
+    /// mid-stream paged match is impossible and the full-prompt/post-answer
+    /// disk keys never equal a growing chat turn — without this boundary they
+    /// cold-prefill every turn. Pure dense topologies (paged-served, no
+    /// ring/companion) are intentionally excluded: their paged tier already
+    /// matches any mid-stream prefix.
+    ///
+    /// Returns `nil` when the boundary cannot pay for itself: dense
+    /// paged-served models reuse via paged prefix matching, media inputs are
+    /// excluded, and with every cache tier disabled the store would be
+    /// dropped. `VMLX_HYBRID_STRIPPED_STORE=0` disables it outright.
     static func hybridStripBoundaryIndex(
         coordinator: CacheCoordinator?,
         promptTokenIds: [Int],
-        input: LMInput
+        input: LMInput,
+        cache: [any KVCache]
     ) -> Int? {
         let heuristicBoundary = coordinator?.genPromptSuffixTokens.first
             .flatMap { promptTokenIds.lastIndex(of: $0) }
@@ -2314,16 +2335,20 @@ public struct TokenIterator: TokenIteratorProtocol {
             // `error: unable to type-check this expression in reasonable time`. Each `+=` here is
             // independently trivial to check.
             var trace = "[vmlx][strip-boundary] prompt=\(promptTokenIds.count) "
-            trace += "canonical=\(canonicalBoundary.map(String.init) ?? "nil") "
-            trace += "prefixCounts=\(input.cachePrefixTokenCounts) "
-            trace += "stableCounts=\(input.cacheStablePrefixTokenCounts) "
-            trace += "genSuffixTokens=\(coordinator?.genPromptSuffixTokens ?? []) "
-            trace += "heuristic=\(heuristicBoundary.map(String.init) ?? "nil")\n"
+                        trace += "canonical=\(canonicalBoundary.map(String.init) ?? "nil") "
+                        trace += "prefixCounts=\(input.cachePrefixTokenCounts) "
+                        trace += "stableCounts=\(input.cacheStablePrefixTokenCounts) "
+                        trace += "genSuffixTokens=\(coordinator?.genPromptSuffixTokens ?? []) "
+                        trace += "heuristic=\(heuristicBoundary.map(String.init) ?? "nil") "
+                        trace += "isHybrid=\(coordinator?.isHybrid ?? false) "
+                        trace += "companion=\(coordinator?.requiresPagedBoundaryCompanion ?? false)\n"
             FileHandle.standardError.write(Data(trace.utf8))
         }
         guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
             let coordinator,
-            coordinator.isHybrid,
+            (coordinator.isHybrid
+                || coordinator.requiresPagedBoundaryCompanion
+                || cacheHasStandaloneRotatingWindowState(cache)),
             coordinator.canPersistBoundaries,
             let stripAt = canonicalBoundary ?? heuristicBoundary,
             stripAt > 0, stripAt < promptTokenIds.count,

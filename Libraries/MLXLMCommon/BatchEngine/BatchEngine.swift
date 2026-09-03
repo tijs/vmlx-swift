@@ -3306,7 +3306,8 @@ public actor BatchEngine {
             let sharedPromptStripBoundary = TokenIterator.hybridStripBoundaryIndex(
                 coordinator: coordinator,
                 promptTokenIds: promptTokens,
-                input: slot.originalInput)
+                input: slot.originalInput,
+                cache: slot.cache)
             var sharedPromptRederivedStates: [Int: [MLXArray]]?
             let anchorBoundaries = slot.parameters.ssmAnchorBoundaries
             let sharedPromptAdditionalBoundaries = Array(Set(
@@ -3644,7 +3645,8 @@ public actor BatchEngine {
                     }
                 }
 
-                // Gen-suffix-stripped cross-turn boundary (hybrid SSM).
+                // Gen-suffix-stripped cross-turn boundary (hybrid SSM + rotating
+                // companion topologies).
                 //
                 // The prompt boundary stored above ends in the chat template's
                 // generation-prompt suffix (`<|im_start|>assistant\n`, …). The
@@ -3655,7 +3657,11 @@ public actor BatchEngine {
                 // boundary the next turn DOES contain as an exact prefix is this
                 // prompt stripped back to the end of the last real (user) message,
                 // i.e. everything before the final turn-start token. Store it so
-                // hybrid multi-turn chat reuses prior prefill.
+                // hybrid multi-turn chat reuses prior prefill. Non-hybrid
+                // rotating-companion topologies (Gemma4-style mixed rotating+KV)
+                // are admitted too: their paged tier cannot serve mid-stream
+                // prefix matches (companion exists only at stored boundaries), so
+                // this stripped boundary is their only growing-turn reuse path.
                 //
                 // Correctness: KV comes from the prompt-boundary trim/re-derive;
                 // clean SSM/GatedDeltaNet state at the stripped position comes from
@@ -3674,7 +3680,9 @@ public actor BatchEngine {
                 // `cachePrefixTokenCounts` entry — gating on it silently disables
                 // the store entirely (the re-derive here is the only writer).
                 if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
-                   coordinator.isHybrid,
+                   (coordinator.isHybrid
+                       || coordinator.requiresPagedBoundaryCompanion
+                       || cacheHasStandaloneRotatingWindowState(slot.cache)),
                    let stripAt = sharedPromptStripBoundary
                 {
                     let strippedTokens = Array(promptTokens.prefix(stripAt))

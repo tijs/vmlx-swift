@@ -503,7 +503,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.hybridStripBoundary = TokenIterator.hybridStripBoundaryIndex(
             coordinator: cacheCoordinator,
             promptTokenIds: self.promptTokenIds,
-            input: input)
+            input: input,
+            cache: self.cache)
         // The boundary index is absolute; prefill only sees the suffix a
         // cache hit left over. A boundary inside the restored prefix needs
         // no capture — a stored boundary at least that long already exists
