@@ -1,5 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
+import CryptoKit
 import Foundation
 import MLX
 import MLXLMCommon
@@ -902,7 +903,7 @@ private final class Qwen4ExpQSAIndexer: Module {
         let B = x.dim(0), S = x.dim(1)
         precondition(B == 1, "qwen4_exp QSA currently supports batch size 1")
         let past = cache?.offset ?? 0
-        let qk = projection(x)
+        let qk = Qwen4ExpVerifyTile.padded(x) { projection($0) }
         let split = MLX.split(
             qk, indices: [extras.indexerNHeads * extras.indexerHeadDim], axis: -1)
         let rawKeys = split[1]
@@ -1014,13 +1015,21 @@ private final class Qwen4ExpAttention: Module {
         let past = cache?.offset ?? 0
         let sparseMask = indexer(x, cache: cache)
         let headDim = text.headDim ?? (text.hiddenSize / text.attentionHeads)
-        let qg = qProj(x).reshaped(B, S, text.attentionHeads, headDim * 2)
+        // Verify-tile (workplan W2a): the projections are row-independent
+        // weight matmuls, so their M dimension may be padded to the NAX tile
+        // and sliced back before any reshape, rope, cache, or SDPA touches
+        // the rows. Off by default; see `Qwen4ExpVerifyTile`.
+        let qg = Qwen4ExpVerifyTile.padded(x) { qProj($0) }
+            .reshaped(B, S, text.attentionHeads, headDim * 2)
             .split(parts: 2, axis: -1)
         var query = qNorm(qg[0]).transposed(0, 2, 1, 3)
         let gate = qg[1].reshaped(B, S, -1)
-        var key = kNorm(kProj(x).reshaped(B, S, text.kvHeads, headDim))
-            .transposed(0, 2, 1, 3)
-        let value = vProj(x).reshaped(B, S, text.kvHeads, headDim).transposed(0, 2, 1, 3)
+        var key = kNorm(
+            Qwen4ExpVerifyTile.padded(x) { kProj($0) }
+                .reshaped(B, S, text.kvHeads, headDim)
+        ).transposed(0, 2, 1, 3)
+        let value = Qwen4ExpVerifyTile.padded(x) { vProj($0) }
+            .reshaped(B, S, text.kvHeads, headDim).transposed(0, 2, 1, 3)
         // Media prefill passes explicit 3-channel M-RoPE positions from
         // getRopeIndex; decode after media continues from past + ropeDelta.
         // Text-only keeps the sequential cache-offset positions (offset 0).
@@ -1053,7 +1062,7 @@ private final class Qwen4ExpAttention: Module {
             queries: query, keys: key, values: value, cache: cache,
             scale: scale, mask: mask)
             .transposed(0, 2, 1, 3).reshaped(B, S, -1)
-        return oProj(output * sigmoid(gate))
+        return Qwen4ExpVerifyTile.padded(output * sigmoid(gate)) { oProj($0) }
     }
 }
 
@@ -1083,7 +1092,8 @@ private final class Qwen4ExpDecoderLayer: Module {
         if isLinear {
             _linearAttention.wrappedValue = Qwen35Language.GatedDeltaNet(
                 text, outputGateSigmoid: config.extras.outputGateType == "sigmoid",
-                fuseDecodeInputProjections: true)
+                fuseDecodeInputProjections: true,
+                verifyTilePadding: true)
         } else {
             _attention.wrappedValue = Qwen4ExpAttention(config)
         }
@@ -1433,6 +1443,14 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     @ModuleInfo(key: "mtp") private var mtp: Qwen4ExpMTPModule?
     @ModuleInfo(key: "visual") private var visionModel: Qwen3VLVision.VisionModel?
 
+    /// Low-bit DRAFT-ONLY copy of `head` (`ProposalHeadStamp` contract).
+    /// Used exclusively by `nativeMTPForward` to sample draft proposals;
+    /// every trunk/verify projection keeps the checkpoint head, so emitted
+    /// tokens remain exactly verified. Not a @ModuleInfo — it is derived at
+    /// load from the already-loaded head, never read from or written to the
+    /// checkpoint.
+    private var proposalHead: QuantizedLinear?
+
     /// M-RoPE delta established by the most recent media prefill, keyed by the
     /// conversation's cache identity so concurrent sessions do not cross.
     /// Decode positions after a media prefill continue at
@@ -1714,7 +1732,10 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     }
 
     private func projectToLogits(_ headInput: MLXArray) -> MLXArray {
-        let logits = head(headInput)
+        // Verify-tile (workplan W2a): at verify width every lm_head row costs
+        // a full qmv stream of the 5120x248320 head; padding M to the NAX
+        // tile streams it once for all rows. Off by default.
+        let logits = Qwen4ExpVerifyTile.padded(headInput) { head($0) }
         let result: MLXArray
         guard let computeDType = config.declaredComputeDType,
             logits.dtype != computeDType
@@ -1770,8 +1791,21 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         let preMixer = mtp.preMixerHidden(
             hiddenStates: hiddenStates, nextTokenIds: nextTokenIds,
             embedding: textModel.embedding, cache: cache)
+        // DRAFT projection: the proposal head (when installed) replaces the
+        // full head HERE and nowhere else. Draft logits only choose which
+        // tokens get proposed; the verify forwards above project with the
+        // checkpoint head, so acceptance can shift but outputs cannot.
+        let mixed = mtp.mixed(preMixer)
+        let logits: MLXArray
+        if let proposalHead {
+            let raw = proposalHead(mixed)
+            logits =
+                config.declaredComputeDType.map { raw.dtype == $0 ? raw : raw.asType($0) } ?? raw
+        } else {
+            logits = projectToLogits(mixed)
+        }
         return NativeMTPForwardResult(
-            logits: projectToLogits(mtp.mixed(preMixer)),
+            logits: logits,
             hiddenStates: preMixer)
     }
 
@@ -1902,5 +1936,142 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             "[Qwen4Exp] declared_compute_dtype=\(computeDType) affine_metadata_checkpoint_dtype=\(storageDTypes) affine_metadata_count=\(affineMetadataCount)\n".utf8))
 
         return output
+    }
+}
+
+// MARK: - Proposal-head stamping (draft-only low-bit lm_head)
+
+extension Qwen4Exp: NativeMTPProposalHeadInstalling {
+
+    public var nativeMTPProposalHeadFamily: String { "qwen4_exp" }
+
+    /// The ACTUAL loaded head layout. qwen4_exp always ships a standalone
+    /// `lm_head` (never tied to the embedding), so `tied` is false whenever
+    /// the head loaded quantized; a non-quantized head reports nil and the
+    /// bootstrap skips the bundle.
+    public var nativeMTPProposalHeadSourceLayout: ProposalHeadSourceLayout? {
+        guard let quantized = head as? QuantizedLinear else { return nil }
+        return ProposalHeadSourceLayout(
+            bits: quantized.bits,
+            groupSize: quantized.groupSize,
+            mode: quantized.mode.rawValue,
+            tied: false
+        )
+    }
+
+    /// Install the draft-only proposal head. Preferred source is the
+    /// converter's sha-verified calibrated sidecar (imatrix-weighted refit —
+    /// measurably lower weighted NMSE than RTN); fallback is the RTN
+    /// rebuild: dequantize the calibrated checkpoint head and requantize at
+    /// the stamp's proposal bits (same group size / affine mode — the AWQ
+    /// equalization is folded into the stored weights, so even the RTN copy
+    /// inherits calibration). Draft-only by construction: only
+    /// `nativeMTPForward` reads `proposalHead`.
+    public func installNativeMTPProposalHead(
+        bits: Int, calibratedDraft: ProposalHeadCalibratedDraft?
+    ) {
+        // No MTP module loaded (loadPreservedMTP off / MTP-less bundle) means
+        // nativeMTPForward can never run — building a permanently resident
+        // low-bit head copy (plus a ~1 GB transient dequantized peak) would
+        // be pure waste. Stamping is unaffected; only the install is skipped.
+        guard mtp != nil else {
+            FileHandle.standardError.write(Data(
+                "[ProposalHead] eligible bundle but no MTP module loaded — skipping proposal-head build\n".utf8))
+            return
+        }
+        guard let quantized = head as? QuantizedLinear else { return }
+
+        if let draft = calibratedDraft,
+            let copy = calibratedProposalHead(from: draft, matching: quantized)
+        {
+            eval(copy.weight, copy.scales)
+            proposalHead = copy
+            logProposalHeadDigestIfRequested(copy, origin: "sidecar")
+            return
+        }
+
+        let full = dequantized(
+            quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits,
+            mode: quantized.mode
+        )
+        let copy = QuantizedLinear(
+            weight: full,
+            bias: quantized.bias,
+            groupSize: quantized.groupSize,
+            bits: bits,
+            mode: quantized.mode
+        )
+        // Materialize now so the one-time build cost lands at load, not on
+        // the first draft token.
+        eval(copy.weight, copy.scales)
+        proposalHead = copy
+        logProposalHeadDigestIfRequested(copy, origin: "rtn")
+    }
+
+    /// `VMLX_PROPOSAL_HEAD_DIGEST=1`: log sha256 of the INSTALLED packed
+    /// tensors so a harness can byte-compare them against the sidecar file's
+    /// tensor payloads offline. RTN produces different q4 codes than the
+    /// imatrix-weighted refit, so digest equality with the sidecar is hard
+    /// proof the calibrated head is live (and inequality proves RTN). Debug
+    /// aid only — costs one hash pass, gated off by default.
+    private func logProposalHeadDigestIfRequested(_ copy: QuantizedLinear, origin: String) {
+        guard ProcessInfo.processInfo.environment["VMLX_PROPOSAL_HEAD_DIGEST"] == "1"
+        else { return }
+        func digest(_ array: MLXArray) -> String {
+            let data = array.asData(access: .copy).data
+            var hasher = SHA256()
+            hasher.update(data: data)
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        }
+        FileHandle.standardError.write(Data(
+            ("[ProposalHead] digest origin=\(origin) "
+                + "weight=\(digest(copy.weight)) "
+                + "scales=\(digest(copy.scales)) "
+                + "biases=\(copy.biases.map(digest) ?? "none")\n").utf8))
+    }
+
+    /// Adopt the sidecar tensors verbatim as the proposal head, but only
+    /// when their shapes actually describe THIS head (out rows equal, packed
+    /// q-bits column arithmetic consistent with the head's input width).
+    /// A shape surprise silently yields nil → the RTN rebuild proceeds.
+    private func calibratedProposalHead(
+        from draft: ProposalHeadCalibratedDraft, matching head: QuantizedLinear
+    ) -> QuantizedLinear? {
+        let inFeatures = head.scales.dim(1) * head.groupSize
+        let outFeatures = head.scales.dim(0)
+        func rejected(_ why: String) -> QuantizedLinear? {
+            FileHandle.standardError.write(Data(
+                "[ProposalHead] calibrated sidecar shape rejected (\(why)) — RTN rebuild\n".utf8))
+            return nil
+        }
+        guard draft.weight.ndim == 2, draft.scales.ndim == 2 else {
+            return rejected("tensor rank")
+        }
+        guard draft.weight.dim(0) == outFeatures, draft.scales.dim(0) == outFeatures else {
+            return rejected(
+                "out rows \(draft.weight.dim(0)) vs head \(outFeatures)")
+        }
+        guard draft.scales.dim(1) * draft.groupSize == inFeatures else {
+            return rejected(
+                "group cols \(draft.scales.dim(1))×g\(draft.groupSize) vs in \(inFeatures)")
+        }
+        guard draft.weight.dim(1) * 32 == inFeatures * draft.bits else {
+            return rejected(
+                "packed cols \(draft.weight.dim(1)) vs q\(draft.bits) over in \(inFeatures)")
+        }
+        let copy = QuantizedLinear(
+            weight: draft.weight,
+            bias: head.bias,
+            scales: draft.scales,
+            biases: draft.biases,
+            groupSize: draft.groupSize,
+            bits: draft.bits,
+            mode: head.mode
+        )
+        return copy
     }
 }

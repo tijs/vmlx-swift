@@ -1305,13 +1305,25 @@ enum Qwen35Language {
             let B = x.dim(0)
             let L = x.dim(1)
 
-            let qProjOutput = qProj(x)
+            // Verify-tile (workplan W2a): at verify width (1 < L < tile,
+            // B == 1) each projection re-streams its full weight per row
+            // through the qmv kernel; zero-padding M to the tile streams it
+            // once. The pad is sliced off before q/k norms, RoPE, and the
+            // KV cache write, so the cache only ever sees the real rows.
+            // Off unless VMLX_MTP_VERIFY_TILE is set.
+            let qProjOutput = Qwen4ExpVerifyTile.padded(
+                x, family: Qwen4ExpVerifyTile.Family.qwen35
+            ) { qProj($0) }
             let qSplit = qProjOutput.reshaped(B, L, numAttentionHeads, -1).split(parts: 2, axis: -1)
             var queries = qSplit[0]
             let gate = qSplit[1].reshaped(B, L, -1)
 
-            var keys = kProj(x)
-            var values = vProj(x)
+            var keys = Qwen4ExpVerifyTile.padded(
+                x, family: Qwen4ExpVerifyTile.Family.qwen35
+            ) { kProj($0) }
+            var values = Qwen4ExpVerifyTile.padded(
+                x, family: Qwen4ExpVerifyTile.Family.qwen35
+            ) { vProj($0) }
 
             queries = qNorm(queries).transposed(0, 2, 1, 3)
             keys = kNorm(keys.reshaped(B, L, numKeyValueHeads, -1)).transposed(0, 2, 1, 3)
@@ -1382,7 +1394,10 @@ enum Qwen35Language {
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
 
-            return oProj(compiledSigmoidMultiply(output, gate))
+            return Qwen4ExpVerifyTile.padded(
+                compiledSigmoidMultiply(output, gate),
+                family: Qwen4ExpVerifyTile.Family.qwen35
+            ) { oProj($0) }
         }
     }
 
@@ -1441,6 +1456,12 @@ enum Qwen35Language {
         let convKernelSize: Int
         let convDim: Int
         let fuseDecodeInputProjections: Bool
+        /// Verify-tile (workplan W2a) opt-in. GatedDeltaNet is shared across
+        /// the qwen3_5 VLM family; each trunk that opts in passes `true`
+        /// plus its own `verifyTileFamily` tag so the one-shot activation
+        /// log names the family that engaged. See `Qwen4ExpVerifyTile`.
+        let verifyTilePadding: Bool
+        let verifyTileFamily: String
         private var attemptedDecodeInputFusion = false
         private var fusedDecodeInputProjection: FusedDecodeInputProjection?
 
@@ -1459,7 +1480,9 @@ enum Qwen35Language {
         init(
             _ args: Qwen35Configuration.TextConfiguration,
             outputGateSigmoid: Bool = false,
-            fuseDecodeInputProjections: Bool = false
+            fuseDecodeInputProjections: Bool = false,
+            verifyTilePadding: Bool = false,
+            verifyTileFamily: String = Qwen4ExpVerifyTile.Family.qwen4Exp
         ) {
             self.hiddenSize = args.hiddenSize
             self.numVHeads = args.linearNumValueHeads
@@ -1471,6 +1494,8 @@ enum Qwen35Language {
             self.convKernelSize = args.linearConvKernelDim
             self.convDim = keyDim * 2 + valueDim
             self.fuseDecodeInputProjections = fuseDecodeInputProjections
+            self.verifyTilePadding = verifyTilePadding
+            self.verifyTileFamily = verifyTileFamily
 
             precondition(
                 numVHeads % numKHeads == 0,
@@ -1832,11 +1857,11 @@ enum Qwen35Language {
                 }
             } else {
                 let fusedInputs = fusedDecodeInputs(inputs)
-                var mixedQKV = fusedInputs?[0] ?? inProjQKV(inputs)
-                z = (fusedInputs?[1] ?? inProjZ(inputs)).reshaped(
+                var mixedQKV = fusedInputs?[0] ?? verifyTiled(inputs) { inProjQKV($0) }
+                z = (fusedInputs?[1] ?? verifyTiled(inputs) { inProjZ($0) }).reshaped(
                     B, S, numVHeads, headVDim)
-                b = fusedInputs?[2] ?? inProjB(inputs)
-                a = fusedInputs?[3] ?? inProjA(inputs)
+                b = fusedInputs?[2] ?? verifyTiled(inputs) { inProjB($0) }
+                a = fusedInputs?[3] ?? verifyTiled(inputs) { inProjA($0) }
 
                 if let mask {
                     mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
@@ -1955,9 +1980,37 @@ enum Qwen35Language {
                 }
             }
 
-            if let tail = compiledDecodeTail(out, gate: z) { return tail }
-            out = norm(out, gate: z)
-            return outProj(out.reshaped(B, S, -1))
+            // Verify-tile (workplan W2a): norm-with-gate is rowwise and
+            // outProj is a row-independent matmul, so the whole output stage
+            // may run at padded M and be sliced back afterwards. All cache
+            // and staging writes above already saw only the real rows.
+            return verifyTiledOutput(out, gate: z) { paddedOut, paddedGate in
+                if let tail = compiledDecodeTail(paddedOut, gate: paddedGate) {
+                    return tail
+                }
+                let normed = norm(paddedOut, gate: paddedGate)
+                return outProj(
+                    normed.reshaped(normed.dim(0), normed.dim(1), -1))
+            }
+        }
+
+        /// Verify-tile M-pad for this layer's row-independent projections; a
+        /// no-op unless this instance opted in (qwen4_exp and qwen3_5 do).
+        private func verifyTiled(
+            _ x: MLXArray, _ body: (MLXArray) -> MLXArray
+        ) -> MLXArray {
+            guard verifyTilePadding else { return body(x) }
+            return Qwen4ExpVerifyTile.padded(x, family: verifyTileFamily) { body($0) }
+        }
+
+        private func verifyTiledOutput(
+            _ x: MLXArray, gate: MLXArray,
+            _ body: (MLXArray, MLXArray) -> MLXArray
+        ) -> MLXArray {
+            guard verifyTilePadding else { return body(x, gate) }
+            return Qwen4ExpVerifyTile.padded(x, gate, family: verifyTileFamily) {
+                body($0, $1)
+            }
         }
 
         /// Commit for the STAGED (compile-compatible) verify: the forward
@@ -2357,9 +2410,14 @@ enum Qwen35Language {
                 // out of trace capture. Tying it to compiledDecodeRegions
                 // left every mixed-scheme JANG stamp — including the 27B —
                 // running four decode launches per GDN layer for no reason.
+                // Verify-tile (workplan W2a): pad the GDN's verify-width
+                // projections to the NAX qmm tile. Off unless
+                // VMLX_MTP_VERIFY_TILE is set; see `Qwen4ExpVerifyTile`.
                 _linearAttn.wrappedValue = GatedDeltaNet(
                     args,
-                    fuseDecodeInputProjections: true)
+                    fuseDecodeInputProjections: true,
+                    verifyTilePadding: true,
+                    verifyTileFamily: Qwen4ExpVerifyTile.Family.qwen35)
             } else {
                 _selfAttn.wrappedValue = Attention(args)
             }
@@ -2706,6 +2764,23 @@ enum Qwen35Language {
         fileprivate var precomputedPositionIds: MLXArray? = nil
         fileprivate var ropeDeltas: MLXArray? = nil
 
+        /// The LM-head projection (untied `lm_head` or the tied embedding),
+        /// with verify-tile M-padding (workplan W2a): at verify width every
+        /// head row costs a full qmv stream of the hidden x vocab weight;
+        /// padding M to the NAX tile streams it once for all rows and the
+        /// padded rows are sliced away before the logits leave. Off unless
+        /// VMLX_MTP_VERIFY_TILE is set.
+        fileprivate func headLogits(_ hidden: MLXArray) -> MLXArray {
+            Qwen4ExpVerifyTile.padded(
+                hidden, family: Qwen4ExpVerifyTile.Family.qwen35
+            ) { input in
+                if let lmHead {
+                    return lmHead(input)
+                }
+                return model.embedTokens.asLinear(input)
+            }
+        }
+
         init(_ config: Qwen35Configuration) {
             self.config = config
             self.textConfig = config.textConfiguration
@@ -2882,11 +2957,7 @@ enum Qwen35Language {
                 positionIds: positionIds
             )
 
-            if let lmHead {
-                out = lmHead(out)
-            } else {
-                out = model.embedTokens.asLinear(out)
-            }
+            out = headLogits(out)
 
             return LMOutput(logits: out)
         }
@@ -2941,12 +3012,7 @@ enum Qwen35Language {
                 positionIds: positionIds,
                 captureLayerIDs: captureLayerIDs,
                 recordPrefixCommitStates: recordPrefixCommitStates)
-            let logits: MLXArray
-            if let lmHead {
-                logits = lmHead(hidden)
-            } else {
-                logits = model.embedTokens.asLinear(hidden)
-            }
+            let logits = headLogits(hidden)
             return (logits, captured)
         }
 
@@ -2976,19 +3042,13 @@ enum Qwen35Language {
             let logits: MLXArray
             if NativeMTPPhaseDiagnostics.enabled {
                 let start = Date.timeIntervalSinceReferenceDate
-                if let lmHead {
-                    logits = lmHead(model.norm(hidden))
-                } else {
-                    logits = model.embedTokens.asLinear(model.norm(hidden))
-                }
+                logits = headLogits(model.norm(hidden))
                 MLX.eval(logits)
                 NativeMTPPhaseDiagnostics.record(
                     "vlm_lm_head",
                     seconds: Date.timeIntervalSinceReferenceDate - start)
-            } else if let lmHead {
-                logits = lmHead(model.norm(hidden))
             } else {
-                logits = model.embedTokens.asLinear(model.norm(hidden))
+                logits = headLogits(model.norm(hidden))
             }
             return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
         }
@@ -3014,12 +3074,7 @@ enum Qwen35Language {
                     seconds: Date.timeIntervalSinceReferenceDate - blockStart)
 
                 let headStart = Date.timeIntervalSinceReferenceDate
-                let logits: MLXArray
-                if let lmHead {
-                    logits = lmHead(mtp.norm(hidden))
-                } else {
-                    logits = model.embedTokens.asLinear(mtp.norm(hidden))
-                }
+                let logits = headLogits(mtp.norm(hidden))
                 MLX.eval(logits)
                 NativeMTPPhaseDiagnostics.record(
                     "vlm_mtp_lm_head",
@@ -3031,12 +3086,7 @@ enum Qwen35Language {
                 nextTokenIds: nextTokenIds,
                 embedTokens: model.embedTokens,
                 cache: cache)
-            let logits: MLXArray
-            if let lmHead {
-                logits = lmHead(mtp.norm(hidden))
-            } else {
-                logits = model.embedTokens.asLinear(mtp.norm(hidden))
-            }
+            let logits = headLogits(mtp.norm(hidden))
             return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
         }
 
@@ -3706,5 +3756,44 @@ extension Qwen35 {
     fileprivate func castCacheOptional(_ cache: [any KVCache]?) -> [KVCache]? {
         guard let cache else { return nil }
         return castCache(cache)
+    }
+}
+
+// MARK: - Proposal-head stamping (draft-only low-bit lm_head)
+
+extension Qwen35: NativeMTPProposalHeadInstalling {
+
+    public var nativeMTPProposalHeadFamily: String { "qwen3_5" }
+
+    /// The ACTUAL loaded head layout. A nil `lm_head` means the family ties
+    /// the head to the embedding (`embedTokens.asLinear`) — reported as
+    /// `tied` so the stamp records the truthful ineligibility reason. An
+    /// unquantized standalone head has no quantized layout to measure and
+    /// skips stamping entirely.
+    public var nativeMTPProposalHeadSourceLayout: ProposalHeadSourceLayout? {
+        guard let lmHead = languageModel.lmHead else {
+            return ProposalHeadSourceLayout(bits: 0, groupSize: 0, mode: "none", tied: true)
+        }
+        guard let quantized = lmHead as? QuantizedLinear else { return nil }
+        return ProposalHeadSourceLayout(
+            bits: quantized.bits,
+            groupSize: quantized.groupSize,
+            mode: quantized.mode.rawValue,
+            tied: false
+        )
+    }
+
+    /// Every shipped qwen3_5 bundle is ineligible (heads are ≤6-bit or
+    /// mxfp8), so this can only be reached by a FUTURE q8/g64 27B — whose
+    /// draft routing does not exist yet. Stamping stays truthful (bundle
+    /// eligibility is a property of the head); the runtime just logs that it
+    /// is not taking the acceleration rather than pretending it did.
+    public func installNativeMTPProposalHead(
+        bits: Int, calibratedDraft: ProposalHeadCalibratedDraft?
+    ) {
+        FileHandle.standardError.write(Data(
+            ("[ProposalHead] qwen3_5 head is stamp-eligible (q\(bits)) but draft "
+                + "routing is not implemented for this family yet; drafting stays "
+                + "on the full head\n").utf8))
     }
 }

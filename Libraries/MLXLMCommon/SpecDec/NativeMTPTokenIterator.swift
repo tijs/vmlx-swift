@@ -106,12 +106,11 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
     /// Draft depth actually in effect at the start of generation (`depth=`).
     ///
     /// This is the REQUESTED depth after the policy cap, not the raw request:
-    /// the iterator clamps to `VMLX_MTP_DEPTH_CAP` (default `2` — the D2
-    /// ceiling; depths past 2 only ever won on a deterministic counting
-    /// prompt, and Nemotron measured D3 at 0.48x on real prose). A host that
-    /// asks for `.nativeMTP(depth: 3)` therefore sees `depth == 2` here —
-    /// which is the point of surfacing it, since that gap is otherwise
-    /// invisible without reading stderr.
+    /// the iterator clamps to `VMLX_MTP_DEPTH_CAP` (default `3` since the
+    /// staged verifier's measured D3 win — see the cap-site comment; the D2
+    /// ceiling era is over). A host that asks past the cap sees the clamped
+    /// value here — which is the point of surfacing it, since that gap is
+    /// otherwise invisible without reading stderr.
     public let depth: Int
 
     /// Draft depth in effect at end of generation, after any adaptive
@@ -166,6 +165,10 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
     /// line printing `adaptiveFallback=none`; a non-`nil` reason is printed
     /// verbatim (`adaptiveFallback=`).
     public let adaptiveFallbackReason: String?
+    /// AR-safety governor: how many times the request paused speculation for
+    /// losing to AR on a window, and how many resume probes won.
+    public let arSafetyTrips: Int
+    public let arSafetyResumes: Int
 
     /// Verifier mode used for this generation (`verifierMode=`).
     public let verifierMode: String
@@ -187,7 +190,9 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
         adaptiveDownshifts: Int,
         adaptiveFallbackReason: String?,
         verifierMode: String,
-        cacheMode: String
+        cacheMode: String,
+        arSafetyTrips: Int = 0,
+        arSafetyResumes: Int = 0
     ) {
         self.depth = depth
         self.activeDepth = activeDepth
@@ -203,6 +208,8 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
         self.adaptiveFallbackReason = adaptiveFallbackReason
         self.verifierMode = verifierMode
         self.cacheMode = cacheMode
+        self.arSafetyTrips = arSafetyTrips
+        self.arSafetyResumes = arSafetyResumes
     }
 }
 
@@ -234,6 +241,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
     var tokenCount = 0
     var promptPrefillTime: TimeInterval = 0
+
+    /// `VMLX_LOGITS_NAN_TRACE=1` diagnostic (see ``NaNLogitsTrace``);
+    /// `nil` when the flag is off. Probes the backbone (target) logits at
+    /// every site that samples a committed token: chunk verify, rollback
+    /// repair, sequential verify, and the AR fallback. Draft-head logits
+    /// are not probed — a non-finite draft is rejected by verify anyway and
+    /// probing them would drain the draft pipeline once per level.
+    private var nanTrace: NaNLogitsTrace?
 
     private var pendingTokens: [Int] = []
     private var pendingIndex = 0
@@ -370,6 +385,21 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var mtpForwardCount = 0
     private(set) var autoregressiveFallbackTokenCount = 0
     private(set) var adaptiveDepthDownshiftCount = 0
+    /// Per-rule audit counters for the depth controller (printed on the
+    /// stats line): which rule moved the depth, how often.
+    private var adaptiveWallClockDemotes = 0
+    private var adaptiveAcceptanceDemotes = 0
+    /// Oscillation brake: how many times each depth has been demoted FROM
+    /// in this generation. Live on 4M prose (2026-09-04): d3 start →
+    /// 12 downshifts over 414 cycles — acceptance demoted, the margin gate
+    /// promoted straight back, each hop cold-starting the head cache. A
+    /// level demoted twice is closed for the rest of the generation.
+    private var adaptiveDemotedFromCount: [Int: Int] = [:]
+    private static let adaptiveMaxDemotesPerLevel = 2
+    /// Hard ceiling for adaptive promotion — the resolved depth cap, which
+    /// may exceed the REQUESTED depth (the request is a starting point, not
+    /// a lid, since 2026-09-04). See the depth-policy comment in `init`.
+    private let adaptiveDepthCeiling: Int
     private(set) var seedMainForwardTime: TimeInterval = 0
     private(set) var verifyMainForwardTime: TimeInterval = 0
     private(set) var replayMainForwardTime: TimeInterval = 0
@@ -405,9 +435,87 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var acceptanceProbabilitySum = 0.0
     private(set) var acceptanceProbabilityCount = 0
     private var forceAutoregressiveFallback = false
+
+    // MARK: AR-safety governor state (windowed, context-scaled, REVERSIBLE)
+    //
+    // Runs every cycle regardless of depth policy (fixed or adaptive): if a
+    // WINDOWED MTP ms/token exceeds a context-scaled AR baseline, the request
+    // pauses speculation and decodes AR "instantaneously"; while paused it
+    // measures the live AR step cost and periodically PROBES a resume at the
+    // starting depth, keeping MTP only if the probe window beats live AR.
+    // Design + audit trail: docs/internal/MTP-AR-SAFETY-GOVERNOR-SWIFT-2026-09-04.md
+    // (Swift port of vmlx-private-evidence MTP-ONFLY-AR-FALLBACK-PLAN, plus
+    // the reversible Phase 2 the Python plan deferred).
+    struct ARSafetySample {
+        let emitted: Int
+        let wall: TimeInterval
+        let verifyTotal: TimeInterval
+    }
+    private var arSafetyRing: [ARSafetySample] = []
+    private var arSafetyEmittedTotal = 0
+    /// Wall of one TRUE single-token AR step measured after eval — the first
+    /// decode cycle runs AR precisely to capture this (the seed forward is
+    /// prompt-sized here, not an AR step; the lazy-eval trap is avoided by
+    /// timing after `MLX.eval`).
+    private var arSafetySeedStepSec: TimeInterval?
+    private var arSafetySeedFirstSampleSec: TimeInterval?
+    /// First MTP cycle's verify-forward wall; verify growth over it tracks
+    /// AR's own context growth (context-fair baseline).
+    private var arSafetyFirstVerifySec: TimeInterval?
+    private var arSafetyPaused = false
+    /// Live AR step cost at the CURRENT context, EMA over paused steps.
+    private var arSafetyLiveStepSec: TimeInterval?
+    private var arSafetyTokensSincePause = 0
+    private var arSafetyResumeInterval = NativeMTPTokenIterator.arSafetyResumeIntervalStart
+    private var arSafetyProbeCyclesRemaining = 0
+    /// True while a kept re-entry is speculating: a trip in that state backs
+    /// the resume interval off further instead of resetting it.
+    private var arSafetyReentered = false
+    private(set) var arSafetyTrips = 0
+    private(set) var arSafetyResumes = 0
+    /// Judged every verify cycle over the last `arSafetyWindow` cycles once
+    /// `arSafetyWarmupCycles` have run: earliest trip = cycle 16 (~0.65 s at
+    /// d3), a later drop is caught within ~8 cycles (~0.3 s).
+    private static let arSafetyWindow = 8
+    private static let arSafetyWarmupCycles = 8
+    private static let arSafetyMargin = 1.25
+    private static let arSafetyProbeWindow = 6
+    /// Re-probe after 16, 32, 64… AR tokens (×2 per lost probe, ×4 on a
+    /// clear loss); a kept re-entry that trips again backs off further.
+    private static let arSafetyResumeIntervalStart = 16
+    private static let arSafetyResumeIntervalMax = 4096
+    /// A probe is kept only when MTP beats the live AR cost by this factor
+    /// (10% hysteresis) so a re-entry cannot ride the noise floor.
+    private static let arSafetyReentryHysteresis = 1.10
+    /// A probe that lost by this factor or more is a clear regime signal:
+    /// back off ×4 instead of ×2.
+    private static let arSafetyClearLossFactor = 1.3
+    /// `VMLX_NATIVE_MTP_AR_SAFETY=0` disables the governor (measurement
+    /// hatch, like the adaptive one). Default ON.
+    private static let arSafetyDisabled =
+        ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] == "0"
     private var hybridSafetyWarmupComplete = false
     private var adaptiveWindow: [AdaptiveCycle] = []
     private var adaptiveFallbackReason: String?
+    /// Timestamp of the previous adaptive cycle's bookkeeping; diffs give
+    /// per-cycle wall time for wall-clock depth pricing.
+    private var lastAdaptiveCycleTimestamp: TimeInterval?
+    /// Measured committed-tokens-per-second per depth (EMA, α = 0.5),
+    /// recorded each time a full window evaluates at that depth. Wall-clock
+    /// truth for the controller: acceptance floors alone kept a d3 window at
+    /// 0.65 acceptance pinned at d3 even when its throughput measurably lost
+    /// to d2 (Eric, 2026-09-04: "d3 is slower than d2 sometimes").
+    private var measuredThroughputByDepth: [Int: Double] = [:]
+    /// Windows evaluated at the current depth since the level above was last
+    /// throughput-probed; after `upperProbeCooldownWindows`, the stale upper
+    /// measurement is dropped so the climb can be re-attempted (prompt
+    /// character changes mid-generation — a table after prose).
+    private var windowsSinceUpperProbe = 0
+    private static let upperProbeCooldownWindows = 8
+    /// A lower depth must beat the current one by this factor before the
+    /// wall-clock rule demotes — hysteresis so measurement noise doesn't
+    /// oscillate the depth.
+    private static let wallClockDemoteFactor = 1.05
     private(set) var nativeMTPStats: NativeMTPGenerationStats?
     private var generationStatsFinalized = false
     private let iteratorStartTime = Date.timeIntervalSinceReferenceDate
@@ -419,6 +527,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private struct AdaptiveCycle {
         let depth: Int
         let accepted: Int
+        /// Tokens this cycle actually delivered (accepted drafts + the
+        /// verifier's own token) — the numerator of wall-clock pricing.
+        let committed: Int
+        /// Wall seconds since the previous cycle's bookkeeping — drafting,
+        /// verify, sampling, cache commit, everything the user waits on.
+        /// 0 for the first cycle of a generation (no predecessor to diff
+        /// against); throughput sums skip those.
+        let wallSeconds: Double
     }
 
     init(
@@ -467,6 +583,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         effectiveParameters = nativeMTPParameters
 
         self.model = model
+        self.nanTrace = NaNLogitsTrace(model: String(describing: type(of: model)))
         self.cache = cache ?? model.newCache(parameters: effectiveParameters)
         self.mtpCache = model.makeNativeMTPCache()
         self.cacheCoordinator = cacheCoordinator
@@ -474,21 +591,21 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
         self.maxTokens = effectiveParameters.maxTokens
-        // Depth policy: D3 is the ceiling. The old D2 cap was calibrated on
-        // the lazy-repair/sequential verifier, where every rejection cost a
-        // checkpoint restore + full replay forward (Nemotron D3 0.48x, the
-        // Python depth-3 prose figure 14% slower than AR). Under the staged
-        // verifier those numbers no longer describe this code: 2026-08-19 on
-        // Qwen3.8-27B-JANG_4D, D3 measured 28.4 tok/s vs D2 27.5 vs plain
-        // 16.5, byte-identical output, 3.13 committed tokens per verify.
-        // A default cap below what a measured tuning artifact requests is a
-        // silent clamp on the host's explicit choice — the same bug this
-        // comment already records for the cap=1 era. The adaptive controller
-        // still downshifts unprofitable depth at runtime; benchmarks can
-        // override via VMLX_MTP_DEPTH_CAP.
+        // Depth policy (2026-09-04): the REQUESTED depth is the STARTING
+        // depth; the hard cap is 5 and the adaptive controller may promote
+        // past the request up to that cap when a full acceptance window
+        // clears the top floor with margin — near-perfect-acceptance shapes
+        // (counting, enumeration, tables) earn d4/d5 at runtime instead of
+        // being pinned to their start. History: the D2 cap era was
+        // calibrated on the lazy-repair verifier (Nemotron D3 0.48x); the
+        // staged verifier re-measured D3 as a win (27B_4D: 28.4 vs 16.5
+        // plain, byte-identical), and the same acceptance-priced controller
+        // that downshifts unprofitable depth governs every step above the
+        // start. Benchmarks can still override via VMLX_MTP_DEPTH_CAP.
         let depthCap =
             ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
-            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 3
+            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 5
+        self.adaptiveDepthCeiling = depthCap
         self.depth = Swift.min(requestedDepth, depthCap)
         self.currentDepth = Swift.min(requestedDepth, depthCap)
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
@@ -576,10 +693,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 let ssmStates, let diskArrays):
                 var restored = false
                 var retainedDiskRestore = false
+                var restoredTokenCount = 0
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
                     coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
+                        restoredTokenCount = restoredTokens
                         if let ssm = ssmStates {
                             restoreSSMStates(
                                 ssm, into: self.cache, boundary: matchedTokens)
@@ -591,6 +710,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 if let diskArrays, !restored {
                     let diskRestored = restoreFromDiskArrays(diskArrays, into: &self.cache)
                     if diskRestored > 0 {
+                        restoredTokenCount = diskRestored
                         let cacheHasArraysState = self.cache.contains {
                             String(describing: type(of: $0)).contains("Arrays")
                         }
@@ -606,6 +726,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     }
                 }
 
+                // Fail closed: attention offsets come from the restored KV
+                // tensors, recurrent offsets from the matched boundary. A
+                // hybrid whose two halves disagree must rebuild and full-prefill.
+                if restored,
+                    !validateRestoredCacheBoundary(
+                        self.cache, matchedTokens: matchedTokens,
+                        restoredTokens: restoredTokenCount, detail: "native-mtp")
+                {
+                    restored = false
+                    retainedDiskRestore = false
+                    self.cache = model.newCache(parameters: effectiveParameters)
+                    inputForPrepare = input
+                }
                 if restored {
                     if cacheLookupUsesPostPrepareAlias {
                         self.promptTokenIds = cacheLookupTokenIds
@@ -772,7 +905,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             ProcessInfo.processInfo.environment["VMLX_MTP_COMPILED_VERIFY"] == "1"
         {
             let promptOffset = self.cache.map(\.offset).max() ?? promptTokenIds.count
-            let bufferLength = promptOffset + (self.maxTokens ?? 4096) + self.depth + 8
+            // Sized by the promotion CEILING, not the starting depth — the
+            // adaptive controller may climb past the request mid-generation.
+            let bufferLength =
+                promptOffset + (self.maxTokens ?? 4096) + self.adaptiveDepthCeiling + 8
             self.cache = self.cache.map { layer in
                 // Never promote QSAKVCache: the qwen4_exp indexer needs the
                 // concrete type for its raw-key lane (osaurus#2525).
@@ -797,7 +933,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             pendingTokens.removeAll(keepingCapacity: true)
             pendingIndex = 0
             do {
-                if forceAutoregressiveFallback {
+                if forceAutoregressiveFallback || arSafetyPaused
+                    || (!Self.arSafetyDisabled && arSafetySeedStepSec == nil)
+                {
                     try generateAutoregressiveToken()
                 } else {
                     try verifyCycle()
@@ -862,8 +1000,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 cachePrefixTokenCounts + [sharedPromptStripBoundary].compactMap { $0 }
             ))
 
-            func store(tokens: [Int], snapshot: [KVCache], label _: String) {
+            func store(tokens: [Int], snapshot: [KVCache], label: String) {
                 guard !tokens.isEmpty else { return }
+                // Post-generation tail breakdown (VMLX_CACHE_FETCH_TRACE=1): live
+                // 2026-09-04 the whole 9.5–15 s "hang at the last letters" was
+                // this store; name the step that costs it.
+                let trace = ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+                let t0 = Date()
                 // Same guard as the other store paths: saving a cache materialises
                 // it several times over at the memory high-water mark, and a
                 // prefix-cache entry is only ever a speed-up for a later request —
@@ -873,6 +1016,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 guard CacheStoreBudget.canStore(snapshot) else { return }
                 let cacheSnapshot = snapshot.map { $0.copy() }
                 MLX.eval(cacheSnapshot)
+                let tCopy = Date()
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(cacheSnapshot)
                 let perLayerData = requiresDiskBackedRestore
@@ -918,9 +1062,21 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         persistCapturedStatesToDisk: false,
                         prefillStepSize: cacheInitParameters.prefillStepSize)
                 }()
+                let tSSM = Date()
                 let diskStoreCache = makeDiskStoreCache(
                     fromPromptBoundary: cacheSnapshot,
                     parameters: cacheInitParameters)
+                let tDisk = Date()
+                defer {
+                    if trace {
+                        print(
+                            "[vmlx][gen/tail/store] label=\(label) tokens=\(tokens.count)"
+                                + " copyEval=\(tCopy.timeIntervalSince(t0))s"
+                                + " layerData+ssm=\(tSSM.timeIntervalSince(tCopy))s"
+                                + " diskCachePrep=\(tDisk.timeIntervalSince(tSSM))s"
+                                + " coordinatorStore=\(Date().timeIntervalSince(tDisk))s")
+                    }
+                }
                 coordinator.storeAfterGeneration(
                     promptTokens: tokens,
                     perLayerData: perLayerData,
@@ -953,7 +1109,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     {
                         continue
                     }
-                    if let boundarySnapshot = cacheSnapshotForBoundary(
+                    let tBoundary = Date()
+                    let boundarySnapshotOpt = cacheSnapshotForBoundary(
                         tokens: boundaryTokens,
                         promptSnapshot: promptCacheSnapshot,
                         allowDiskBackedRederive: shouldForceStableBoundaryRederive(
@@ -961,7 +1118,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             isReusablePrefixWarmup: isReusablePrefixWarmup,
                             requiresRecurrentSSMCompanion:
                                 coordinator.requiresRecurrentSSMCompanion))
-                    {
+                    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                        print("[vmlx][gen/tail/derive] label=history-boundary tokens=\(boundaryTokens.count) snapshot=\(Date().timeIntervalSince(tBoundary))s stable=\(isStableBoundary)")
+                    }
+                    if let boundarySnapshot = boundarySnapshotOpt {
                         store(
                             tokens: boundaryTokens,
                             snapshot: boundarySnapshot,
@@ -988,11 +1148,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     // loop can't store this boundary (no allowDiskBackedRederive),
                     // and `stripAt` routinely coincides with a prefix-count entry.
                     let strippedTokens = Array(promptTokenIds.prefix(stripAt))
-                    if let strippedSnapshot = cacheSnapshotForBoundary(
+                    let tStrip = Date()
+                    let strippedSnapshotOpt = cacheSnapshotForBoundary(
                         tokens: strippedTokens,
                         promptSnapshot: promptCacheSnapshot,
                         allowDiskBackedRederive: true)
-                    {
+                    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                        print("[vmlx][gen/tail/derive] label=gen-suffix-stripped tokens=\(strippedTokens.count) snapshot=\(Date().timeIntervalSince(tStrip))s")
+                    }
+                    if let strippedSnapshot = strippedSnapshotOpt {
                         store(
                             tokens: strippedTokens,
                             snapshot: strippedSnapshot,
@@ -1054,6 +1218,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         abandonPendingVerify()
         guard !generationStatsFinalized else { return }
         generationStatsFinalized = true
+        nanTrace?.finish(totalSteps: tokenCount)
         let accepted = acceptedByDepth
             .sorted { $0.key < $1.key }
             .map { "\($0.key):\($0.value)" }
@@ -1112,10 +1277,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveDownshifts: adaptiveDepthDownshiftCount,
             adaptiveFallbackReason: adaptiveFallbackReason,
             verifierMode: verifierMode,
-            cacheMode: "private-mtp+verifier-prefix-commit")
+            cacheMode: "private-mtp+verifier-prefix-commit",
+            arSafetyTrips: arSafetyTrips,
+            arSafetyResumes: arSafetyResumes)
         let line = String(
             format:
-                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
+                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d]\n",
             depth,
             currentDepth,
             verifyCalls,
@@ -1158,7 +1325,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             verifyPrefetchAbandonedCount,
             phaseSummary,
             speculativeSampler.isGreedy ? "greedy" : "exact-pq",
-            verifierMode)
+            verifierMode,
+            arSafetyTrips,
+            arSafetyResumes,
+            arSafetyPaused ? 1 : 0,
+            adaptiveDepthPromotionCount,
+            adaptiveWallClockDemotes,
+            adaptiveAcceptanceDemotes)
         FileHandle.standardError.write(Data(line.utf8))
     }
 
@@ -1470,6 +1643,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         materializeSyncTime += verifyDecision.materializeSyncTime
         samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
+        if let nanTrace {
+            // Whole verify slab `[1, K+1, V]`: every row is a decode position.
+            let next = verifyDecision.nextToken
+            nanTrace.observe(
+                verifier.logits, site: "mtp", step: tokenCount, role: "verify",
+                sampled: { next.item(Int.self) })
+        }
 
         var accepted = verifyDecision.accepted
         var nextVerifiedToken = verifyDecision.nextToken
@@ -1557,6 +1737,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         verifyCalls += 1
         acceptedByDepth[accepted, default: 0] += 1
+        arSafetyAfterVerifyCycle(accepted: accepted)
         recordAdaptiveCycle(accepted: accepted)
         if Self.traceEnabled {
             let requestedIDs = recordMaterializeSync { requested.map { $0.item(Int.self) } }
@@ -1599,6 +1780,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 .token
             recordMaterializeSync {
                 MLX.eval(nextVerifiedToken)
+            }
+            if let nanTrace {
+                let sampled = nextVerifiedToken
+                nanTrace.observe(
+                    repaired.logits[0..., -1, 0...], site: "mtp", step: tokenCount,
+                    role: "repair", sampled: { sampled.item(Int.self) })
             }
             repairedHiddenForNextMTP =
                 repaired.hiddenStates[0..., accepted ..< (accepted + 1), 0...]
@@ -1867,7 +2054,228 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static let adaptiveDisabledForMeasurement =
         ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_DISABLE_ADAPTIVE"] == "1"
 
+    // MARK: - AR-safety governor
+
+    /// The pure decision: does a windowed MTP ms/token lose to the
+    /// context-scaled AR baseline? Mirrors the Python engine's
+    /// `_native_mtp_windowed_ar_verdict` exactly so both runtimes trip on the
+    /// same arithmetic. nil = MTP holds. Guards: zero/negative deltas never
+    /// divide; `firstVerifyMs <= 0` disables context scaling (baseline stays
+    /// the seed AR step).
+    struct ARSafetyVerdict: Equatable {
+        let mtpMsPerToken: Double
+        let arBaselineMs: Double
+    }
+
+    static func windowedARVerdict(
+        arStepMs: Double,
+        firstVerifyMs: Double,
+        windowCycles: Int,
+        deltaEmitted: Int,
+        deltaWallMs: Double,
+        deltaVerifyMs: Double,
+        margin: Double
+    ) -> ARSafetyVerdict? {
+        guard arStepMs > 0, windowCycles > 0, deltaEmitted > 0, deltaWallMs > 0 else {
+            return nil
+        }
+        var scale = 1.0
+        if firstVerifyMs > 0 {
+            let verifyAvgMs = deltaVerifyMs / Double(windowCycles)
+            scale = Swift.max(1.0, verifyAvgMs / firstVerifyMs)
+        }
+        let baseline = arStepMs * scale
+        let mtpMsPerToken = deltaWallMs / Double(deltaEmitted)
+        guard mtpMsPerToken > baseline * margin else { return nil }
+        return ARSafetyVerdict(mtpMsPerToken: mtpMsPerToken, arBaselineMs: baseline)
+    }
+
+    private var arSafetyWindowForRequest: Int {
+        // A restored prefix starts with a cold aligned-head cache, but the
+        // 8-cycle warmup already excludes those cycles from the judgement
+        // window; no extra dilution (a 4× window hid real losses for ~2.6 s).
+        Self.arSafetyWindow
+    }
+
+    /// Median per-cycle ms/token over the ring. A single stalled cycle
+    /// (allocator hiccup, page-in) can push the window MEAN over the margin;
+    /// the median must agree before a trip counts as a sustained loss.
+    static func medianCycleMsPerToken(_ ring: [ARSafetySample]) -> Double? {
+        var perCycle: [Double] = []
+        perCycle.reserveCapacity(Swift.max(ring.count - 1, 0))
+        for (a, b) in zip(ring, ring.dropFirst()) {
+            let emitted = b.emitted - a.emitted
+            guard emitted > 0 else { continue }
+            perCycle.append((b.wall - a.wall) * 1000 / Double(emitted))
+        }
+        guard !perCycle.isEmpty else { return nil }
+        let sorted = perCycle.sorted()
+        return sorted[sorted.count / 2]
+    }
+
+    /// After every verify cycle (any depth policy): sample, then either
+    /// judge a resume probe or run the windowed trip test.
+    private mutating func arSafetyAfterVerifyCycle(accepted: Int) {
+        guard !Self.arSafetyDisabled, !forceAutoregressiveFallback else { return }
+        arSafetyEmittedTotal += accepted + 1
+        let now = Date.timeIntervalSinceReferenceDate
+        arSafetyRing.append(
+            ARSafetySample(
+                emitted: arSafetyEmittedTotal, wall: now, verifyTotal: targetVerifyTime))
+        let window = arSafetyProbeCyclesRemaining > 0
+            ? Self.arSafetyProbeWindow : arSafetyWindowForRequest
+        if arSafetyRing.count > window + 1 {
+            arSafetyRing.removeFirst(arSafetyRing.count - (window + 1))
+        }
+        if arSafetyFirstVerifySec == nil, arSafetyRing.count >= 2 {
+            let d = arSafetyRing[1].verifyTotal - arSafetyRing[0].verifyTotal
+            if d > 0 { arSafetyFirstVerifySec = d }
+        }
+        guard arSafetyRing.count == window + 1,
+            let oldest = arSafetyRing.first, let newest = arSafetyRing.last
+        else { return }
+        let deltaEmitted = newest.emitted - oldest.emitted
+        let deltaWallMs = (newest.wall - oldest.wall) * 1000
+        let deltaVerifyMs = (newest.verifyTotal - oldest.verifyTotal) * 1000
+
+        if arSafetyProbeCyclesRemaining > 0 {
+            arSafetyProbeCyclesRemaining -= 1
+            guard arSafetyProbeCyclesRemaining == 0 else { return }
+            // Probe verdict against the LIVE AR cost measured while paused
+            // (already at the current context — no scaling needed). MTP must
+            // WIN outright to stay; otherwise pause again with backoff.
+            let liveArMs = (arSafetyLiveStepSec ?? arSafetySeedStepSec ?? 0) * 1000
+            let mtpMsPerToken = deltaEmitted > 0 ? deltaWallMs / Double(deltaEmitted) : .infinity
+            if liveArMs > 0, mtpMsPerToken * Self.arSafetyReentryHysteresis >= liveArMs {
+                arSafetyPause(
+                    reason: String(
+                        format: "ar_safety_probe_lost(mtp=%.1fms/tok live_ar=%.1fms)",
+                        mtpMsPerToken, liveArMs))
+                let clearLoss = liveArMs > 0 && mtpMsPerToken >= liveArMs * Self.arSafetyClearLossFactor
+                arSafetyResumeInterval = Swift.min(
+                    arSafetyResumeInterval * (clearLoss ? 4 : 2), Self.arSafetyResumeIntervalMax)
+            } else {
+                arSafetyResumes += 1
+                arSafetyReentered = true
+                // The interval is NOT reset here: a re-entry that trips again
+                // backs off from where it was (no ping-pong); it resets only
+                // when the generation ends.
+                adaptiveFallbackReason = nil
+                FileHandle.standardError.write(Data(String(
+                    format: "[NativeMTP] ar_safety resumed: mtp=%.1fms/tok live_ar=%.1fms depth=%d\n",
+                    mtpMsPerToken, liveArMs, currentDepth).utf8))
+            }
+            return
+        }
+
+        // Warmup: judge only once `arSafetyWarmupCycles` have run AND the
+        // window is full of post-warmup cycles (earliest trip = cycle 16).
+        guard verifyCalls >= Self.arSafetyWarmupCycles + window,
+            let seed = arSafetySeedStepSec
+        else { return }
+        if let verdict = Self.windowedARVerdict(
+            arStepMs: seed * 1000,
+            firstVerifyMs: (arSafetyFirstVerifySec ?? 0) * 1000,
+            windowCycles: window,
+            deltaEmitted: deltaEmitted,
+            deltaWallMs: deltaWallMs,
+            deltaVerifyMs: deltaVerifyMs,
+            margin: Self.arSafetyMargin),
+            let median = Self.medianCycleMsPerToken(arSafetyRing),
+            median > verdict.arBaselineMs * Self.arSafetyMargin
+        {
+            arSafetyPause(
+                reason: String(
+                    format: "ar_safety_windowed(mtp=%.1fms/tok ar=%.1fms depth=%d)",
+                    verdict.mtpMsPerToken, verdict.arBaselineMs, currentDepth))
+        }
+    }
+
+    private mutating func arSafetyPause(reason: String) {
+        arSafetyPaused = true
+        arSafetyTrips += 1
+        if arSafetyReentered {
+            // A kept re-entry lost again: back off further (spec: no ping-pong).
+            arSafetyReentered = false
+            arSafetyResumeInterval = Swift.min(
+                arSafetyResumeInterval * 2, Self.arSafetyResumeIntervalMax)
+        }
+        arSafetyTokensSincePause = 0
+        arSafetyProbeCyclesRemaining = 0
+        arSafetyRing.removeAll(keepingCapacity: true)
+        adaptiveWindow.removeAll(keepingCapacity: true)
+        lastAdaptiveCycleTimestamp = nil
+        adaptiveFallbackReason = reason
+        drafts.removeAll(keepingCapacity: true)
+        draftProbabilities.removeAll(keepingCapacity: true)
+        FileHandle.standardError.write(Data("[NativeMTP] ar_safety paused: \(reason)\n".utf8))
+    }
+
+    /// After every AR step: capture the seed AR cost on the very first
+    /// decode step, track live AR cost while paused, and start a resume
+    /// probe on schedule. Resuming = fresh head cache + drafts from THIS
+    /// step's hidden, so the next cycle is a real verify at the start depth.
+    private mutating func arSafetyAfterARStep(
+        stepSec: TimeInterval, hidden: MLXArray, nextToken: MLXArray
+    ) {
+        guard !Self.arSafetyDisabled, !forceAutoregressiveFallback else { return }
+        if arSafetySeedStepSec == nil {
+            // The very first decode step carries graph/kernel warm-up and
+            // reads high (a lenient, never over-eager baseline — but lenient
+            // enough that a prose regime at ~AR speed never tripped). Take
+            // the MIN of two consecutive true AR steps as the seed.
+            if let first = arSafetySeedFirstSampleSec {
+                arSafetySeedStepSec = Swift.min(first, stepSec)
+                arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: false)
+            } else {
+                arSafetySeedFirstSampleSec = stepSec
+            }
+            return
+        }
+        guard arSafetyPaused else { return }
+        arSafetyLiveStepSec = arSafetyLiveStepSec.map { 0.7 * $0 + 0.3 * stepSec } ?? stepSec
+        arSafetyTokensSincePause += 1
+        guard arSafetyTokensSincePause >= arSafetyResumeInterval else { return }
+        arSafetyPaused = false
+        arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: true)
+    }
+
+    private mutating func arSafetyStartSpeculating(
+        hidden: MLXArray, nextToken: MLXArray, probe: Bool
+    ) {
+        // Same re-prime the depth controller uses on every depth change: a
+        // fresh head cache, drafts from the current hidden. Drafts are only
+        // proposals — verification owns every emitted token — so a cold head
+        // cache can only cost acceptance, never correctness.
+        mtpCache = model.makeNativeMTPCache()
+        mtpCacheRefreshCount += 1
+        currentDepth = depth
+        arSafetyRing.removeAll(keepingCapacity: true)
+        arSafetyProbeCyclesRemaining = probe ? Self.arSafetyProbeWindow : 0
+        let draftStart = Date.timeIntervalSinceReferenceDate
+        let draftBatch = Self.makeDrafts(
+            model: model,
+            hidden: hidden,
+            nextToken: nextToken,
+            mtpCache: mtpCache,
+            depth: currentDepth,
+            sampler: sampler,
+            speculativeSampler: speculativeSampler,
+            processor: processor)
+        drafts = draftBatch.tokens
+        draftProbabilities = draftBatch.probabilities
+        headChainPairs = Self.alignedHeadCacheEnabled
+            ? Swift.max(0, draftBatch.tokens.count - 1) : 0
+        mtpForwardCount += draftBatch.forwardCount
+        materializeSyncTime += draftBatch.materializeSyncTime
+        mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
+    }
+
     private mutating func recordAdaptiveCycle(accepted: Int) {
+        // While the AR-safety governor holds the request in AR (or is
+        // probing a resume) the depth controller must not also act: one
+        // decision per window, one owner.
+        if arSafetyPaused || arSafetyProbeCyclesRemaining > 0 { return }
         if Self.adaptiveDisabledForMeasurement {
             // The hatch must not leave the safety warmup permanently
             // incomplete: that silently priced EVERY cycle as a sequential
@@ -1879,15 +2287,35 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             return
         }
-        adaptiveWindow.append(AdaptiveCycle(depth: currentDepth, accepted: accepted))
+        let now = Date.timeIntervalSinceReferenceDate
+        let cycleWall = lastAdaptiveCycleTimestamp.map { now - $0 } ?? 0
+        lastAdaptiveCycleTimestamp = now
+        adaptiveWindow.append(
+            AdaptiveCycle(
+                depth: currentDepth,
+                accepted: accepted,
+                committed: accepted + 1,
+                wallSeconds: Swift.max(0, cycleWall)))
         if adaptiveWindow.count > Self.adaptiveWindowSize {
             adaptiveWindow.removeFirst(adaptiveWindow.count - Self.adaptiveWindowSize)
         }
 
+        // The safety warmup exists for the lazy-repair verifier (an
+        // unaccepted row could reach committed state). Under the STAGED
+        // verifier that corruption class is structurally gone — the
+        // verify-cycle gate already skips warmup there — yet this
+        // acceptance verdict still ran after `hybridWarmupCycleCount` staged
+        // cycles, and one low-acceptance prose generation wrote a PERMANENT
+        // negative memo that turned every later generation in the process
+        // into pure AR (live 2026-09-04: `hybrid_warmup_memo`, verifyCalls=0,
+        // 324/325 tokens AR). Speculation economics under staged verify are
+        // the AR-safety governor's job (windowed, reversible) — never a
+        // one-shot permanent verdict.
         if usesHybridMambaCache,
            speculativeSampler.isGreedy,
            processor == nil,
            !hybridSafetyWarmupComplete,
+           stagedVerifierCommitCount == 0,
            verifyCalls >= Self.hybridWarmupCycleCount
         {
             let acceptedTokens = acceptedByDepth.reduce(0) { partial, item in
@@ -1974,10 +2402,71 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // the sample budget before any demote judgment.
         let inRestoredGraceWindow =
             restoredPrefixStart && verifyCalls < 4 * Self.adaptiveWindowSize
-        if currentDepth >= 3, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
+
+        // WALL-CLOCK pricing (2026-09-04). Acceptance floors are a proxy;
+        // what the user feels is committed tokens per second. Record this
+        // window's measured throughput for the current depth, then demote
+        // when a LOWER depth's remembered throughput beats it with margin —
+        // even at healthy acceptance. This is the fix for "d3 is slower
+        // than d2 sometimes": drafting more per token does not pay when the
+        // acceptance decay + per-row verify cost eat the extra drafts.
+        let timedSamples = activeSamples.filter { $0.wallSeconds > 0 }
+        let windowWall = timedSamples.reduce(0.0) { $0 + $1.wallSeconds }
+        if windowWall > 0, timedSamples.count >= Self.adaptiveMinimumSamplesPerDepth {
+            let committed = timedSamples.reduce(0) { $0 + $1.committed }
+            let throughput = Double(committed) / windowWall
+            measuredThroughputByDepth[currentDepth] =
+                measuredThroughputByDepth[currentDepth].map { 0.5 * $0 + 0.5 * throughput }
+                ?? throughput
+            windowsSinceUpperProbe += 1
+            if windowsSinceUpperProbe >= Self.upperProbeCooldownWindows {
+                // The level above was measured in a different stretch of the
+                // generation; forget it so the climb can be re-attempted.
+                measuredThroughputByDepth[currentDepth + 1] = nil
+                windowsSinceUpperProbe = 0
+            }
+            if currentDepth > 1, !inRestoredGraceWindow,
+                let lower = measuredThroughputByDepth[currentDepth - 1],
+                lower > throughput * Self.wallClockDemoteFactor
+            {
+                adaptiveDemotedFromCount[currentDepth, default: 0] += 1
+                currentDepth -= 1
+                adaptiveDepthDownshiftCount += 1
+                adaptiveWallClockDemotes += 1
+                adaptiveWindow.removeAll(keepingCapacity: true)
+                lastAdaptiveCycleTimestamp = nil
+                windowsSinceUpperProbe = 0
+                mtpCache = model.makeNativeMTPCache()
+                mtpCacheRefreshCount += 1
+                return
+            }
+        }
+
+        // Above the measured d3 regime, price each level one step at a time:
+        // a d5 window that stops paying drops to d4, not to d2 — the deep
+        // levels exist only because acceptance earned them, and one soft
+        // window shouldn't forfeit the whole climb.
+        if currentDepth >= 4, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
+            adaptiveDemotedFromCount[currentDepth, default: 0] += 1
+            currentDepth -= 1
+            adaptiveDepthDownshiftCount += 1
+            adaptiveAcceptanceDemotes += 1
+            adaptiveWindow.removeAll(keepingCapacity: true)
+            lastAdaptiveCycleTimestamp = nil
+            windowsSinceUpperProbe = 0
+            mtpCache = model.makeNativeMTPCache()
+            mtpCacheRefreshCount += 1
+            return
+        }
+
+        if currentDepth == 3, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
+            adaptiveDemotedFromCount[3, default: 0] += 1
             currentDepth = 2
             adaptiveDepthDownshiftCount += 1
+            adaptiveAcceptanceDemotes += 1
             adaptiveWindow.removeAll(keepingCapacity: true)
+            lastAdaptiveCycleTimestamp = nil
+            windowsSinceUpperProbe = 0
             mtpCache = model.makeNativeMTPCache()
             mtpCacheRefreshCount += 1
             return
@@ -1987,15 +2476,33 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // A failing D2 downshifts to D1 first — D1's breakeven is far
             // lower, so "D2 doesn't pay" is not evidence that speculation
             // itself doesn't.
+            adaptiveDemotedFromCount[2, default: 0] += 1
             currentDepth = 1
             adaptiveDepthDownshiftCount += 1
+            adaptiveAcceptanceDemotes += 1
             adaptiveWindow.removeAll(keepingCapacity: true)
+            lastAdaptiveCycleTimestamp = nil
+            windowsSinceUpperProbe = 0
             mtpCache = model.makeNativeMTPCache()
             mtpCacheRefreshCount += 1
             return
         }
 
         if currentDepth == 1, acceptanceRatio < depthOneFloor, !inRestoredGraceWindow {
+            // Under the staged verifier with the governor on, "d1 doesn't
+            // pay" is a REVERSIBLE verdict: pause to AR and let the governor's
+            // probes bring MTP back when the regime changes. Live (4M prose,
+            // build #4): this irreversible fallback fired on 6/8 prose gens
+            // BEFORE the governor could act, locking 55–366 AR tokens per
+            // turn — the "never recovers" behaviour the governor exists to
+            // end. The lazy-repair verifier keeps the irreversible fallback.
+            if staged, !Self.arSafetyDisabled {
+                arSafetyPause(
+                    reason: String(
+                        format: "adaptive_accept_ratio=%.2f_depth=1_paused",
+                        acceptanceRatio))
+                return
+            }
             enableAutoregressiveFallback(
                 reason: String(
                     format: "adaptive_accept_ratio=%.2f_depth=%d",
@@ -2004,22 +2511,40 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        // Re-arm. The controller could historically only demote, so a single
-        // cold window — a restored prefix arriving with a cold aligned-head
-        // cache — pinned the whole session below its configured depth. When a
-        // full window at the CURRENT depth clears the floor of the depth
-        // above with margin, promote one level; the window reset re-prices
-        // the new depth on fresh samples.
-        if currentDepth < depth {
+        // Promote. Historically bounded by the REQUESTED depth (recovery
+        // only); since 2026-09-04 the request is a STARTING depth and a full
+        // window that clears the floor of the level above with margin climbs
+        // toward `adaptiveDepthCeiling` — near-perfect-acceptance shapes
+        // (counting, enumeration) ride to d4/d5 while ordinary prose, whose
+        // acceptance sits under the floors, never leaves its start. Only the
+        // staged verifier earns the extended ceiling: the lazy-repair
+        // verifier keeps the old recover-to-request bound (its rejection
+        // cost model was never re-measured above d3).
+        let promotionCeiling = staged ? adaptiveDepthCeiling : depth
+        if currentDepth < promotionCeiling {
             let nextFloor: Double
             switch currentDepth {
             case 1: nextFloor = depthTwoFloor
             default: nextFloor = depthThreeFloor
             }
-            if acceptanceRatio >= nextFloor + Self.adaptivePromotionMargin {
+            // Don't re-climb to a level whose measured wall-clock already
+            // lost to this one (the cooldown above forgets it eventually so
+            // a changed prompt regime can re-probe).
+            let upperKnownWorse =
+                measuredThroughputByDepth[currentDepth + 1].map { upper in
+                    measuredThroughputByDepth[currentDepth].map { upper < $0 } ?? false
+                } ?? false
+            let upperClosed =
+                adaptiveDemotedFromCount[currentDepth + 1, default: 0]
+                >= Self.adaptiveMaxDemotesPerLevel
+            if acceptanceRatio >= nextFloor + Self.adaptivePromotionMargin,
+                !upperKnownWorse, !upperClosed
+            {
                 currentDepth += 1
                 adaptiveDepthPromotionCount += 1
                 adaptiveWindow.removeAll(keepingCapacity: true)
+                lastAdaptiveCycleTimestamp = nil
+                windowsSinceUpperProbe = 0
             }
         }
     }
@@ -2061,9 +2586,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
 
         let tokenID = recordMaterializeSync { sample.token.item(Int.self) }
+        nanTrace?.observe(
+            output.logits[0..., -1, 0...], site: "mtp", step: tokenCount, role: "ar",
+            sampled: { tokenID })
         pendingTokens.append(tokenID)
         autoregressiveFallbackTokenCount += 1
         nextMain = sample.token
+        // Any drafts made before this AR step were built for the previous
+        // position; they are stale now.
+        drafts.removeAll(keepingCapacity: true)
+        draftProbabilities.removeAll(keepingCapacity: true)
+        arSafetyAfterARStep(
+            stepSec: elapsed,
+            hidden: Self.lastHidden(output.hiddenStates),
+            nextToken: sample.token)
     }
 
     private mutating func verifyCycleSequential(primary: MLXArray) throws {
@@ -2089,6 +2625,22 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             targetForwardCount += 1
             verifyMainForwardCount += 1
             verifyInputTokenCount += 1
+
+            // Diagnostic only: logits are already materialized here, so the
+            // count is cheap; the sampled id is whichever token this
+            // iteration appends (every branch below appends exactly one
+            // before `continue`/`break`), read in the deferred report.
+            let nonFinite = nanTrace == nil
+                ? nil : NaNLogitsTrace.nonFiniteCounts(verifier.logits[0..., -1, 0...])
+            let stepForReport = tokenCount
+            defer {
+                if let nonFinite, let nanTrace {
+                    nanTrace.record(
+                        site: "mtp", step: stepForReport, nan: nonFinite.nan,
+                        inf: nonFinite.inf, role: "verify-seq",
+                        sampled: pendingTokens.last ?? -1)
+                }
+            }
 
             hiddenForNextMTP = Self.lastHidden(verifier.hiddenStates)
 
@@ -2184,6 +2736,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         acceptedByDepth[accepted, default: 0] += 1
+        arSafetyAfterVerifyCycle(accepted: accepted)
         recordAdaptiveCycle(accepted: accepted)
         prefixCommitCount += 1
 

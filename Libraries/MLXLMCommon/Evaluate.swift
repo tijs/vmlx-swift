@@ -1623,6 +1623,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     private var compiledMambaOffsets: [(index: Int, base: Int)] = []
     private var compiledStepCount = 0
 
+    /// `VMLX_LOGITS_NAN_TRACE=1` diagnostic (see ``NaNLogitsTrace``). Created
+    /// lazily on the first sample so the flag-off path costs one `Bool` read.
+    private var nanTrace: NaNLogitsTrace?
+
     // Multi-tier cache coordinator (skeleton integration)
     let cacheCoordinator: CacheCoordinator?
 
@@ -1935,10 +1939,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                     let ssmStates, let diskArrays):
                 var restored = false
                 var retainedDiskRestore = false
+                var restoredTokenCount = 0
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
                     coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
+                        restoredTokenCount = restoredTokens
                         if let ssm = ssmStates {
                             restoreSSMStates(
                                 ssm, into: self.cache, boundary: matchedTokens)
@@ -2008,6 +2014,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                         return count
                     }
                     if diskRestored > 0 {
+                        restoredTokenCount = diskRestored
                         restored = true
                         Self.logger.info(
                             "Cache \(detail.rawValue) hit: restored \(diskRestored) tokens from disk, prefilling \(remainingTokens.count) remaining"
@@ -2015,6 +2022,19 @@ public struct TokenIterator: TokenIteratorProtocol {
                     }
                 }
 
+                // Fail closed: attention offsets come from the restored KV
+                // tensors, recurrent offsets from the matched boundary. A
+                // hybrid whose two halves disagree must rebuild and full-prefill.
+                if restored,
+                    !validateRestoredCacheBoundary(
+                        self.cache, matchedTokens: matchedTokens,
+                        restoredTokens: restoredTokenCount, detail: detail.rawValue)
+                {
+                    restored = false
+                    retainedDiskRestore = false
+                    self.cache = self.model.newCache(parameters: effectiveParameters)
+                    inputForPrepare = input
+                }
                 if restored {
                     if cacheLookupUsesPostPrepareAlias {
                         self.promptTokenIds = cacheLookupTokenIds
@@ -2668,16 +2688,40 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     mutating func convertToToken(logits: MLXArray) -> MLXArray {
         var logits = logits[0..., -1, 0...]
+        // Diagnostic only (`VMLX_LOGITS_NAN_TRACE=1`): keep the raw model
+        // row so the probe below reports what the model produced, before
+        // any processor rewrites it. Sampling behaviour is unchanged.
+        let rawRow = NaNLogitsTrace.isEnabled ? logits : nil
 
         if var processor {
             logits = processor.process(logits: logits)
             let y = sampler.sample(logits: logits)
             processor.didSample(token: y)
             self.processor = processor
+            if let rawRow { probeNonFiniteLogits(rawRow, sampled: y) }
             return y
         }
 
-        return sampler.sample(logits: logits)
+        let y = sampler.sample(logits: logits)
+        if let rawRow { probeNonFiniteLogits(rawRow, sampled: y) }
+        return y
+    }
+
+    /// `VMLX_LOGITS_NAN_TRACE=1` only. Reports the first non-finite
+    /// last-position row of this generation to stderr; never alters `sampled`.
+    private mutating func probeNonFiniteLogits(_ row: MLXArray, sampled: MLXArray) {
+        if nanTrace == nil {
+            nanTrace = NaNLogitsTrace(model: String(describing: type(of: model)))
+        }
+        nanTrace?.observe(
+            row,
+            site: compiledForward != nil ? "solo-compiled" : "solo",
+            step: tokenCount,
+            sampled: { sampled.item(Int.self) })
+    }
+
+    public mutating func finalizeGenerationStats(generatedTokenIds: [Int]) {
+        nanTrace?.finish(totalSteps: tokenCount)
     }
 
     // Whether cache quantization is needed (skip the function call entirely when not)

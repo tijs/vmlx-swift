@@ -44,9 +44,73 @@ import MLXNN
 /// Gate for the GLM5-next sparse-index pooling/scoring dtype. Default runs
 /// in the packed cache's native dtype (no per-step full-context fp32
 /// copies); the env var restores the historical fp32 pipeline for A/B.
-enum Glm5NextIndexerRuntime {
+/// Where does prefill memory actually go? Set `VMLX_GLM5_PREFILL_MEMORY=1`.
+///
+/// Reports, per chunk: MLX's live-tensor total, its allocator free-buffer cache, the high-water
+/// mark, and the bytes held by the KV/indexer caches themselves. The split is the point — a per-token
+/// cost that shows up in ACTIVE memory is something genuinely retained, while one that shows up in
+/// CACHE memory is the allocator holding freed buffers and is not a leak. Attributing GLM-5.3's
+/// residual ~0.25 MB/token needs that distinction; a process-level "peak RAM" number cannot make it.
+enum Glm5NextPrefillMemoryProbe {
+    nonisolated(unsafe) static let enabled: Bool =
+        ProcessInfo.processInfo.environment["VMLX_GLM5_PREFILL_MEMORY"] == "1"
+
+    static func report(tokens: Int, caches: [KVCache]) {
+        guard enabled else { return }
+        var cacheBytes = 0
+        var slots = 0
+        for c in caches {
+            for a in c.state {
+                cacheBytes += a.size * a.dtype.size
+                slots += 1
+            }
+        }
+        let g = 1024.0 * 1024.0 * 1024.0
+        FileHandle.standardError.write(Data(String(
+            format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG slots=%d\n",
+            tokens, Double(GPU.activeMemory) / g, Double(GPU.cacheMemory) / g,
+            Double(GPU.peakMemory) / g, Double(cacheBytes) / g, slots).utf8))
+    }
+}
+
+public enum Glm5NextIndexerRuntime {
     nonisolated(unsafe) static var poolFP32: Bool = {
         ProcessInfo.processInfo.environment["VMLX_GLM5_INDEX_FP32"] == "1"
+    }()
+
+    /// Cache the SHARED `kv_a` latent instead of the expanded per-head K/V ("compact v2").
+    ///
+    /// `kv_b_proj` maps the rank-512 latent to `num_heads * (qk_nope + v_head)` = 64 * 512 = 32768
+    /// values per token. Caching that costs 65,536 bytes per token per MLA layer; caching the latent
+    /// it was expanded FROM costs 1,024 — the same information, 64x smaller, because one latent
+    /// serves all 64 heads. Across GLM-5.3's 11 MLA layers that is 704 KiB/token against 11 KiB, or
+    /// 88 GiB against 1.4 GiB at a 128k context, which is the difference between the advertised
+    /// context being reachable and not.
+    ///
+    /// The equivalence is algebra, not approximation. Attention needs `q·Kᵀ` and `A·V`, and with
+    /// `K = C·W_kᵀ`, `V = C·W_vᵀ` for the shared latent `C`, both regroup:
+    ///     q·Kᵀ = q·(C·W_kᵀ)ᵀ = (q·W_k)·Cᵀ        and        A·V = A·(C·W_vᵀ) = (A·C)·W_vᵀ
+    /// so folding `W_k` into the query and `W_v` into the output leaves the result unchanged while
+    /// the cache holds only `C`. `Glm5NextAbsorbedMLATests` asserts that against the expanded path
+    /// rather than leaving it as reasoning.
+    ///
+    /// Opt out for diagnostics and numerical comparison, mirroring the reference's own
+    /// `VMLX_GLM5_MLA_ABSORB` switch — which defaults ON there for the same reason it does here.
+    /// Gather the selected latent rows instead of masking over the whole history.
+    ///
+    /// Default ON, matching the reference, whose absorbed path gathers for EVERY query length —
+    /// prefill chunks included — rather than only for decode. Opt out for differential comparison:
+    /// the two paths compute the same attention and `Glm5NextGatherTests` asserts it.
+    nonisolated(unsafe) public static var gatherSelected: Bool = {
+        let v = ProcessInfo.processInfo.environment["VMLX_GLM5_GATHER_SELECTED"]?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        return v == nil || ["1", "true", "yes", "on"].contains(v!)
+    }()
+
+    nonisolated(unsafe) public static var absorbMLA: Bool = {
+        let v = ProcessInfo.processInfo.environment["VMLX_GLM5_MLA_ABSORB"]?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        return v == nil || ["1", "true", "yes", "on"].contains(v!)
     }()
 }
 
@@ -390,6 +454,13 @@ public enum Glm5NextCheckpointKeys {
 
     /// Weights for a tower that was not built. Dropping them is what makes a narrowed construction
     /// loadable at all: MLX refuses keys with no matching module.
+    /// The decoder-layer index a key belongs to, or nil if it names no layer.
+    static func decoderLayerIndex(_ key: String) -> Int? {
+        guard let range = key.range(of: "layers.") else { return nil }
+        let digits = key[range.upperBound...].prefix { $0.isNumber }
+        return digits.isEmpty ? nil : Int(digits)
+    }
+
     public static func isVisionKey(_ key: String) -> Bool {
         key.hasPrefix("model.visual.") || key.hasPrefix("visual.")
             || key.hasPrefix("model.vision_tower.") || key.hasPrefix("vision_tower.")
@@ -439,12 +510,18 @@ public enum Glm5NextCheckpointKeys {
     }
 
     /// Apply the policy. `keepVision` is the plan's answer, not a guess from the key set.
+    /// - Parameter dropLayersFrom: when non-nil, discard weights for decoder layers at or above
+    ///   this index. That is how an MTP-carrying bundle loads with the head switched off: the keys
+    ///   are dropped here rather than left unclaimed, which `verify: [.noUnusedKeys]` would reject.
     public static func sanitize(
-        _ weights: [String: MLXArray], keepVision: Bool
+        _ weights: [String: MLXArray], keepVision: Bool, dropLayersFrom: Int? = nil
     ) -> [String: MLXArray] {
         var out = [String: MLXArray](minimumCapacity: weights.count)
         for (key, value) in weights {
             if !keepVision, isVisionKey(key) { continue }
+            if let floor = dropLayersFrom, let index = decoderLayerIndex(key), index >= floor {
+                continue
+            }
             // Torch conv layout [O, I, …] -> MLX [O, …, I]. `patch_embed.proj` is 5-D and
             // `downsample` is 4-D; a bundle already converted is left alone, which is what the
             // trailing-dimension check decides.
@@ -469,6 +546,26 @@ public enum Glm5NextCheckpointKeys {
         }
         return out
     }
+}
+
+/// Whether this load builds GLM-5.3's multi-token-prediction head.
+///
+/// `num_nextn_predict_layers` is `1` in BOTH shipped bundles, but only the `-MTP` bundle carries
+/// layer 45's weights. Building the head from the config alone therefore allocated a 288-expert MoE
+/// that no checkpoint key binds to: three DENSE, UNQUANTIZED `switch_mlp` projections at 4.83 GB
+/// each. Nothing read them — the backbone forward runs `layers.prefix(numDecoderLayers)` and
+/// `multiTokenPredictionLayer` has no callers — but 14.5 GB of resident parameters pushed the
+/// process past MLX's allocator GC threshold (`0.95 * recommendedMaxWorkingSetSize`, which no cap
+/// can raise). Above it `MetalAllocator::malloc` releases the buffer cache on EVERY allocation, so
+/// buffer reuse stops entirely.
+///
+/// `verify: [.noUnusedKeys]` cannot catch this: it asserts that no checkpoint KEY went unclaimed,
+/// and a module that receives no weights consumes no keys.
+///
+/// Fail-closed, matching `nemotronHNativeMTPEnabled()`: with no host request the head is never
+/// built and costs nothing. `LoadConfiguration.nativeMTP` is how a host asks for it.
+internal func glm5NextNativeMTPEnabled() -> Bool {
+    NativeMTPActivation.isExplicitlyRequested
 }
 
 // MARK: - Linear attention
@@ -575,6 +672,108 @@ public final class Glm5NextSparseAttention: Module {
         super.init()
     }
 
+    /// Dequantized per-head factors of `kv_b_proj`, split into its K and V halves.
+    ///
+    /// Computed once and kept: `[H, qk_nope, rank]` and `[H, v_head, rank]`, ~33 MB per layer at
+    /// GLM-5.3's dimensions, against the GiB-scale cache the absorbed form removes. The reference
+    /// keeps exactly the same two arrays for exactly the same reason.
+    ///
+    /// The weight must be DEQUANTIZED first: the absorbed form multiplies it into the query rather
+    /// than applying it as a layer, so the packed representation cannot be used directly.
+    private var wKNope: MLXArray?
+    private var wKV: MLXArray?
+
+    private func kbFactors() -> (MLXArray, MLXArray) {
+        if let k = wKNope, let v = wKV { return (k, v) }
+        var w = kvBProj.weight
+        if let q = kvBProj as? QuantizedLinear {
+            w = dequantized(
+                w, scales: q.scales, biases: q.biases,
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+        }
+        w = w.reshaped(numHeads, qkNopeHeadDim + vHeadDim, -1)
+        let k = w[0..., ..<qkNopeHeadDim, 0...]
+        let v = w[0..., qkNopeHeadDim..., 0...]
+        eval(k, v)
+        wKNope = k
+        wKV = v
+        return (k, v)
+    }
+
+
+    /// Attend to each query's SELECTED latent rows, without a dense mask over the whole history.
+    ///
+    /// This is the difference between a working set that grows with context and one that does not.
+    /// The masking path runs full attention over every cached key and then hides most of it: its
+    /// scores are `[heads, S, total]`, so the transient grows linearly with history forever.
+    /// Measured on this model at 8k, that was 81% of all peak growth — 2.98 MiB per chunk-token,
+    /// which is exactly 3.0 tensors of `[64 heads x history]` in bf16 (one score matrix plus the two
+    /// dense masks). Gathering instead makes the cost `O(tile x K x rank)` where K is `index_topk`,
+    /// which is CAPPED — so past the selection threshold the transient stops growing at all.
+    ///
+    /// The shape trick is the reference's: each query ROW becomes a batch element with its own K
+    /// gathered rows, so the 64 attention heads move into the query axis and the kv head count is 1.
+    /// All heads of one query share the same selected keys, which is what makes that legal.
+    ///
+    /// `gatherElementBudget` bounds the tile so the gathered block is a predictable size regardless
+    /// of how many queries arrive at once; the reference uses the same constant.
+    static let gatherElementBudget = 268_435_456
+
+    private func gatherAbsorbedAttention(
+        queries: MLXArray,  // [B, H, S, rank]
+        latent: MLXArray,  // [B, 1, total, rank]
+        indices: MLXArray,  // [B, S, K]
+        valid: MLXArray,  // [B, S, K], true where the index is usable
+        past: Int
+    ) -> MLXArray {
+        let B = queries.dim(0), H = queries.dim(1), S = queries.dim(2), rank = queries.dim(3)
+        let K = indices.dim(-1)
+        let flat = latent[0..., 0]  // [B, total, rank]
+        let total = flat.dim(1)
+        let tile = max(1, min(S, Self.gatherElementBudget / max(K * rank, 1)))
+
+        var outputs: [MLXArray] = []
+        var start = 0
+        while start < S {
+            let stop = min(start + tile, S)
+            let rows = stop - start
+            let idx = indices[0..., start ..< stop]
+            let validRows = valid[0..., start ..< stop]
+            let safe = MLX.where(validRows, idx, MLXArray.zeros(like: idx))
+
+            let gathered: MLXArray
+            if B == 1 {
+                gathered = take(flat[0], safe.reshaped(rows * K), axis: 0)
+            } else {
+                // Fold the batch into the row index so one gather serves every sequence.
+                let offsets = (MLXArray(Int32(0) ..< Int32(B)) * MLXArray(Int32(total)))
+                    .asType(safe.dtype).expandedDimensions(axis: -1)
+                let shifted = (safe.reshaped(B, rows * K) + offsets).reshaped(B * rows * K)
+                gathered = take(flat.reshaped(B * total, rank), shifted, axis: 0)
+            }
+            let keys = gathered.reshaped(B * rows, 1, K, rank)
+            let q = queries[0..., 0..., start ..< stop]
+                .transposed(0, 2, 1, 3).reshaped(B * rows, 1, H, rank)
+
+            // Causality still has to be enforced here: the indexer may offer a pool whose rows run
+            // past this query's own position, and there is no causal mask left to catch it.
+            let qPos = (MLXArray(Int32(start) ..< Int32(stop)) + MLXArray(Int32(past)))
+                .expandedDimensions(axis: 0).expandedDimensions(axis: -1)
+            let allowed = validRows .&& (idx .<= qPos.asType(idx.dtype))
+            let bias = MLX.where(
+                allowed, MLXArray(Float(0)),
+                MLXArray(-Float.greatestFiniteMagnitude)
+            ).reshaped(B * rows, 1, 1, K)
+
+            let attended = MLXFast.scaledDotProductAttention(
+                queries: q, keys: keys, values: keys, scale: scale,
+                mask: .array(bias.asType(q.dtype)))
+            outputs.append(attended.reshaped(B, rows, H, rank).transposed(0, 2, 1, 3))
+            start = stop
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
     /// MLA over the keys the indexer selects.
     ///
     /// Below `index_topk` the selection is skipped, and that is an EQUIVALENCE rather than an
@@ -611,28 +810,116 @@ public final class Glm5NextSparseAttention: Module {
 
         // No rotary split, so `_with_mqa` carries the compressed KV alone.
         let compressed = kvALayerNorm(kvAProjWithMqa(x))
-        var kv = kvBProj(compressed)
-        kv = kv.reshaped(B, T, numHeads, qkNopeHeadDim + vHeadDim).transposed(0, 2, 1, 3)
-        var keys = kv[.ellipsis, ..<qkNopeHeadDim]
-        var values = kv[.ellipsis, qkNopeHeadDim...]
 
-        if let cache {
-            (keys, values) = cache.update(keys: keys, values: values)
-        }
-
+        // ONE mask for both representations. It selects KEY POSITIONS and knows nothing about how
+        // wide a key is, so absorbing `kv_b_proj` into the query does not change it.
+        //
         // The sparse mask REPLACES the causal one rather than joining it: the indexer has already
         // applied causality (a pool is a candidate only if its last token is visible to the query),
         // so anding them again would be redundant, and passing the causal mask instead of the
         // sparse one would silently un-sparsify the layer.
-        var effectiveMask = mask
-        if let selected {
-            let visible = indexer.maskFromIndices(selected, kvLength: keys.dim(2))
-            effectiveMask = MLX.where(
-                visible, MLXArray(Float(0)).asType(q.dtype),
-                MLXArray(-Float.greatestFiniteMagnitude).asType(q.dtype))
+        func attentionMask(
+            kvLength: Int, dtype: DType
+        ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+            if let selected {
+                let visible = indexer.maskFromIndices(selected, kvLength: kvLength)
+                return .array(
+                    MLX.where(
+                        visible, MLXArray(Float(0)).asType(dtype),
+                        MLXArray(-Float.greatestFiniteMagnitude).asType(dtype)))
+            }
+            if let mask { return .array(mask) }
+            if T > 1 {
+                // CAUSALITY, for the path where the selection is SKIPPED. Below `index_topk` the
+                // indexer deliberately returns nothing, and nothing else supplied causality here:
+                // every caller passes `mask: nil`, the language model forwards it unchanged, and
+                // SDPA treats a nil mask as NO MASK rather than as a causal sentinel, so prefill
+                // was bidirectional.
+                //
+                // `.causal` and NOT a materialised `[T, kvLength]` array. The mode lets MLX take
+                // its fused kernel; an explicit array can force the scores to be materialised
+                // instead, and at GLM-5.3's 64 heads an 8k prefill is then 8192 x 8192 x 64 x 2 B
+                // = 8.6 GB of scores per layer — measured as an OOM, not a slowdown. `.causal`
+                // also carries the cache offset by convention (the last `T` queries align to the
+                // last `T` keys), which is what `createAttentionMask` relies on, so it needs no
+                // offset argument. The reference passes its own `mask="causal"` for both reasons.
+                return .causal
+            }
+            // Decode: one query, no future to hide.
+            return .none
         }
-        let out = MLXFast.scaledDotProductAttention(
-            queries: q, keys: keys, values: values, scale: scale, mask: effectiveMask)
+
+        let out: MLXArray
+        // The CACHE decides, so a cache cannot change representation underneath itself; the global
+        // only seeds a fresh one, and only matters at all when there is no cache (a bare forward).
+        if indexed?.absorbed ?? Glm5NextIndexerRuntime.absorbMLA {
+            // COMPACT (v2): the cache holds the shared latent, not the expanded per-head K/V.
+            var latent = compressed.expandedDimensions(axis: 1)  // [B, 1, T, rank]
+            if let cache {
+                // One "head", broadcast across all `numHeads` queries — that single axis is where
+                // the 64x comes from. `KVCacheSimple` sizes its keys and values slots independently
+                // (`kHeadDim` vs `vHeadDim`), so the values slot takes a 1-wide stub rather than a
+                // second copy of the latent: 2 bytes per token per layer. Reusing it also inherits
+                // its capacity growth, in-place update, trim and serialization, which is why this
+                // needs none of the reference's hand-written absorbed-capacity machinery.
+                let stub = MLXArray.zeros([B, 1, T, 1], dtype: latent.dtype)
+                (latent, _) = cache.update(keys: latent, values: stub)
+            }
+            let total = latent.dim(2)
+
+            if T > 1, selected == nil {
+                // DENSE PREFILL: re-expand the fetched latent ONCE, transiently. Absorption widens
+                // both attention operands from the head dims (256) to the latent rank (512), which
+                // is a loss when there are many queries and a large win when there is one. The
+                // reference splits at exactly this boundary for exactly this reason. The persisted
+                // cache still holds only the latent.
+                var kv = kvBProj(latent[0..., 0])
+                kv = kv.reshaped(B, total, numHeads, qkNopeHeadDim + vHeadDim)
+                    .transposed(0, 2, 1, 3)
+                out = MLXFast.scaledDotProductAttention(
+                    queries: q, keys: kv[.ellipsis, ..<qkNopeHeadDim],
+                    values: kv[.ellipsis, qkNopeHeadDim...],
+                    scale: scale, mask: attentionMask(kvLength: total, dtype: q.dtype))
+            } else {
+                // DECODE, and the sparse path: attend in latent space. `q·Kᵀ = (q·W_k)·Cᵀ`, so the
+                // query absorbs `W_k`; `A·V = (A·C)·W_vᵀ`, so the output absorbs `W_v`. `scale` is
+                // unchanged because it is the same dot product, merely regrouped.
+                let (wk, wv) = kbFactors()
+                let qEff = matmul(q, wk.expandedDimensions(axis: 0).asType(q.dtype))
+                let attended: MLXArray
+                if let selected, Glm5NextIndexerRuntime.gatherSelected {
+                    // GATHER the selected rows rather than attending over all of them and hiding
+                    // most with a mask. Same attention, but the working set is O(tile x K x rank)
+                    // with K capped at `index_topk`, so it stops growing with context.
+                    let valid =
+                        (selected .>= MLXArray(Int32(0)))
+                        .&& (selected .< MLXArray(Int32(total)))
+                    attended = gatherAbsorbedAttention(
+                        queries: qEff, latent: latent, indices: selected, valid: valid,
+                        past: cached)
+                } else {
+                    attended = MLXFast.scaledDotProductAttention(
+                        queries: qEff, keys: latent, values: latent,
+                        scale: scale, mask: attentionMask(kvLength: total, dtype: qEff.dtype))
+                }
+                out = matmul(
+                    attended,
+                    wv.expandedDimensions(axis: 0).swappedAxes(-1, -2).asType(attended.dtype))
+            }
+        } else {
+            // EXPANDED (v1): kept as the differential reference for the compact path, and as the
+            // diagnostic opt-out. Measured at 64x the cache of the path above.
+            var kv = kvBProj(compressed)
+            kv = kv.reshaped(B, T, numHeads, qkNopeHeadDim + vHeadDim).transposed(0, 2, 1, 3)
+            var keys = kv[.ellipsis, ..<qkNopeHeadDim]
+            var values = kv[.ellipsis, qkNopeHeadDim...]
+            if let cache {
+                (keys, values) = cache.update(keys: keys, values: values)
+            }
+            out = MLXFast.scaledDotProductAttention(
+                queries: q, keys: keys, values: values, scale: scale,
+                mask: attentionMask(kvLength: keys.dim(2), dtype: q.dtype))
+        }
         return oProj(out.transposed(0, 2, 1, 3).reshaped(B, T, numHeads * vHeadDim))
     }
 }
@@ -780,7 +1067,20 @@ public final class Glm5NextIndexedKVCache: KVCache {
     /// is padding" would have to be rewritten rather than fed differently if padding ever arrives.
     public private(set) var indexerPacked: MLXArray?
 
-    public init() {}
+    /// Which K/V representation this cache holds: the shared `kv_a` latent (compact) or the expanded
+    /// per-head K/V.
+    ///
+    /// It belongs to the CACHE and is fixed at construction, not read from the global on every call.
+    /// The two representations have different shapes — `[B, 1, N, rank]` against
+    /// `[B, heads, N, head_dim]` — so a cache written in one mode and appended to in the other does
+    /// not degrade, it traps inside MLX with a broadcast error naming shapes that appear nowhere in
+    /// this file. Binding the mode to the object makes that unrepresentable instead of merely
+    /// unlikely. The reference does the same, down to refusing to merge caches that disagree.
+    public let absorbed: Bool
+
+    public init(absorbed: Bool? = nil) {
+        self.absorbed = absorbed ?? Glm5NextIndexerRuntime.absorbMLA
+    }
 
     /// Append this step's rows and return the whole history.
     public func updateIndexer(_ new: MLXArray) -> MLXArray {
@@ -809,7 +1109,13 @@ public final class Glm5NextIndexedKVCache: KVCache {
             // The packed buffer is the ONLY optional trailing entry, so its presence is decided by
             // the count rather than by position — restoring it into the KV slots would corrupt both.
             let kvCount = kv.state.count
-            kv.state = Array(newValue.prefix(kvCount))
+            let kvPortion = Array(newValue.prefix(kvCount))
+            // Same empty guard as `copy()`: the inner setter traps on a count
+            // that is not exactly 2, and an empty restore (fresh snapshot)
+            // yields no KV arrays.
+            if !kvPortion.isEmpty {
+                kv.state = kvPortion
+            }
             indexerPacked = newValue.count > kvCount ? newValue[kvCount] : nil
         }
     }
@@ -838,8 +1144,18 @@ public final class Glm5NextIndexedKVCache: KVCache {
     }
 
     public func copy() -> any KVCache {
-        let copy = Glm5NextIndexedKVCache()
-        copy.kv.state = kv.state.map(Self.owned)
+        let copy = Glm5NextIndexedKVCache(absorbed: absorbed)
+        // The inner KVCacheSimple's state setter requires EXACTLY [keys,
+        // values] and traps on any other count. A fresh cache (no tokens yet)
+        // yields an EMPTY state, so restore it only when present — the same
+        // guard `KVCacheSimple.copy()` and `DeepseekV4Compressor` already use.
+        // Without it, snapshotting a fresh cache at the prompt boundary (the
+        // very first generation) round-tripped `[]` through the setter and
+        // trapped, crashing the app before any token was produced.
+        let innerState = kv.state
+        if !innerState.isEmpty {
+            copy.kv.state = innerState.map(Self.owned)
+        }
         copy.kv.metaState = kv.metaState
         copy.kv.offset = kv.offset
         copy.indexerPacked = indexerPacked.map(Self.owned)
@@ -1446,8 +1762,23 @@ public enum Glm5NextActivation {
     /// the reference would have bounded.
     public static func clampedSwiGLU(gate g: MLXArray, up u: MLXArray, limit: Float?) -> MLXArray {
         guard let limit else { return silu(g) * u }
-        let gateClamped = minimum(g, MLXArray(limit))
-        let upClamped = clip(u, min: -limit, max: limit)
+        // THE SCALARS MUST CARRY THE OPERAND'S DTYPE. `MLXArray(someFloat)` is a FLOAT32 scalar, and
+        // `minimum(bf16, f32)` promotes — so the bound, not the data, decided the width of every
+        // activation in the model.
+        //
+        // The blast radius was the whole network, not this function: the promoted MLP output becomes
+        // `blockOut`, the hyper-connection expand returns `blockOut.dtype`, and the residual stream
+        // is float32 from the first layer onward for all 45. Measured, that is most of GLM-5.3's
+        // ~7.8 MB/token prefill growth, and it is why the fused affine MoE decode kernel — whose
+        // contract is BF16 in and out — was rejected on every invocation, so a fast path that was
+        // correctly built and correctly wired never once ran.
+        //
+        // Nothing here changes the ARITHMETIC: the clamp is `minimum(gate, limit)` and
+        // `clip(up, -limit, limit)`, exactly as the reference's `_clamped_swiglu` does it.
+        let hi = MLXArray(limit).asType(g.dtype)
+        let gateClamped = minimum(g, hi)
+        let bound = MLXArray(limit).asType(u.dtype)
+        let upClamped = clip(u, min: -bound, max: bound)
         return silu(gateClamped) * upClamped
     }
 }
@@ -1524,16 +1855,34 @@ public final class Glm5NextMoE: Module {
             numExperts: config.nRoutedExperts,
             // `swiglu_limit` is 10.0 in this bundle, so the activation is CLAMPED. Plain silu would
             // be wrong on the tail, silently — nothing about the shapes would object.
-            activation: { clip(silu($0), min: -config.swigluLimit!, max: config.swigluLimit!) })
+            activation: { clip(silu($0), min: -config.swigluLimit!, max: config.swigluLimit!) },
+            // The SAME value that builds the eager activation above, so the fused decode kernel and
+            // the generic path cannot disagree about the clamp.
+            swigluLimit: config.swigluLimit)
         _sharedExperts.wrappedValue = Glm5NextSharedExpert(config)
         super.init()
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = gate(x, correctionBias: eScoreCorrectionBias)
-        let routed = switchMLP(x, indices)
-        // `switchMLP` returns [..., topK, hidden]; weight each expert's contribution and sum.
-        let combined = (routed * expandedDimensions(weights, axis: -1)).sum(axis: -2)
+
+        // DECODE FAST PATH. `qwen4ExpReduced` walks gate and up in one pass and applies the router
+        // scores while reducing the down projections straight into the hidden vector, so it never
+        // materialises the [routes, hidden] routed tensor the generic path builds. It returns nil
+        // for anything it does not handle exactly — prefill batches, unqualified geometry, a
+        // quantization it has not been given — and the generic path below then runs unchanged.
+        //
+        // Asking for it is the half that was missing: the kernel and its shape gate can both be
+        // correct while nothing ever calls them, which is what made this a fast path GLM-5.3 could
+        // not reach no matter what the gate said.
+        let combined: MLXArray
+        if let fused = switchMLP.qwen4ExpReduced(x, indices: indices, scores: weights) {
+            combined = fused
+        } else {
+            let routed = switchMLP(x, indices)
+            // `switchMLP` returns [..., topK, hidden]; weight each expert's contribution and sum.
+            combined = (routed * expandedDimensions(weights, axis: -1)).sum(axis: -2)
+        }
         // The shared expert is ALWAYS on — it is not one of the routed `topK`.
         return combined + sharedExperts(x)
     }
@@ -1767,7 +2116,53 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
         let imagePixels = input.image?.pixels
         let videoPixels = input.video?.pixels
         guard imagePixels != nil || videoPixels != nil else {
-            return .tokens(input.text)
+            // TEXT-ONLY PREFILL, IN CHUNKS.
+            //
+            // Returning `.tokens` hands the prompt to the generic path, which runs it as ONE forward
+            // (`_ = model(remaining[text: .newAxis], ...)`). Every layer's activations for the whole
+            // prompt are then live at once, so peak memory grows with prompt LENGTH: measured at
+            // 4.2 MB/token after the dtype fix, against a KV cache of 11 KiB/token. That is what put
+            // the context ceiling between 4k and 5k on a machine with ~8 GiB of working headroom
+            // above a 95 GiB model.
+            //
+            // Chunking bounds the working set to one chunk instead of the whole prompt. The
+            // `MLX.eval(cache)` is what makes it work at all: MLX is lazy, so without forcing the
+            // graph each chunk's intermediates stay alive and chunking buys nothing. The reference
+            // does exactly this in its runner (512-token chunks, `mx.eval(cache)`, commented "Force
+            // evaluation to free intermediate memory"), and four models here already do it through
+            // `chunkedPrefillEmbedding` — GLM-5.3 simply never did.
+            //
+            // This was BLOCKED until the causal-mask fix. Chunking is only sound if the forward is
+            // segmentation-invariant, and GLM-5.3's was not: with no causal mask below `index_topk`,
+            // each chunking produced a different answer. `Glm5NextSparseAttentionTests` now pins
+            // that invariance, which is what makes this safe to do.
+            // `VMLX_GLM5_PREFILL_STEP` overrides the caller's step. It is a real memory/latency
+            // knob, measured at 8k: 128 versus 512 gives peak 97.0 vs 99.2 GB and TTFT 124-135s vs
+            // 99-108s, both reproducible in every paired run. Smaller chunks bound the attention
+            // working set and cost launch overhead.
+            let step =
+                Int(ProcessInfo.processInfo.environment["VMLX_GLM5_PREFILL_STEP"] ?? "")
+                ?? (windowSize ?? 512)
+            let ids = input.text.tokens.ndim == 1
+                ? input.text.tokens.expandedDimensions(axis: 0) : input.text.tokens
+            let promptTokenCount = ids.dim(1)
+            guard step > 0, promptTokenCount > step else { return .tokens(input.text) }
+
+            var offset = 0
+            while offset + step < promptTokenCount {
+                try Task.checkCancellation()
+                let end = offset + step
+                _ = try languageModel(ids[0..., offset ..< end], mask: nil, caches: cache)
+                MLX.eval(cache)
+                PrefillProgressReporter.reportCompletedUnits(end)
+                offset = end
+                Glm5NextPrefillMemoryProbe.report(tokens: end, caches: cache)
+                MLX.Memory.clearCache()
+            }
+            // The final chunk returns the hidden states the caller needs logits from.
+            let hidden = try languageModel(ids[0..., offset...], mask: nil, caches: cache)
+            let logits = lmHead.map { $0(hidden) } ?? languageModel.embedTokens.asLinear(hidden)
+            return .logits(LMOutput(logits: logits))
         }
 
         guard let tower = visionTower else {
@@ -2304,7 +2699,10 @@ public final class Glm5NextLanguageModel: Module {
     public init(_ config: Glm5NextTextConfiguration) throws {
         let schedule = try config.validatedSchedule()
         self.numDecoderLayers = config.numHiddenLayers
-        self.numMTPLayers = max(0, config.numNextnPredictLayers)
+        // Gated, not config-driven: see `glm5NextNativeMTPEnabled()`. A bundle that declares an
+        // MTP layer but ships no weights for it must not allocate one.
+        self.numMTPLayers =
+            glm5NextNativeMTPEnabled() ? max(0, config.numNextnPredictLayers) : 0
         self.usesHyperConnections = config.mhc
         self.hcMult = config.hcMult
 
@@ -2675,7 +3073,10 @@ public class Glm5Next: Module, ModalityBearing, ModelComponentMapping {
     /// Applies the bundle's key policy, asking the PLAN whether the tower exists rather than
     /// inferring it from which keys happen to be present.
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        Glm5NextCheckpointKeys.sanitize(weights, keepVision: plan.builds(.visionTower))
+        Glm5NextCheckpointKeys.sanitize(
+            weights, keepVision: plan.builds(.visionTower),
+            dropLayersFrom: glm5NextNativeMTPEnabled()
+                ? nil : config.textConfig.numHiddenLayers)
     }
 
     /// The linear-attention layers, in decoder order. Built lazily by `buildLinearAttentionLayers`

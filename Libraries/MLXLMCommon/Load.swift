@@ -122,6 +122,103 @@ private func modelIndexContainsPreservedMTPWeight(at modelDirectory: URL) -> Boo
     return weightMap.keys.contains(where: isPreservedMTPWeightKey)
 }
 
+/// The unique shard file names `model.safetensors.index.json` maps weights
+/// into, or nil when the bundle has no readable index (single-file and
+/// legacy bundles keep the directory-scan path). Entries that try to escape
+/// the bundle (absolute paths, `..`) are dropped — weight_map values are
+/// plain file names by contract, and a hostile index must not become a
+/// file-system probe.
+/// What `model.safetensors.index.json` means for the load, given which of the
+/// files it names exist next to it:
+/// - every named file exists → the index is the load manifest (`manifest`);
+/// - some exist and some do not → a truncated or partially replaced download
+///   (`truncated`): loading the rest would silently leave tensors
+///   uninitialised (`model.update` verifies unused keys, not missing ones),
+///   so the load fails loud;
+/// - NONE exist and the directory holds exactly one COMPLETE numbered
+///   `model-NNNNN-of-MMMMM` family (every 1…M present) → the index is from
+///   another layout of the same bundle (`staleIndex`); that family — and
+///   only that family — is the bundle the index failed to describe;
+/// - NONE exist and there is no complete family (an empty or partial
+///   download, unrelated sidecars only, two families) → `incomplete`: fail
+///   loud, nothing can be positively identified as the model.
+enum IndexManifestDecision: Equatable {
+    case manifest([String])
+    case truncated(missing: [String])
+    case staleIndex(missing: [String], replacement: [String])
+    case incomplete(missing: [String])
+}
+
+/// The one complete `model-NNNNN-of-MMMMM.safetensors` family among `names`
+/// (1…M all present, exactly one M), in shard order; nil otherwise.
+func completeNumberedShardFamily(in names: [String]) -> [String]? {
+    let regex = try! NSRegularExpression(pattern: #"^model-(\d+)-of-(\d+)\.safetensors$"#)
+    var byTotal: [Int: [Int: String]] = [:]
+    for name in names {
+        let whole = NSRange(name.startIndex..., in: name)
+        guard let match = regex.firstMatch(in: name, range: whole),
+            let indexRange = Range(match.range(at: 1), in: name),
+            let totalRange = Range(match.range(at: 2), in: name),
+            let index = Int(name[indexRange]), let total = Int(name[totalRange])
+        else { continue }
+        byTotal[total, default: [:]][index] = name
+    }
+    guard byTotal.count == 1, let (total, files) = byTotal.first, total > 0,
+        Set(files.keys) == Set(1...total)
+    else { return nil }
+    return (1...total).map { files[$0]! }
+}
+
+func indexManifestDecision(indexedNames: [String], presentNames: [String]) -> IndexManifestDecision {
+    let present = Set(presentNames)
+    var found: [String] = []
+    var missing: [String] = []
+    for name in indexedNames {
+        if present.contains(name) { found.append(name) } else { missing.append(name) }
+    }
+    if missing.isEmpty { return .manifest(found) }
+    if !found.isEmpty { return .truncated(missing: missing) }
+    if let family = completeNumberedShardFamily(in: presentNames) {
+        return .staleIndex(missing: missing, replacement: family)
+    }
+    return .incomplete(missing: missing)
+}
+
+/// The tensor names a safetensors file declares (header only, no payload
+/// read); nil when the header cannot be read.
+func safetensorsTensorKeys(_ url: URL) -> [String]? {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? handle.close() }
+    guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8
+    else { return nil }
+    var headerLength: UInt64 = 0
+    for (index, byte) in lengthData.enumerated() {
+        headerLength |= UInt64(byte) << UInt64(index * 8)
+    }
+    guard headerLength > 0, headerLength <= 64 * 1024 * 1024,
+        let headerData = try? handle.read(upToCount: Int(headerLength)),
+        headerData.count == Int(headerLength),
+        let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
+    else { return nil }
+    return header.keys.filter { $0 != "__metadata__" }
+}
+
+func indexedShardFileNames(at modelDirectory: URL) -> [String]? {
+    let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
+    guard let data = try? Data(contentsOf: indexURL),
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let weightMap = json["weight_map"] as? [String: Any]
+    else { return nil }
+    var names: Set<String> = []
+    for value in weightMap.values {
+        guard let name = value as? String, !name.isEmpty,
+            !name.hasPrefix("/"), !name.contains("..")
+        else { continue }
+        names.insert(name)
+    }
+    return names.isEmpty ? nil : names.sorted()
+}
+
 private func loadJangConfigSanitizeMetadata(at modelDirectory: URL) -> [String: String] {
     guard let url = JangLoader.findConfigPath(at: modelDirectory),
         let data = try? Data(contentsOf: url),
@@ -241,6 +338,98 @@ public func loadWeights(
                 continue
             }
             allShardURLs.append(url)
+        }
+        // FINAL bundle-layout contract (2026-09-04, JANG bundles): when the
+        // bundle ships `model.safetensors.index.json`, the index IS the load
+        // manifest — load exactly the files its weight_map names, nothing
+        // else. Discovery-by-glob is what let withdrawn artifacts (a
+        // dedicated `mtp-00001-*` shard, an interim root-level draft-head
+        // sidecar) leak into `model.update()` as duplicate/unknown keys and
+        // fail loads the index itself defines as complete. An extra file the
+        // index does not mention must never fail — or even affect — a load;
+        // the calibrated draft sidecar lives in `mtp_draft/` for exactly
+        // that reason. Named runtime overlays (`jangtq_stacked`,
+        // `jangpress-prestacked`) are deliberate artifacts, not indexed
+        // weights, so they keep their exact-path opt-in. Gated to JANG
+        // bundles: stock community bundles keep the historical glob and are
+        // untouched by this contract.
+        if jangConfig != nil,
+            let indexedNames = indexedShardFileNames(at: modelDirectory)
+        {
+            let decision = indexManifestDecision(
+                indexedNames: indexedNames,
+                presentNames: allShardURLs.map(\.lastPathComponent))
+            var selected: [URL] = []
+            switch decision {
+            case .manifest(let names):
+                selected = names.map { modelDirectory.appendingPathComponent($0) }
+            case .truncated(let missing), .incomplete(let missing):
+                let message =
+                    "model.safetensors.index.json references \(missing.count) "
+                    + "file(s) that are not in \(modelDirectory.path): "
+                    + missing.sorted().joined(separator: ", ")
+                    + ". The bundle layout is incomplete or superseded — "
+                    + "re-download the bundle."
+                FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                throw TruncatedSafetensorsError(description: message)
+            case .staleIndex(let missing, let replacement):
+                // The index describes a layout that is not in this directory
+                // at all (a bundle re-uploaded with new shards but an old
+                // index — JANGQ-AI/Ling-2.6-flash-JANGTQ names 31 files, ships
+                // a complete 29-shard family, osaurus#2652). The one complete
+                // numbered family IS the bundle; load exactly it (plus the
+                // named overlays below), never every safetensors file, and
+                // refuse if two shards declare the same tensor — the
+                // `model.update` verification behind this only checks unused
+                // keys, so a duplicate would silently win by order.
+                var seen: [String: String] = [:]
+                var duplicates: [String] = []
+                for name in replacement {
+                    let url = modelDirectory.appendingPathComponent(name)
+                    guard let keys = safetensorsTensorKeys(url) else {
+                        let message =
+                            "model.safetensors.index.json is stale (names \(missing.count) absent file(s)) "
+                            + "and the replacement shard \(name) has an unreadable header — re-download the bundle."
+                        FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                        throw TruncatedSafetensorsError(description: message)
+                    }
+                    for key in keys {
+                        if let first = seen[key] { duplicates.append("\(key) (\(first), \(name))") } else { seen[key] = name }
+                    }
+                }
+                if !duplicates.isEmpty {
+                    let message =
+                        "model.safetensors.index.json is stale and the \(replacement.count)-shard replacement "
+                        + "declares \(duplicates.count) duplicate tensor(s): "
+                        + duplicates.sorted().prefix(5).joined(separator: ", ") + " — re-download the bundle."
+                    FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                    throw TruncatedSafetensorsError(description: message)
+                }
+                FileHandle.standardError.write(Data(
+                    ("[loadWeights] model.safetensors.index.json is stale: none of the "
+                        + "\(missing.count) file(s) it names exist in \(modelDirectory.path) "
+                        + "(e.g. \(missing.sorted().first ?? "")); loading the complete "
+                        + "\(replacement.count)-shard family present instead (\(seen.count) tensors, no duplicates)\n").utf8))
+                selected = replacement.map { modelDirectory.appendingPathComponent($0) }
+            }
+            for overlay in ["jangtq_stacked.safetensors", "jangpress-prestacked.safetensors"] {
+                if overlay == "jangtq_stacked.safetensors" && skipDSV4Sidecar { continue }
+                let url = modelDirectory.appendingPathComponent(overlay)
+                if FileManager.default.fileExists(atPath: url.path),
+                    !selected.contains(where: { $0.lastPathComponent == overlay })
+                {
+                    selected.append(url)
+                }
+            }
+            let droppedCount = allShardURLs.filter { url in
+                !selected.contains(where: { $0.path == url.path })
+            }.count
+            if droppedCount > 0 {
+                FileHandle.standardError.write(Data(
+                    ("[loadWeights] index-manifest load: ignoring \(droppedCount) "
+                        + "non-indexed safetensors file(s) in the bundle\n").utf8))
+            }
+            allShardURLs = selected
         }
         // Detect mixed `model-NNNNN-of-MMMMM.safetensors` sets: parse
         // the trailing `MMMMM` total and group by it. >1 distinct total
@@ -1066,13 +1255,32 @@ public func loadWeights(
                 modelDirectory: modelDirectory)
             || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
                 modelDirectory: modelDirectory))
-    if !preserveJANGAffineMmapDtypes
+    let materialiseBFloat16 =
+        !preserveJANGAffineMmapDtypes
         && (!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16
             || autoJANGTQMmapBFloat16)
-    {
+    if materialiseBFloat16 {
         convertToBFloat16(
             model: model,
             shouldSkip: isJANGTQNative ? isJANGTQParameterKey : { _ in false })
+    }
+    // Always-on, one line per load: which dtype policy this load took and what
+    // the parameters actually are afterwards. An f16-seeded activation stream
+    // (JANG f16 affine scales kept file-backed under mmap) is invisible in
+    // every other log line and surfaces only as NaN logits (osaurus#2652);
+    // this line makes the loaded dtype a fact instead of an inference.
+    do {
+        var histogram: [String: Int] = [:]
+        for (_, array) in model.parameters().flattened() {
+            histogram[String(describing: array.dtype), default: 0] += 1
+        }
+        let summary = histogram.sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+        FileHandle.standardError.write(Data(
+            ("[Load] dtype-materialisation bf16=\(materialiseBFloat16) mmap=\(mmapSafetensorsActive) "
+                + "jangtqNative=\(isJANGTQNative) preserveJANGAffine=\(preserveJANGAffineMmapDtypes) "
+                + "autoJANGTQBF16=\(autoJANGTQMmapBFloat16) allowJANGTQBF16=\(allowJANGTQMmapBFloat16) "
+                + "params[\(summary)]\n").utf8))
     }
 
     // The Gemma-4 / DSV4-prestacked preserve branches keep f16 affine
@@ -1150,6 +1358,18 @@ public func loadWeights(
 
     eval(model)
     MLX.Memory.clearCache()
+
+    // One-shot proposal-head stamp check + install (draft-only low-bit
+    // lm_head; `ProposalHeadStamp` contract). Runs after the weights are
+    // final so the ACTUAL head layout is what gets checked. Adoption of the
+    // installing protocol is the family gate; the call cannot throw and
+    // fail-opens on every path, so it can never break or block a load.
+    ProposalHeadBootstrap.ensure(
+        model: model, modelDirectory: modelDirectory,
+        // JangConfig presence IS the calibration marker: only JANG conversions
+        // ship it, and only calibrated bundles have earned an eligibility
+        // derivation (speed-audit mlx_lm packs stay unstamped on purpose).
+        isCalibratedBundle: jangConfig != nil)
 }
 
 /// Safetensors files emitted or copied by converters for calibration and
@@ -1157,7 +1377,10 @@ public func loadWeights(
 /// must never participate in inference weight loading.
 func isAuxiliaryCalibrationSafetensor(_ filename: String) -> Bool {
     switch filename {
-    case "awq-calibration.safetensors", "jang_imatrix.safetensors":
+    // `awq_activations.safetensors`: the Ling 3 / Raptor converter's activation
+    // capture, shipped next to the bf16 source shards. Its flat `lm_head` key
+    // fails `update(parameters:)` when globbed in with the indexed shards.
+    case "awq-calibration.safetensors", "jang_imatrix.safetensors", "awq_activations.safetensors":
         true
     default:
         false
@@ -1243,7 +1466,16 @@ private func isJANGTQParameterKey(_ key: String) -> Bool {
     key.hasSuffix(".tq_packed") || key.hasSuffix(".tq_norms")
 }
 
-private func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool {
+/// JANGTQ-native bundles whose NON-TurboQuant affine weights must be
+/// materialised to bf16 even under mmap. Under mmap the loader otherwise keeps
+/// every file-backed tensor as stored, and JANG stamps f16 affine scales: the
+/// 8-bit embedding then seeds an f16 residual stream and every f16-range
+/// overflow in the runtime becomes NaN. Ling 2.6 flash JANGTQ (`bailing_hybrid`,
+/// GLA linear attention, osaurus#2652) is the measured case: with the mmap
+/// path every logit was NaN (157184/157184, token 0 "!" streams) and with the
+/// bf16 materialisation alone the same load answered coherently. The
+/// TurboQuant tensors themselves (`tq_packed`/`tq_norms`) stay raw either way.
+func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool {
     let configURL = modelDirectory.appendingPathComponent("config.json")
     guard
         let data = try? Data(contentsOf: configURL),
@@ -1251,10 +1483,14 @@ private func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool {
     else {
         return false
     }
+    return requiresJANGTQMmapBFloat16(config: object)
+}
+
+func requiresJANGTQMmapBFloat16(config object: [String: Any]) -> Bool {
     let config = (object["text_config"] as? [String: Any]) ?? object
     let modelType = ((config["model_type"] as? String) ?? (object["model_type"] as? String) ?? "")
         .lowercased()
-    if modelType == "nemotron_h" {
+    if modelType == "nemotron_h" || modelType == "bailing_hybrid" {
         return true
     }
     guard modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text" else {

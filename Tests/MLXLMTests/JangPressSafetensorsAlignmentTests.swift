@@ -127,12 +127,13 @@ struct JangPressSafetensorsAlignmentTests {
         #expect(try Data(contentsOf: blob) == before)
     }
 
-    @Test("the production JangPress hook heals before returning the mmap directory")
-    func productionLoadHookHealsByDefault() throws {
+    @Test("the production hook does NOT rewrite the user's shards without opt-in (#2604)")
+    func productionLoadHookDoesNotHealWithoutOptIn() throws {
         let bundle = try Self.makeDirectory()
         defer { try? FileManager.default.removeItem(at: bundle) }
         let shard = bundle.appendingPathComponent("model.safetensors")
         try Self.writeUnalignedFixture(shard)
+        let before = try Data(contentsOf: shard)
         let saved = Self.saveAndUnset([
             "MLXPRESS_HEAL_SAFETENSORS", "JANGPRESS_HEAL_SAFETENSORS",
             "MLXPRESS_PRESTACK", "JANGPRESS_PRESTACK",
@@ -143,8 +144,66 @@ struct JangPressSafetensorsAlignmentTests {
         let prepared = try JangPressPrestacker.prepareBundleIfNeeded(
             originalURL: bundle, enabled: true)
 
+        // Default: the original file is byte-for-byte untouched; MLX loads it
+        // through its aligned-copy fallback instead. No storage mutation.
+        #expect(prepared.standardizedFileURL == bundle.standardizedFileURL)
+        #expect(try Data(contentsOf: shard) == before)
+        #expect(try Self.temporaryFiles(in: bundle).isEmpty)
+    }
+
+    @Test("opt-in MLXPRESS_HEAL_SAFETENSORS=1 heals the shard in place")
+    func productionLoadHookHealsWhenOptedIn() throws {
+        let bundle = try Self.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: bundle) }
+        let shard = bundle.appendingPathComponent("model.safetensors")
+        try Self.writeUnalignedFixture(shard)
+        let saved = Self.saveAndUnset([
+            "MLXPRESS_HEAL_SAFETENSORS", "JANGPRESS_HEAL_SAFETENSORS",
+            "MLXPRESS_PRESTACK", "JANGPRESS_PRESTACK",
+            "MLXPRESS_ALIGN_SAFETENSORS", "JANGPRESS_ALIGN_SAFETENSORS",
+        ])
+        defer { Self.restore(saved) }
+        setenv("MLXPRESS_HEAL_SAFETENSORS", "1", 1)
+
+        let prepared = try JangPressPrestacker.prepareBundleIfNeeded(
+            originalURL: bundle, enabled: true)
+
         #expect(prepared.standardizedFileURL == bundle.standardizedFileURL)
         #expect(try Self.readFixture(shard).unalignedCount == 0)
+    }
+
+    @Test("healing a shard never rewrites config.json or normalizes its numbers (#2604)")
+    func healingLeavesConfigJsonByteIdentical() throws {
+        let bundle = try Self.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: bundle) }
+        let shard = bundle.appendingPathComponent("model.safetensors")
+        try Self.writeUnalignedFixture(shard)
+
+        // #2604 reports config.json numbers being normalized — `1e10` losing
+        // its `.0`, `9.99…e-07` collapsing to `1e-06`. That is the signature of
+        // a JSON parse-and-reserialize. Ship a config.json with exactly those
+        // shapes and prove the healer leaves it byte-for-byte untouched: the
+        // healer only ever renames `.safetensors` shards.
+        let configURL = bundle.appendingPathComponent("config.json")
+        let configText = """
+            {
+              "gradient_clipping": 10000000000.0,
+              "rms_norm_eps": 9.9999999999999995e-07,
+              "model_type": "qwen3_5"
+            }
+            """
+        try Data(configText.utf8).write(to: configURL)
+        let before = try Data(contentsOf: configURL)
+
+        let result = SafetensorsStorageHealer.healBundle(
+            at: bundle, configuration: Self.configuration())
+
+        #expect(result.healedShards == 1)
+        // Byte-for-byte identical — no rewrite, no number normalization.
+        #expect(try Data(contentsOf: configURL) == before)
+        let after = try String(contentsOf: configURL, encoding: .utf8)
+        #expect(after.contains("10000000000.0"))
+        #expect(after.contains("9.9999999999999995e-07"))
     }
 
     @Test("resident/non-mmap loads do not mutate model storage")
@@ -162,8 +221,11 @@ struct JangPressSafetensorsAlignmentTests {
     }
 
     private static func configuration() -> SafetensorsStorageHealer.Configuration {
+        // The healer is opt-in (default OFF so it never rewrites a user's
+        // original shards). These tests exercise the healing LOGIC, so they
+        // explicitly enable it.
         SafetensorsStorageHealer.Configuration(
-            environment: [:],
+            environment: ["MLXPRESS_HEAL_SAFETENSORS": "1"],
             availableBytes: { _ in UInt64.max },
             failAfterCopiedBytes: nil,
             logger: { _ in })

@@ -220,7 +220,6 @@ public enum LLMTypeRegistry {
             "olmo3": create(Olmo3Configuration.self, Olmo3Model.init),
             "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
             "bailing_hybrid": dispatchBailingHybrid,
-            "bailing_moe_v2_5": create(BailingHybridConfiguration.self, BailingHybridModel.init),
             "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
             "step": dispatchStep3p5,
             "step3p5": dispatchStep3p5,
@@ -388,12 +387,17 @@ public enum LLMTypeRegistry {
         return ZayaModel(config, moe: context)
     }
 
-    /// Ling 2.6 and Ling 3.0 both declare `model_type = "bailing_hybrid"`,
-    /// but they are different architectures: 2.6 is Lightning/GLA linear
-    /// attention (`BailingHybridModel`), 3.0 is KDA + MLA + V3 MoE
-    /// (`BailingMoeV3Model`, `architectures = ["BailingMoeV3ForCausalLM"]`).
-    /// The `architectures` list is the discriminator; a KDA marker key is the
-    /// fallback for configs that omit it.
+    /// `model_type = "bailing_hybrid"` covers two architectures that share the
+    /// model type:
+    /// - Ling 3.0 (KDA + MLA + V3 MoE, `BailingMoeV3Model`): any Ling 3 marker
+    ///   (a `MoeV3` architecture name, `linear_attention: kda`,
+    ///   `kda_lower_bound`) — and the default when a config names neither.
+    /// - Ling 2.6 (GLA + MLA + V2 MoE, `BailingHybridModel`): ONLY a config
+    ///   whose `architectures` names `BailingMoeV2…` with no Ling 3 marker
+    ///   (Ling 2.6 flash / JANGTQ, osaurus#2652).
+    /// The marker-less FALLBACK to the 2.6 runtime is gone (#424): a Ling 3
+    /// bundle routed there decodes to garbage (token 0 "!" streams, loops), so
+    /// an ambiguous config is decoded as Ling 3 and fails LOUDLY if it is not.
     private static func dispatchBailingHybrid(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
         throws -> any LanguageModel
     {
@@ -401,7 +405,6 @@ public enum LLMTypeRegistry {
             var architectures: [String]?
             var linearAttention: String?
             var kdaLowerBound: Float?
-
             enum CodingKeys: String, CodingKey {
                 case architectures
                 case linearAttention = "linear_attention"
@@ -409,18 +412,42 @@ public enum LLMTypeRegistry {
             }
         }
         let probe = try? JSONDecoder().decode(Probe.self, from: data)
+        let markers =
+            "architectures=\(probe?.architectures ?? []) linear_attention=\(probe?.linearAttention ?? "nil") kda_lower_bound=\(probe?.kdaLowerBound.map { String($0) } ?? "nil")"
+        // Ling 3 markers: the V3 architecture name, KDA linear attention, or
+        // the KDA gate lower bound. Any one of them makes the bundle Ling 3.
         let isV3 =
             probe?.architectures?.contains(where: { $0.contains("MoeV3") }) == true
             || probe?.linearAttention == "kda"
             || probe?.kdaLowerBound != nil
-        if isV3 {
+        // A config that NAMES the Ling 2.6 architecture (BailingMoeV2_5ForCausalLM)
+        // and carries no Ling 3 marker is a genuine 2.6 bundle: GLA linear
+        // attention + MLA + V2 MoE, the `BailingHybridModel` runtime. This is
+        // the ONLY way to reach that runtime — the marker-less fallback that
+        // sent Ling 3 bundles there (#424) stays gone: a config naming neither
+        // architecture is decoded as Ling 3 below.
+        if !isV3, let architectures = probe?.architectures,
+            architectures.contains(where: { $0.hasPrefix("BailingMoeV2") })
+        {
+            let configuration = try JSONDecoder().decode(
+                BailingHybridConfiguration.self, from: data)
+            FileHandle.standardError.write(Data(
+                "[LLMModelFactory] bailing_hybrid → Ling 2.6 runtime (BailingHybridModel, GLA) \(markers)\n".utf8))
+            return BailingHybridModel(configuration)
+        }
+        do {
             let configuration = try JSONDecoder().decode(
                 BailingMoeV3Configuration.self, from: data)
+            FileHandle.standardError.write(Data(
+                "[LLMModelFactory] bailing_hybrid → Ling 3.0 runtime (BailingMoeV3Model, KDA) \(markers)\n".utf8))
             return BailingMoeV3Model(configuration)
+        } catch {
+            FileHandle.standardError.write(Data(
+                ("[LLMModelFactory] bailing_hybrid config does not decode as Ling 3.0 (BailingMoeV3Configuration): "
+                    + "\(error). The Ling 2.6 GLA runtime is reached only by a config naming the "
+                    + "BailingMoeV2 architecture; it is not a fallback (it produces garbage for Ling 3 bundles). \(markers)\n").utf8))
+            throw error
         }
-        let configuration = try JSONDecoder().decode(
-            BailingHybridConfiguration.self, from: data)
-        return BailingHybridModel(configuration)
     }
 
     private static func dispatchNemotronH(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
@@ -1295,18 +1322,26 @@ private struct LLMUserInputProcessor: UserInputProcessor {
     let modelType: String?
     let messageGenerator: MessageGenerator
     let defaultAdditionalContext: [String: any Sendable]?
+    /// True when the bundle's chat template reads the standard
+    /// `enable_thinking` kwarg itself (Ling 3.0: `{%- if enable_thinking is
+    /// defined %}` and it renders "detailed thinking on/off" at the END of the
+    /// SYSTEM turn). Then the kwarg is passed through untouched; the legacy
+    /// Bailing directive prepend is only for templates that do not read it.
+    let templateReadsEnableThinking: Bool
 
     internal init(
         tokenizer: any Tokenizer, configuration: ModelConfiguration,
         modelType: String?,
         messageGenerator: MessageGenerator,
-        defaultAdditionalContext: [String: any Sendable]? = nil
+        defaultAdditionalContext: [String: any Sendable]? = nil,
+        templateReadsEnableThinking: Bool = false
     ) {
         self.tokenizer = tokenizer
         self.configuration = configuration
         self.modelType = modelType
         self.messageGenerator = messageGenerator
         self.defaultAdditionalContext = defaultAdditionalContext
+        self.templateReadsEnableThinking = templateReadsEnableThinking
     }
 
     func prepare(input: UserInput) throws -> LMInput {
@@ -1324,7 +1359,8 @@ private struct LLMUserInputProcessor: UserInputProcessor {
         let bailingMessages = BailingThinkingTemplateContext.apply(
             to: messageGenerator.generate(from: input),
             modelType: modelType,
-            additionalContext: additionalContext
+            additionalContext: additionalContext,
+            templateReadsEnableThinking: templateReadsEnableThinking
         )
         var messages = NemotronToolChoiceTemplateContext.apply(
             to: bailingMessages,
@@ -1848,7 +1884,8 @@ public final class LLMModelFactory: ModelFactory {
         var eosTokenIds = ModelTokenConfigurationResolver.resolvedEOSTokenIds(
             baseConfig: baseConfig,
             configurationData: configData,
-            generationConfig: generationConfig)
+            generationConfig: generationConfig,
+            jangStopTokenIds: earlyJangConfig?.chat?.stopTokenIds)
         if baseConfig.modelType == "deepseek_v4" {
             // DSV4's Python runtime treats EOS plus both role-boundary
             // sentinels as hard stops: {1, 128803, 128804}. The public
@@ -2032,7 +2069,8 @@ public final class LLMModelFactory: ModelFactory {
                 modelType: baseConfig.modelType,
                 capabilities: jangConfig?.capabilities,
                 generationConfig: generationConfig,
-                chatConfig: jangConfig?.chat))
+                chatConfig: jangConfig?.chat),
+            templateReadsEnableThinking: BailingThinkingTemplateContext.templateReadsEnableThinking(chatTemplate))
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

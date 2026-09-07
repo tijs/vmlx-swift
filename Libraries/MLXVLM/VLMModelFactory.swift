@@ -98,11 +98,11 @@ private func create<C: Codable, P>(
         @escaping (
             C,
             any Tokenizer
-        ) -> P
+        ) throws -> P
 ) -> (Data, any Tokenizer) throws -> P {
     { data, tokenizer in
         let configuration = try JSONDecoder.json5().decode(C.self, from: data)
-        return processorInit(configuration, tokenizer)
+        return try processorInit(configuration, tokenizer)
     }
 }
 
@@ -224,6 +224,8 @@ public enum VLMProcessorTypeRegistry {
     public static let shared: ProcessorTypeRegistry = .init(creators: [
         "MuseGlimmerProcessor": create(
             MuseGlimmerProcessorConfiguration.self, MuseGlimmerProcessor.init),
+        "Glm5NextProcessor": create(
+            Glm5NextProcessorConfiguration.self, Glm5NextProcessor.init),
         "PaliGemmaProcessor": create(
             PaliGemmaProcessorConfiguration.self, PaliGemmaProcessor.init),
         "Qwen2VLProcessor": create(
@@ -633,7 +635,8 @@ public final class VLMModelFactory: ModelFactory {
         var eosTokenIds = ModelTokenConfigurationResolver.resolvedEOSTokenIds(
             baseConfig: baseConfig,
             configurationData: mergedConfigData,
-            generationConfig: generationConfig)
+            generationConfig: generationConfig,
+            jangStopTokenIds: earlyJangConfig?.chat?.stopTokenIds)
         if baseConfig.modelType == "deepseek_v4" {
             eosTokenIds.formUnion([1, 128803, 128804])
         }

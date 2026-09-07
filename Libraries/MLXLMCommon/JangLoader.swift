@@ -365,13 +365,30 @@ public enum ParserResolution {
             )
         }
 
-        if let cap = capabilities, cap.reasoningParser != nil {
+        if let cap = capabilities, let stamp = cap.reasoningParser {
             // Stamped — honour exactly. `nil` is a valid stamp meaning
             // "this model emits no reasoning".
-            return (
-                ReasoningParser.fromCapabilityName(cap.reasoningParser),
-                .jangStamped
-            )
+            //
+            // An UNRECOGNISED stamp is a different thing entirely, and
+            // conflating the two is how a declared reasoning model ended up
+            // with no parser at all. GLM-5.3 ships
+            // `reasoning_parser: "glm_think_block"`; that named nothing in
+            // `fromCapabilityName`, which returned nil, and nil was taken as
+            // the model's own claim not to reason. The bundle that DECLARED
+            // its parser therefore fared WORSE than one declaring nothing,
+            // which falls through to the model_type heuristic below and gets a
+            // working `think_xml`.
+            //
+            // So: a stamp we understand wins; a stamp we do not understand is
+            // missing information, not a negative claim, and degrades to the
+            // heuristic. The next vendor spelling we have not seen then loses
+            // precision instead of losing the reasoning channel.
+            // A stamp we KNOW wins outright — including the spellings that mean "no reasoning",
+            // whose nil is an answer rather than a gap. Only a name we do not recognise falls
+            // through to the heuristic below.
+            if ReasoningParser.namesAKnownFamily(stamp) {
+                return (ReasoningParser.fromCapabilityName(stamp), .jangStamped)
+            }
         }
         if declaresLFM25ThinkingTemplate(modelType: modelType, chatTemplate: chatTemplate) {
             return (
@@ -795,6 +812,12 @@ public struct JangChatConfig: Sendable, Equatable {
     public let samplingDefaults: JangChatSamplingDefaults?
     public let templateKwargsDefaults: ChatTemplateKwargsDefaults?
 
+    /// Extra end-of-turn token ids from `chat.stop_token_ids`. Raptor
+    /// (Ling 3 / KDA) stamps `[156895]` (`<|role_end|>`), which is NOT in
+    /// the bundle's `eos_token_id`; the factories union these into
+    /// `ModelConfiguration.eosTokenIds` so the turn actually terminates.
+    public let stopTokenIds: [Int]?
+
     public init(
         encoder: String? = nil,
         hasTokenizerChatTemplate: Bool? = nil,
@@ -806,7 +829,8 @@ public struct JangChatConfig: Sendable, Equatable {
         reasoning: JangChatReasoning? = nil,
         toolCalling: JangChatToolCalling? = nil,
         samplingDefaults: JangChatSamplingDefaults? = nil,
-        templateKwargsDefaults: ChatTemplateKwargsDefaults? = nil
+        templateKwargsDefaults: ChatTemplateKwargsDefaults? = nil,
+        stopTokenIds: [Int]? = nil
     ) {
         self.encoder = encoder
         self.hasTokenizerChatTemplate = hasTokenizerChatTemplate
@@ -819,6 +843,7 @@ public struct JangChatConfig: Sendable, Equatable {
         self.toolCalling = toolCalling
         self.samplingDefaults = samplingDefaults
         self.templateKwargsDefaults = templateKwargsDefaults
+        self.stopTokenIds = stopTokenIds
     }
 }
 
@@ -1832,6 +1857,14 @@ public struct JangLoader: Sendable {
                 branchingBudget: cDict["branching_budget"] as? Int,
                 blockSize: cDict["block_size"] as? Int
             )
+        } else if let synthesized = topLevelStampCapabilities(json) {
+            // Raptor-era (Ling 3 / KDA) bundles carry the stamp as top-level
+            // `reasoning` / `tools` / `vision` / `audio` blocks and no
+            // `capabilities` block at all. Without this the loader read
+            // nothing and every parser fell back to the model_type
+            // heuristic. The names round-trip through the same
+            // `fromCapabilityName` paths as a `capabilities` stamp would.
+            capabilities = synthesized
         } else {
             capabilities = nil
         }
@@ -1842,13 +1875,29 @@ public struct JangLoader: Sendable {
         let modelFamily =
             (json["model_family"] as? String) ?? capabilities?.family
 
+        // Top-level `reasoning` / `tools` blocks (Raptor-era). They feed
+        // the `chat` sub-blocks below only where the `chat` block itself
+        // says nothing, so DSV4-era bundles are untouched.
+        let topLevelReasoning = json["reasoning"] as? [String: Any]
+        let topLevelTools = json["tools"] as? [String: Any]
+
         // New `chat` block — see JangChatConfig doc. Only present
         // on DSV4-era bundles; older bundles return nil here and
         // the runtime falls back to `capabilities` + model_type
         // heuristics. Parsed defensively (every field optional) so
         // partial adoption doesn't break loaders.
+        // A bundle with top-level `reasoning` / `tools` but no `chat` block
+        // still gets a `chat` so the derived sub-blocks have somewhere to live.
+        let chatDict: [String: Any]?
+        if let explicit = json["chat"] as? [String: Any] {
+            chatDict = explicit
+        } else if topLevelReasoning != nil || topLevelTools != nil {
+            chatDict = [String: Any]()
+        } else {
+            chatDict = nil
+        }
         let chat: JangChatConfig?
-        if let chDict = json["chat"] as? [String: Any] {
+        if let chDict = chatDict {
             // reasoning subblock
             let reasoning: JangChatReasoning?
             if let rDict = chDict["reasoning"] as? [String: Any] {
@@ -1863,6 +1912,14 @@ public struct JangLoader: Sendable {
                         rDict["reasoning_effort_levels"]),
                     dropEarlierReasoning: rDict["drop_earlier_reasoning"] as? Bool
                 )
+            } else if let rDict = topLevelReasoning {
+                // Raptor-era top-level `reasoning` block: `default` is
+                // `"on"` / `"off"`, which is the `default_mode`
+                // `"thinking"` / `"chat"` pair the factories already read.
+                reasoning = JangChatReasoning(
+                    supported: rDict["supported"] as? Bool,
+                    defaultMode: topLevelReasoningDefaultMode(rDict)
+                )
             } else { reasoning = nil }
 
             // tool_calling subblock
@@ -1876,6 +1933,11 @@ public struct JangLoader: Sendable {
                     invokeBlock: tDict["invoke_block"] as? String,
                     parameterBlock: tDict["parameter_block"] as? String,
                     toolOutputTag: tDict["tool_output_tag"] as? String
+                )
+            } else if let tDict = topLevelTools {
+                toolCalling = JangChatToolCalling(
+                    supported: tDict["supported"] as? Bool,
+                    parser: tDict["parser"] as? String
                 )
             } else { toolCalling = nil }
 
@@ -1903,8 +1965,29 @@ public struct JangLoader: Sendable {
             if let defaults = chDict["template_kwargs_defaults"] as? [String: Any] {
                 templateKwargsDefaults = ChatTemplateKwargsDefaults(
                     enableThinking: defaults["enable_thinking"] as? Bool)
+            } else if let rDict = topLevelReasoning,
+                let enableThinking = topLevelReasoningDefaultEnableThinking(rDict),
+                enableThinking == false
+            {
+                // Only an explicit `reasoning.default: "off"` needs the kwarg:
+                // the template's own default is what "on" already produces,
+                // and passing `enable_thinking=true` explicitly moved the
+                // Bailing "detailed thinking on" directive from the end of the
+                // system turn (template default) to its start (injected
+                // context), changing Raptor's prompt bytes between releases.
+                templateKwargsDefaults = ChatTemplateKwargsDefaults(
+                    enableThinking: false)
             } else {
                 templateKwargsDefaults = nil
+            }
+
+            // `chat.stop_token_ids` — extra end-of-turn ids beyond the
+            // bundle's `eos_token_id` (Raptor stamps `<|role_end|>`).
+            let stopTokenIds: [Int]?
+            if let ids = chDict["stop_token_ids"] as? [Int], !ids.isEmpty {
+                stopTokenIds = ids
+            } else {
+                stopTokenIds = nil
             }
 
             chat = JangChatConfig(
@@ -1919,7 +2002,8 @@ public struct JangLoader: Sendable {
                 reasoning: reasoning,
                 toolCalling: toolCalling,
                 samplingDefaults: sampling,
-                templateKwargsDefaults: templateKwargsDefaults
+                templateKwargsDefaults: templateKwargsDefaults,
+                stopTokenIds: stopTokenIds
             )
         } else {
             chat = nil
@@ -1938,6 +2022,53 @@ public struct JangLoader: Sendable {
             modelFamily: modelFamily,
             chat: chat
         )
+    }
+
+    /// Synthesize a `JangCapabilities` from Raptor-era top-level
+    /// `reasoning` / `tools` / `vision` / `audio` blocks. Returns `nil` when
+    /// neither `reasoning` nor `tools` is present, so pre-stamp bundles keep
+    /// `capabilities == nil` and the model_type heuristics exactly as before.
+    /// Only used when the bundle has no `capabilities` block.
+    static func topLevelStampCapabilities(_ json: [String: Any]) -> JangCapabilities? {
+        let reasoning = json["reasoning"] as? [String: Any]
+        let tools = json["tools"] as? [String: Any]
+        guard reasoning != nil || tools != nil else { return nil }
+        let vision = json["vision"] as? [String: Any]
+        let audio = json["audio"] as? [String: Any]
+        return JangCapabilities(
+            reasoningParser: reasoning?["parser"] as? String,
+            toolParser: tools?["parser"] as? String,
+            thinkInTemplate: reasoning?["think_in_template"] as? Bool,
+            supportsTools: tools?["supported"] as? Bool,
+            supportsThinking: reasoning?["supported"] as? Bool,
+            supportsVision: vision?["supported"] as? Bool,
+            supportsAudio: audio?["supported"] as? Bool
+        )
+    }
+
+    /// `reasoning.default` (`"on"` / `"off"`) → the `chat.reasoning.default_mode`
+    /// vocabulary (`"thinking"` / `"chat"`) `llmDefaultAdditionalContext` reads.
+    static func topLevelReasoningDefaultMode(_ reasoning: [String: Any]) -> String? {
+        // Only an explicit "off" needs a synthesised mode: "on" is what the
+        // Bailing template already does by default, and stamping it made the
+        // factories inject `enable_thinking=true` (moving the "detailed
+        // thinking on" directive to the start of the system turn and changing
+        // Raptor's prompt bytes between releases).
+        switch topLevelReasoningDefaultEnableThinking(reasoning) {
+        case false?: return "chat"
+        case true?, nil: return nil
+        }
+    }
+
+    /// `reasoning.default` (`"on"` / `"off"` / bool) → `enable_thinking`.
+    static func topLevelReasoningDefaultEnableThinking(_ reasoning: [String: Any]) -> Bool? {
+        if let flag = reasoning["default"] as? Bool { return flag }
+        guard let raw = reasoning["default"] as? String else { return nil }
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "on", "true", "thinking": return true
+        case "off", "false", "chat": return false
+        default: return nil
+        }
     }
 
     private static func parseMXTQBits(_ value: Any?) -> [String: Int] {
