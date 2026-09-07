@@ -224,6 +224,54 @@ public class SwitchGLU: Module, SwitchGLULayer {
     private var fusedMode: QuantizationMode = .affine
     private var fusionAttempted: Bool = false
     private let allowFusedGateUpCache: Bool
+    /// True when the fused gate+up bank came from the CHECKPOINT (a
+    /// `switch_mlp.gate_up_proj` tensor adopted by the loader) rather than
+    /// from a runtime concatenation. In that case `gateProj`/`upProj` are
+    /// zero-copy slice VIEWS of the same bank, kept only so every existing
+    /// reader of those properties keeps compiling and so their quantization
+    /// metadata stays inspectable. They must never reach a gather kernel:
+    /// the sorted prefill kernel (`gather_qmm_rhs`) requires a fully
+    /// row-contiguous weight and would silently copy the strided view
+    /// (12 GiB on a 256-expert bank) on every call. So when this is set the
+    /// fused bank serves EVERY shape, prefill included.
+    private var fusedFromCheckpoint: Bool = false
+    nonisolated(unsafe) private static var didReportFusedFromCheckpoint = false
+    private static let fusedFromCheckpointLock = NSLock()
+
+    /// Adopt a pre-fused gate+up bank supplied by the checkpoint.
+    ///
+    /// `ensureFusedGateUp()` normally builds this bank by concatenating gate
+    /// and up at runtime, which materialises a permanent dirty duplicate —
+    /// +12.2 GiB on a 256-expert qwen3_5_moe, enough to force
+    /// `VMLX_FUSED_GATE_UP_CACHE_LIMIT_BYTES=0` and give up the decode
+    /// fusion entirely. A checkpoint that already stores `gate_up_proj`
+    /// (`concat([E,H,P],[E,H,P])` along the output axis is `[E,2H,P]`, the
+    /// same bytes) makes the bank a plain mmap'd file-backed weight.
+    /// Called by `loadWeights` only when such a tensor is present.
+    public func adoptCheckpointFusedGateUp(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) {
+        self.fusedGateUpWeight = weight
+        self.fusedGateUpScales = scales
+        self.fusedGateUpBiases = biases
+        self.fusedGroupSize = groupSize
+        self.fusedBits = bits
+        self.fusedMode = mode
+        self.fusedFromCheckpoint = true
+        self.fusionAttempted = true  // never rebuild by concatenation
+        Self.fusedFromCheckpointLock.lock()
+        if !Self.didReportFusedFromCheckpoint {
+            Self.didReportFusedFromCheckpoint = true
+            FileHandle.standardError.write(Data(
+                ("[SwitchGLU] fused_gate_up=from_checkpoint shape=\(weight.shape) "
+                    + "bits=\(bits) gs=\(groupSize) (no runtime concat; serves prefill+decode)\n").utf8))
+        }
+        Self.fusedFromCheckpointLock.unlock()
+    }
+
+    /// Whether this layer's gate+up bank was adopted from the checkpoint.
+    public var usesCheckpointFusedGateUp: Bool { fusedFromCheckpoint }
     private let compileSeparatedDecode: Bool
     /// Built after checkpoint loading on the first Qwen4Exp decode call, then
     /// reused without repeating projection casts, shape walks, or dtype checks
@@ -409,7 +457,7 @@ public class SwitchGLU: Module, SwitchGLULayer {
     ) -> MLXArray {
         ensureFusedGateUp()
 
-        if compileSeparatedDecode, preDownScores == nil, glue == nil,
+        if compileSeparatedDecode, !fusedFromCheckpoint, preDownScores == nil, glue == nil,
             scoredGlue == nil, isSiluActivation,
             let gate = gateProj as? QuantizedSwitchLinear,
             let up = upProj as? QuantizedSwitchLinear,
@@ -434,9 +482,12 @@ public class SwitchGLU: Module, SwitchGLULayer {
         // (Read once: `ProcessInfo.environment` rebuilds its dictionary on
         // every access — too costly for a per-layer forward path.)
         let decodeThreshold = SwitchGLU.fusedGateUpDecodeThreshold
+        // A checkpoint-provided bank serves every shape: its gate/up halves
+        // are strided views that the sorted prefill kernel cannot consume
+        // without a full copy (see `fusedFromCheckpoint`).
         let useFused =
             (fusedGateUpWeight != nil)
-            && (indices.size <= decodeThreshold)
+            && (fusedFromCheckpoint || indices.size <= decodeThreshold)
 
         let inputDType = input.dtype
         var x = MLX.expandedDimensions(input, axes: [-2, -3])

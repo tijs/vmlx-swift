@@ -1040,11 +1040,87 @@ public func loadWeights(
             return out
         }
 
+        func resolveQuantization(_ path: String)
+            -> (groupSize: Int, bits: Int, mode: QuantizationMode)?
+        {
+            if let effectivePerLayerQuantization {
+                // Module paths omit the checkpoint's leading `model.` prefix.
+                // Resolve through the canonical per-layer API so the module's
+                // own bits and group size reach the quantization predicate.
+                return effectivePerLayerQuantization.quantization(layer: path)?.asTuple
+            }
+            return quantization?.asTuple
+        }
+
+        // C3 (2026-09-07): a checkpoint may ship the routed gate and up
+        // projections PRE-FUSED as `switch_mlp.gate_up_proj` — `[E, 2H, P]`,
+        // the same bytes as the two originals — and omit gate_proj/up_proj.
+        // vmlx's own decode fusion (`SwitchGLU.ensureFusedGateUp`) builds
+        // that bank by concatenation at runtime, a permanent +12.2 GiB dirty
+        // duplicate on a 256-expert qwen3_5_moe; from the checkpoint it is a
+        // plain mmap'd file-backed weight.
+        /// `(parent, half)` when `path` is a routed gate (0) or up (1)
+        /// projection of a SwitchGLU.
+        func fusedGateUpHalf(_ path: String) -> (parent: String, half: Int)? {
+            if path.hasSuffix(".gate_proj") {
+                return (String(path.dropLast(".gate_proj".count)), 0)
+            }
+            if path.hasSuffix(".up_proj") {
+                return (String(path.dropLast(".up_proj".count)), 1)
+            }
+            return nil
+        }
+        /// The checkpoint key base of a fused bank for the SwitchGLU at
+        /// `switchGLUPath`, if the loaded weights carry one.
+        func checkpointFusedGateUpBase(_ switchGLUPath: String) -> String? {
+            quantizedWeightBaseCandidates("\(switchGLUPath).gate_up_proj").first {
+                weights["\($0).weight"] != nil && weights["\($0).scales"] != nil
+            }
+        }
+
         // Inline quantize with error logging instead of try! crash
         let updates = model.leafModules().flattened().compactMap { (path, m) -> (String, Module)? in
             let baseCandidates = quantizedWeightBaseCandidates(path)
             let matchedBase = baseCandidates.first {
                 weights["\($0).weight"] != nil && weights["\($0).scales"] != nil
+            }
+            // C3: serve a missing gate/up half as a zero-copy slice VIEW of the
+            // checkpoint's fused bank, so the module graph and every reader of
+            // `gateProj`/`upProj` stay unchanged. The owning SwitchGLU adopts
+            // the bank itself (below) and routes every gather through it, so
+            // these strided views never reach a kernel.
+            if matchedBase == nil, let switchLinear = m as? SwitchLinear,
+                let split = fusedGateUpHalf(path),
+                let fusedBase = checkpointFusedGateUpBase(split.parent),
+                let fusedWeight = weights["\(fusedBase).weight"],
+                let fusedScales = weights["\(fusedBase).scales"],
+                let resolved = resolveQuantization(path)
+            {
+                let hidden = switchLinear.outputDims
+                guard fusedWeight.dim(-2) == 2 * hidden, fusedScales.dim(-2) == 2 * hidden
+                else {
+                    FileHandle.standardError.write(Data(
+                        ("[loadWeights] \(fusedBase): fused gate_up_proj output dim "
+                            + "\(fusedWeight.dim(-2)) != 2*\(hidden); leaving \(path) unloaded\n").utf8))
+                    return nil
+                }
+                let lo = split.half * hidden
+                let hi = lo + hidden
+                let fusedBiases = weights["\(fusedBase).biases"]
+                var mode = resolved.mode
+                if fusedBiases != nil && (mode == .mxfp4 || mode == .mxfp8) {
+                    mode = .affine
+                }
+                let quantBiases = (mode == .mxfp4 || mode == .mxfp8) ? nil : fusedBiases
+                return (path, QuantizedSwitchLinear(
+                    inputDims: switchLinear.inputDims,
+                    outputDims: hidden,
+                    numExperts: switchLinear.numExperts,
+                    weight: fusedWeight[.ellipsis, lo ..< hi, 0...],
+                    bias: weights["\(fusedBase).bias"] ?? switchLinear.bias,
+                    scales: fusedScales[.ellipsis, lo ..< hi, 0...],
+                    biases: quantBiases.map { $0[.ellipsis, lo ..< hi, 0...] },
+                    groupSize: resolved.groupSize, bits: resolved.bits, mode: mode))
             }
             guard let matchedBase,
                 let loadedWeight = weights["\(matchedBase).weight"],
@@ -1163,6 +1239,38 @@ public func loadWeights(
                 print("  update path: \(path) → \(type(of: mod))")
             }
             throw error
+        }
+
+        // C3: hand each SwitchGLU its checkpoint-provided fused bank, then
+        // drop the fused keys — no module parameter carries them, so the
+        // `.noUnusedKeys` parameter update below would otherwise reject them.
+        var adoptedFusedGateUp = 0
+        for (path, module) in model.namedModules() {
+            guard let glu = module as? SwitchGLU,
+                let fusedBase = checkpointFusedGateUpBase(path),
+                let fusedWeight = weights["\(fusedBase).weight"],
+                let fusedScales = weights["\(fusedBase).scales"],
+                let resolved = resolveQuantization("\(path).gate_proj")
+            else { continue }
+            let fusedBiases = weights["\(fusedBase).biases"]
+            var mode = resolved.mode
+            if fusedBiases != nil && (mode == .mxfp4 || mode == .mxfp8) {
+                mode = .affine
+            }
+            glu.adoptCheckpointFusedGateUp(
+                weight: fusedWeight, scales: fusedScales,
+                biases: (mode == .mxfp4 || mode == .mxfp8) ? nil : fusedBiases,
+                groupSize: resolved.groupSize, bits: resolved.bits, mode: mode)
+            weights["\(fusedBase).weight"] = nil
+            weights["\(fusedBase).scales"] = nil
+            weights["\(fusedBase).biases"] = nil
+            weights["\(fusedBase).bias"] = nil
+            adoptedFusedGateUp += 1
+        }
+        if adoptedFusedGateUp > 0 {
+            FileHandle.standardError.write(Data(
+                ("[loadWeights] checkpoint fused gate_up_proj adopted by \(adoptedFusedGateUp) "
+                    + "SwitchGLU layer(s); gate_proj/up_proj served as slice views\n").utf8))
         }
     }
 
