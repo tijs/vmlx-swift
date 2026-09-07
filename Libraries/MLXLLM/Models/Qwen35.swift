@@ -870,7 +870,27 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
-            numExperts: args.numExperts
+            numExperts: args.numExperts,
+            // Enable the trusted compiled routed-MoE region
+            // (`Qwen4ExpCompiledRoutedSwitchGLU`, SwitchLayers.swift), which
+            // fuses the three routed `gatherQuantizedMM` calls plus silu and
+            // multiply into ONE compiled region instead of three separate
+            // dispatches per layer per token.
+            //
+            // It is built with `vmlxTrustedCompile`, so it compiles WITHOUT the
+            // `VMLX_ENABLE_UNSAFE_COMPILE` opt-in, and it self-guards on shape
+            // and quantization: single-token decode, `indices.size < 64`,
+            // bfloat16 activations/scales/biases, and matching groupSize/bits/
+            // mode across gate/up/down. Any bundle that does not match falls
+            // through to the existing path unchanged.
+            //
+            // The VLM twin (MLXVLM/Models/Qwen35.swift) already passes this;
+            // the LLM path did not, so the region was unreachable for
+            // LLM-loaded qwen3_5_moe bundles such as Ornith 1.5 and Qwen 3.6.
+            // It does NOT conflict with the GDN input-projection fusion: both
+            // gate on `!CompiledDecodeTrace.isActive`, and compiled decode is
+            // off by default.
+            compileSeparatedDecode: true
         )
 
         _sharedExpert.wrappedValue = Qwen3NextMLP(
