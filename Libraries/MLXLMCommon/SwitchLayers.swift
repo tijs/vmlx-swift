@@ -71,6 +71,7 @@ private enum Qwen4ExpCompiledRoutedSwitchGLU {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var regions: [String: Region] = [:]
     nonisolated(unsafe) private static var didReport = false
+    nonisolated(unsafe) private static var didTrace = false
 
     static func call(
         input: MLXArray,
@@ -79,6 +80,42 @@ private enum Qwen4ExpCompiledRoutedSwitchGLU {
         up: QuantizedSwitchLinear,
         down: QuantizedSwitchLinear
     ) -> MLXArray? {
+        // Env-gated one-shot diagnostic: report WHICH precondition rejected the
+        // region. Without this, a non-engaging region is indistinguishable from
+        // an engaging one that simply does not help.
+        if RuntimeEnvironment.value("VMLX_QWEN4_EXP_TRACE") == "1" {
+            Self.lock.lock()
+            if !Self.didTrace {
+                Self.didTrace = true
+                var why: [String] = []
+                if !enabled { why.append("disabled-by-env") }
+                if CompiledDecodeTrace.isActive { why.append("compiled-decode-trace-active") }
+                if input.dim(-2) != 1 { why.append("input.dim(-2)=\(input.dim(-2))") }
+                if indices.size >= 64 { why.append("indices.size=\(indices.size)") }
+                if input.dtype != .bfloat16 { why.append("input.dtype=\(input.dtype)") }
+                if !(gate.groupSize == up.groupSize && gate.groupSize == down.groupSize) {
+                    why.append("groupSize \(gate.groupSize)/\(up.groupSize)/\(down.groupSize)")
+                }
+                if !(gate.bits == up.bits && gate.bits == down.bits) {
+                    why.append("bits \(gate.bits)/\(up.bits)/\(down.bits)")
+                }
+                if !(gate.mode == up.mode && gate.mode == down.mode) { why.append("mode-mismatch") }
+                if gate.scales.dtype != .bfloat16 { why.append("gate.scales=\(gate.scales.dtype)") }
+                if up.scales.dtype != .bfloat16 { why.append("up.scales=\(up.scales.dtype)") }
+                if down.scales.dtype != .bfloat16 { why.append("down.scales=\(down.scales.dtype)") }
+                if gate.biases == nil { why.append("gate.biases=nil") }
+                if up.biases == nil { why.append("up.biases=nil") }
+                if down.biases == nil { why.append("down.biases=nil") }
+                if let b = gate.biases, b.dtype != .bfloat16 { why.append("gate.biases=\(b.dtype)") }
+                if let b = up.biases, b.dtype != .bfloat16 { why.append("up.biases=\(b.dtype)") }
+                if let b = down.biases, b.dtype != .bfloat16 { why.append("down.biases=\(b.dtype)") }
+                let verdict = why.isEmpty ? "ACCEPTED" : "REJECTED: \(why.joined(separator: ", "))"
+                FileHandle.standardError.write(Data(
+                    "[Qwen4ExpTrace] \(verdict) inputShape=\(input.shape) indices=\(indices.shape)\n".utf8))
+            }
+            Self.lock.unlock()
+        }
+
         guard enabled, !CompiledDecodeTrace.isActive, input.dim(-2) == 1,
             indices.size < 64, input.dtype == .bfloat16,
             gate.groupSize == up.groupSize, gate.groupSize == down.groupSize,
@@ -173,6 +210,21 @@ public class SwitchGLU: Module, SwitchGLULayer {
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
     @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
 
+    /// Optional pre-fused gate+up bank supplied by the CHECKPOINT rather than
+    /// concatenated at runtime.
+    ///
+    /// `ensureFusedGateUp()` normally builds this by concatenating gate and up,
+    /// which materialises a permanent duplicate — on a 256-expert qwen3_5_moe
+    /// that is +12.2 GiB of dirty anonymous memory, enough to force
+    /// `VMLX_FUSED_GATE_UP_CACHE_LIMIT_BYTES=0` and give up the decode fusion
+    /// entirely. A checkpoint that already stores `gate_up_proj` avoids the
+    /// allocation: the bank is mmap'd file-backed like every other weight.
+    ///
+    /// Opt-in via `VMLX_GATE_UP_FUSED_CHECKPOINT=1`, because constructing this
+    /// module eagerly would otherwise allocate a full-size random bank at model
+    /// construction for every checkpoint that does NOT provide one.
+    @ModuleInfo(key: "gate_up_proj") var gateUpProj: SwitchLinear?
+
     let inputDims: Int
     let hiddenDims: Int
     let numExperts: Int
@@ -224,6 +276,9 @@ public class SwitchGLU: Module, SwitchGLULayer {
     private var fusedMode: QuantizationMode = .affine
     private var fusionAttempted: Bool = false
     private let allowFusedGateUpCache: Bool
+    nonisolated(unsafe) fileprivate static var didTraceOuter = false
+    fileprivate static let fusedFromCheckpointLock = NSLock()
+    nonisolated(unsafe) fileprivate static var didReportFusedFromCheckpoint = false
     private let compileSeparatedDecode: Bool
     /// Built after checkpoint loading on the first Qwen4Exp decode call, then
     /// reused without repeating projection casts, shape walks, or dtype checks
@@ -255,6 +310,11 @@ public class SwitchGLU: Module, SwitchGLULayer {
         self.scoredGlue = scoredGlue
         self.allowFusedGateUpCache = allowFusedGateUpCache
         self.compileSeparatedDecode = compileSeparatedDecode
+        if RuntimeEnvironment.value("VMLX_GATE_UP_FUSED_CHECKPOINT") == "1" {
+            self._gateUpProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: 2 * hiddenDims,
+                numExperts: numExperts, bias: bias)
+        }
         // Detect common activation types for compiled fast path.
         // Use safeGeluApproximate for comparison to avoid MLXNN's compiledGeluApproximate
         // which uses the Power primitive (x ** 3) and crashes on some Metal GPUs during
@@ -291,6 +351,26 @@ public class SwitchGLU: Module, SwitchGLULayer {
 
         // Feature flag — opt out for A/B comparison.
         if ProcessInfo.processInfo.environment["BENCH_NO_FUSED_GATE_UP"] == "1" {
+            return
+        }
+
+        // Checkpoint-provided fused bank: adopt its arrays directly. No
+        // concatenation, no eval, no allocation — it is already resident as
+        // mmap'd file-backed weight like everything else.
+        if let fused = gateUpProj as? QuantizedSwitchLinear {
+            self.fusedGateUpWeight = fused.weight
+            self.fusedGateUpScales = fused.scales
+            self.fusedGateUpBiases = fused.biases
+            self.fusedGroupSize = fused.groupSize
+            self.fusedBits = fused.bits
+            self.fusedMode = fused.mode
+            Self.fusedFromCheckpointLock.lock()
+            if !Self.didReportFusedFromCheckpoint {
+                Self.didReportFusedFromCheckpoint = true
+                FileHandle.standardError.write(Data(
+                    "[SwitchGLU] fused_gate_up=from_checkpoint (no runtime concat)\n".utf8))
+            }
+            Self.fusedFromCheckpointLock.unlock()
             return
         }
 
@@ -396,6 +476,27 @@ public class SwitchGLU: Module, SwitchGLULayer {
         preDownScores: MLXArray?
     ) -> MLXArray {
         ensureFusedGateUp()
+
+        // Env-gated one-shot diagnostic for the OUTER preconditions. Without it,
+        // a region that never runs is indistinguishable from one that runs and
+        // does not help — and `Qwen4ExpCompiledRoutedSwitchGLU.call`'s own trace
+        // never fires if one of these rejects first.
+        if RuntimeEnvironment.value("VMLX_QWEN4_EXP_TRACE") == "1",
+            !SwitchGLU.didTraceOuter
+        {
+            SwitchGLU.didTraceOuter = true
+            var why: [String] = []
+            if !compileSeparatedDecode { why.append("compileSeparatedDecode=false") }
+            if preDownScores != nil { why.append("preDownScores!=nil") }
+            if glue != nil { why.append("glue!=nil") }
+            if scoredGlue != nil { why.append("scoredGlue!=nil") }
+            if !isSiluActivation { why.append("isSiluActivation=false") }
+            if !(gateProj is QuantizedSwitchLinear) { why.append("gateProj not QuantizedSwitchLinear") }
+            if !(upProj is QuantizedSwitchLinear) { why.append("upProj not QuantizedSwitchLinear") }
+            if !(downProj is QuantizedSwitchLinear) { why.append("downProj not QuantizedSwitchLinear") }
+            let verdict = why.isEmpty ? "outer-ACCEPTED" : "outer-REJECTED: \(why.joined(separator: ", "))"
+            FileHandle.standardError.write(Data("[Qwen4ExpTrace] \(verdict)\n".utf8))
+        }
 
         if compileSeparatedDecode, preDownScores == nil, glue == nil,
             scoredGlue == nil, isSiluActivation,
