@@ -543,6 +543,54 @@ internal final class LagunaMoE: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: Module
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaDenseMLP
 
+    /// Narrow decode fast-path switch for the affine SwitchGLU MoE.
+    ///
+    /// `SwitchGLU(compileSeparatedDecode: true)` engages the validated
+    /// `Qwen4ExpCompiledRoutedSwitchGLU` trusted region — the same fused
+    /// single-token gate/up/silu/down decode trace Qwen3.5 18B already
+    /// default-enables for its routed MoE (same 2048→512→2048 top-8
+    /// geometry). The region is guarded at call time (bf16 activations and
+    /// affine metadata, uniform quantization across gate/up/down, one decode
+    /// row, small route count, no outer compiled trace) and falls back to the
+    /// generic three-`gatherQuantizedMM` path whenever any guard fails, so
+    /// nothing outside the affine SwitchGLU decode path is affected. The
+    /// default is still reserved for the verified S-2.1 XS affine archetype
+    /// so other Laguna variants keep their historical eager path; the
+    /// TurboQuant (mxtq) path is excluded because `TurboQuantSwitchGLU` has
+    /// no compiled separated decode.
+    ///
+    /// Override with `VMLX_LAGUNA_COMPILE_DECODE_REGIONS` (boolean, legacy
+    /// `VMLINUX_` spelling honoured via `RuntimeEnvironment`).
+    static func shouldCompileSeparatedDecode(
+        _ cfg: LagunaConfiguration,
+        jangtq: LagunaMoEContext?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        RuntimeEnvironment.flag(
+            "VMLX_LAGUNA_COMPILE_DECODE_REGIONS",
+            default: isAffineS21XSArchetype(cfg, jangtq: jangtq),
+            in: environment)
+    }
+
+    /// Affine (non-codebook) S-2.1 XS signature: 40 layers, hidden 2048,
+    /// moe intermediate 512, 256 experts, top-8. These are the exact routed
+    /// MoE dimensions whose compiled decode region is already validated in
+    /// this checkout (Qwen3.5 18B); the predicate narrows default
+    /// enablement to that archetype while the env flag above remains the
+    /// escape hatch for any other Laguna bundle.
+    private static func isAffineS21XSArchetype(
+        _ cfg: LagunaConfiguration, jangtq: LagunaMoEContext?
+    ) -> Bool {
+        guard jangtq == nil,
+            cfg.numHiddenLayers == 40,
+            cfg.hiddenSize == 2048,
+            cfg.moeIntermediateSize == 512,
+            cfg.numExperts == 256,
+            cfg.numExpertsPerTok == 8
+        else { return false }
+        return true
+    }
+
     init(_ cfg: LagunaConfiguration, layerIndex: Int, jangtq: LagunaMoEContext?) {
         self.cfg = cfg
         self.layerIndex = layerIndex
@@ -562,7 +610,9 @@ internal final class LagunaMoE: Module, UnaryLayer {
             self._switchMLP.wrappedValue = SwitchGLU(
                 inputDims: cfg.hiddenSize,
                 hiddenDims: cfg.moeIntermediateSize,
-                numExperts: cfg.numExperts)
+                numExperts: cfg.numExperts,
+                compileSeparatedDecode: Self.shouldCompileSeparatedDecode(
+                    cfg, jangtq: nil))
         }
         // Shared expert is affine-quant Linear (NOT codebook) on both paths.
         self._sharedExpert.wrappedValue = LagunaDenseMLP(
