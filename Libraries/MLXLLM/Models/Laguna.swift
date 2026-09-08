@@ -764,6 +764,15 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        // Some conversions (VLM-style / JANG) wrap the whole text-only body
+        // under a `language_model.` prefix — `language_model.model.*` and
+        // `language_model.lm_head.*` — while this model binds its modules at
+        // the top level. Absorb the wrapper before the `model.` strip below
+        // so the keys land on the expected module paths instead of failing
+        // with "Unhandled keys [language_model]". Unprefixed keys pass
+        // through untouched.
+        let weights = Weights.stripLanguageModelPrefix(weights)
+
         // Map HF Laguna weight key prefixes to the Swift module pathing:
         //   - `model.layers.N.{...}` → `layers.N.{...}` (drop "model." prefix)
         //   - `model.embed_tokens.weight` → `embed_tokens.weight`
