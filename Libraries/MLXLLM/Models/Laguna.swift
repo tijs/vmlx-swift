@@ -810,6 +810,25 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
                 of: ".mlp.experts.",
                 with: ".mlp.switch_mlp."
             )
+            // Router gate layout on current affine bundles: the router is a
+            // quantized projection nested under `gate.proj.*`
+            // ({weight,scales,biases}), while `LagunaMoE` declares `gate` as a
+            // plain Linear and `e_score_correction_bias` as a SIBLING parameter.
+            // Flatten `gate.proj.*` → `gate.*` first so Load.swift's
+            // `dequantizeMoEGates` (which matches plain
+            // `.gate.{weight,scales,biases}` keys after sanitize) picks the
+            // tensors up, then hoist `gate.e_score_correction_bias` to the
+            // `mlp.e_score_correction_bias` slot the module declares. Flatten
+            // runs before the bias remap so a hypothetical
+            // `gate.proj.e_score_correction_bias` also lands correctly.
+            k = k.replacingOccurrences(
+                of: ".mlp.gate.proj.",
+                with: ".mlp.gate."
+            )
+            k = k.replacingOccurrences(
+                of: ".mlp.gate.e_score_correction_bias",
+                with: ".mlp.e_score_correction_bias"
+            )
             // Drop unused / config-only keys.
             if k.contains("self_attn.rotary_emb.inv_freq") { continue }
             if k.hasSuffix(".tq_bits") { continue }
