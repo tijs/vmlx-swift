@@ -732,12 +732,24 @@ public final class CacheCoordinator: @unchecked Sendable {
     ) -> Bool {
         guard diskCache?.hasDurableEntry(tokens: tokens, mediaSalt: mediaSalt) == true
         else { return false }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        if isHybrid, requiresRecurrentSSMCompanion, requiresSeparateRecurrentPayload {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,
                 mediaSalt: mediaSalt)
         }
+        // `requiresSeparateRecurrentPayload` mirrors the two paths that
+        // actually decide whether a companion sidecar exists: the store side
+        // writes one only under that flag ("for disk-only MambaCache hybrids
+        // the state round-trips in-file as `mamba_{i}_state0/1`"), and
+        // `hasRequiredHybridSSM` accepts a fetched entry with no companion at
+        // all when it is false, for the same reason. Without it this check
+        // demanded a sidecar those topologies never write, so it was
+        // permanently false: every warm turn re-derived a boundary already
+        // complete on disk, replaying the whole prefix through the model
+        // after the answer had streamed (~60 s/turn on a 20k Hermes prefix;
+        // the write itself was then correctly skipped as "SKIP validated").
+        // Ornith / Qwen3.5 GDN MoE hit this on every single request.
         return true
     }
 
