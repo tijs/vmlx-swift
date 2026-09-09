@@ -2979,8 +2979,14 @@ public struct TokenIterator: TokenIteratorProtocol {
             tokens: [Int],
             cache cacheToStore: [KVCache],
             kvBits diskKVBits: Int?,
-            kvMode diskKVMode: KVQuantizationMode
+            kvMode diskKVMode: KVQuantizationMode,
+            site: String = "?"
         ) {
+            if ProcessInfo.processInfo.environment["VMLX_STORE_TRACE"] == "1" {
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][store-site] site=\(site) tokens=\(tokens.count) "
+                        + "promptLen=\(promptTokenIds.count)\n").utf8))
+            }
             guard !tokens.isEmpty else { return }
             // Saving the cache duplicates it several times over (snapshot, host
             // `Data` for the disk write, disk-store cache) at the point where
@@ -3089,7 +3095,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                     tokens: promptTokenIds,
                     cache: promptCacheSnapshot,
                     kvBits: nil,
-                    kvMode: promptDiskKVMode)
+                    kvMode: promptDiskKVMode,
+                            site: "exact-warmup-prompt")
             } else if isReusablePrefixWarmup, !shouldPersistExactWarmupPrompt {
                 Self.logger.info(
                     "TokenIterator: skipped exact recurrent warmup boundary; retaining processor-proven safe prefix seeds only"
@@ -3133,7 +3140,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: seedSnapshot,
-                                requested: kvMode))
+                                requested: kvMode),
+                            site: "disk-seed")
                     }
                 }
                 // Cross-turn reuse boundary for hybrid-SSM models (qwen3.5 /
@@ -3191,7 +3199,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: strippedSnapshot,
-                                requested: kvMode))
+                                requested: kvMode),
+                            site: "hybrid-strip")
                     } else {
                         Self.logger.debug(
                             "TokenIterator: no stripped-boundary snapshot to store at \(stripAt, privacy: .public); prefill did not cross the boundary"
@@ -3283,7 +3292,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: boundarySnapshot,
-                                requested: kvMode))
+                                requested: kvMode),
+                            site: "prefix-boundary-loop")
                     }
                 }
         }
