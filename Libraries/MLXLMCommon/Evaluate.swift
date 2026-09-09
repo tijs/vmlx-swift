@@ -3175,6 +3175,15 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // this boundary — this store is the only one that can, and
                     // `stripAt` routinely coincides with a `cachePrefixTokenCounts`
                     // entry.
+                    if ProcessInfo.processInfo.environment["VMLX_STORE_TRACE"] == "1" {
+                        FileHandle.standardError.write(Data(
+                            ("[vmlx][store-trace] stripAt=\(stripAt) "
+                                + "snapshot=\(hybridStripSnapshot == nil ? "NIL" : "ok") "
+                                + "promptLen=\(promptTokenIds.count) "
+                                + "prefixCounts=\(Set(cachePrefixTokenCounts).sorted()) "
+                                + "stableCounts=\(originalInput.cacheStablePrefixTokenCounts.sorted()) "
+                                + "canonicalHybrid=\(usesCanonicalHybridBoundary)\n").utf8))
+                    }
                     if let strippedSnapshot = hybridStripSnapshot {
                         store(
                             tokens: Array(promptTokenIds.prefix(stripAt)),
