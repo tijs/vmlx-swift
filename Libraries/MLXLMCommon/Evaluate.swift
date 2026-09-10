@@ -2537,11 +2537,24 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // Capturing both forces a 1-token prefill chunk between them,
                 // and a 1-token chunk plausibly takes the recurrent kernels'
                 // single-step path rather than the chunked scan.
+                // `cacheStablePrefixTokenCounts` are ABSOLUTE positions in the
+                // whole prompt; `headCount` is the length of the slice this
+                // prefill will process. They coincide only when the cache
+                // started empty. After a restore prefill begins partway in —
+                // measured live: promptTokenIds=4102 inputSize=1031
+                // headCount=1026 stable=[4087] — so the strip boundary fails
+                // `$0 < headCount` and `inner` comes back EMPTY. Nothing is
+                // captured, and the post-answer store replays the whole prefix
+                // through the model after the answer has already streamed,
+                // making a restoring turn slower (12.9 s) than a cold one
+                // (10.5 s).
+                let alreadyInCache = promptTokenIds.count - input.text.tokens.size
+                let headEnd = alreadyInCache + headCount
                 let inner = Set(
                     originalInput.cacheStablePrefixTokenCounts
-                        .filter { $0 > 1 && $0 < headCount }
+                        .filter { $0 > 1 && $0 < headEnd }
                         .map { $0 - 1 }
-                ).filter { $0 > 0 && $0 < headCount }.sorted()
+                ).filter { $0 > alreadyInCache && $0 < headEnd }.sorted()
                 // Pure logging. An attempt to rewrite this filter in absolute
                 // terms broke reuse outright, and the arithmetic looked right on
                 // paper — so report the actual values before touching it again.
@@ -2554,7 +2567,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                             + " inner=\(inner)\n").utf8))
                 }
 
-                var consumed = 0
+                var consumed = alreadyInCache
                 var remainingHead = head
                 for boundary in inner {
                     // `boundarySplit` rebases the boundary itself, assuming the
