@@ -3356,7 +3356,14 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 + " store=\(storeBoundary) stable=\(isStableBoundary)"
                                 + " allowRederive=\(allowRederive)"
                                 + " snapshotTokens=\(storageSnapshotTokenCount)"
-                                + " snapshot=\(boundarySnapshotOrNil == nil ? "nil" : "ok")\n")
+                                + " snapshot=\(boundarySnapshotOrNil == nil ? "nil" : "ok")"
+                                // WHICH path produced it is the whole cost
+                                // question: a captured snapshot is free, the
+                                // fallback replays the prefix through the model
+                                // after the answer is already visible. Without
+                                // this the trace reports "ok" either way, which
+                                // is what made a 9.8 s per-task cost invisible.
+                                + " captured=\(stableBoundarySnapshots[storeBoundary] != nil)\n")
                                 .utf8))
                     }
                     if let boundarySnapshot = boundarySnapshotOrNil {
