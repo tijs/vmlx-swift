@@ -2617,7 +2617,20 @@ public struct TokenIterator: TokenIteratorProtocol {
             if let head = capture.head {
                 capturedHeadCount = head.text.tokenIds?.count ?? head.text.tokens.size
                 if capturedHeadCount > 0 {
-                    stableBoundarySnapshots[capturedHeadCount] = snapshot
+                    // Key by the ABSOLUTE boundary, not the head's local length.
+                    // When the cache was restored from an earlier boundary this
+                    // prefill starts partway through the prompt, so the head is
+                    // only the slice from there — filing the snapshot under its
+                    // local length means the store loop, which asks for absolute
+                    // boundaries, never finds it and replays the whole prefix
+                    // through the model instead. Measured on a 4,102-token
+                    // prompt restoring 3,071: the head is 1,016 tokens and the
+                    // store asks for 4,087, so every restoring request paid a
+                    // ~9.8 s rederive AFTER its answer had already streamed —
+                    // making a restoring turn slower (12.9 s) than a cold one
+                    // (10.5 s).
+                    let alreadyInCache = promptTokenIds.count - input.text.tokens.size
+                    stableBoundarySnapshots[alreadyInCache + capturedHeadCount] = snapshot
                 }
             }
             // Keep going through the stable boundaries that sit AFTER this
