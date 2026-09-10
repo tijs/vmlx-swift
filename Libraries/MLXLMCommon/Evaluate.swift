@@ -2537,22 +2537,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // Capturing both forces a 1-token prefill chunk between them,
                 // and a 1-token chunk plausibly takes the recurrent kernels'
                 // single-step path rather than the chunked scan.
-                // `cacheStablePrefixTokenCounts` are ABSOLUTE positions in the
-                // whole prompt, while `headCount` is the length of the slice
-                // this prefill is about to process. They only coincide when the
-                // cache started empty. After a restore, prefill begins partway
-                // in — 3,071 of a 4,102-token prompt, say — so a stable boundary
-                // at 4,087 fails `$0 < headCount` against a head of 1,016 and
-                // is silently skipped. The store then replays the whole prefix
-                // through the model AFTER the answer has streamed, which made a
-                // restoring turn slower (12.9 s) than a cold one (10.5 s).
-                let alreadyInCache = promptTokenIds.count - input.text.tokens.size
-                let headEnd = alreadyInCache + headCount
                 let inner = Set(
                     originalInput.cacheStablePrefixTokenCounts
-                        .filter { $0 > 1 && $0 < headEnd }
+                        .filter { $0 > 1 && $0 < headCount }
                         .map { $0 - 1 }
-                ).filter { $0 > alreadyInCache && $0 < headEnd }.sorted()
+                ).filter { $0 > 0 && $0 < headCount }.sorted()
 
                 var consumed = 0
                 var remainingHead = head
@@ -2568,13 +2557,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // store was then correctly refused, `offsets=[20369]` under
                     // a claimed `tokens=20374`.
                     let rebase = promptTokenIds.count - remainingHead.text.tokens.size
-                    // `boundary` is absolute; `consumed` counts within this
-                    // head; `alreadyInCache` is what the restore already put in
-                    // front of it. Subtract both before re-applying the rebase
-                    // boundarySplit performs internally.
-                    let local = boundary - alreadyInCache - consumed
-                    guard local > 0,
-                        let split = boundarySplit(of: remainingHead, at: local + rebase),
+                    guard boundary > consumed,
+                        let split = boundarySplit(
+                            of: remainingHead, at: boundary - consumed + rebase),
                         let piece = split.head
                     else { continue }
                     let preparedPiece = try MLXPressGenerationProfile.time("prompt.model_prepare") {
@@ -2601,7 +2586,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     stableBoundarySnapshots[boundary] =
                         makePromptBoundaryCacheSnapshot(from: cache)
                     remainingHead = split.tail
-                    consumed = boundary - alreadyInCache
+                    consumed = boundary
                 }
 
                 let preparedHead = try MLXPressGenerationProfile.time("prompt.model_prepare") {
