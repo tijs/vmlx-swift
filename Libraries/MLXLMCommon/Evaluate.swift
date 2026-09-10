@@ -2542,6 +2542,17 @@ public struct TokenIterator: TokenIteratorProtocol {
                         .filter { $0 > 1 && $0 < headCount }
                         .map { $0 - 1 }
                 ).filter { $0 > 0 && $0 < headCount }.sorted()
+                // Pure logging. An attempt to rewrite this filter in absolute
+                // terms broke reuse outright, and the arithmetic looked right on
+                // paper — so report the actual values before touching it again.
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][capture-inputs] promptTokenIds=\(promptTokenIds.count)"
+                            + " inputSize=\(input.text.tokens.size)"
+                            + " headCount=\(headCount)"
+                            + " stable=\(originalInput.cacheStablePrefixTokenCounts)"
+                            + " inner=\(inner)\n").utf8))
+                }
 
                 var consumed = 0
                 var remainingHead = head
