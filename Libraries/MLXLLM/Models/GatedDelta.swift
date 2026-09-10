@@ -156,7 +156,21 @@ private final class GatedDeltaKernelManager: Sendable {
         strictKernelMasked = makeGatedDeltaKernel(hasMask: true, roundStateEachStep: true)
     }
 
+    /// `VMLX_GDN_STRICT=1` forces the step-rounding variant everywhere.
+    ///
+    /// Testing whether the recurrent prefill's segmentation dependence comes
+    /// from the fast kernel accumulating state in float32 registers across a
+    /// whole invocation and materialising it only at the end. Splitting a
+    /// prefill then means the state round-trips through memory at a boundary
+    /// that a single call never has, which is exactly the difference between a
+    /// restore and a straight prefill. The strict variant rounds the state back
+    /// through the input dtype at EVERY step, so where the chunk boundaries
+    /// fall should stop mattering.
+    nonisolated(unsafe) static let forceStrict =
+        ProcessInfo.processInfo.environment["VMLX_GDN_STRICT"] == "1"
+
     func kernel(hasMask: Bool, roundStateEachStep: Bool) -> MLXFast.MLXFastKernel? {
+        let roundStateEachStep = roundStateEachStep || Self.forceStrict
         switch (hasMask, roundStateEachStep) {
         case (false, false): return kernel
         case (true, false): return kernelMasked

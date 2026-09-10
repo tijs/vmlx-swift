@@ -2510,67 +2510,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         // generation and does not alter sampler or template behavior.
         if let capture = prefillBoundaryCapture(of: input) {
             if let head = capture.head {
-                // Capture any stable boundaries that sit INSIDE this head on the
-                // way through it, ascending, before prefilling the rest.
-                //
-                // The pass below this one only looks at stable boundaries AFTER
-                // the head, because it filters on `alreadyConsumed`. For a
-                // cross-conversation anchor that filter can never match: the
-                // anchor marks the shared system+tools prefix and is therefore
-                // always EARLIER in the prompt than the generation-stripped
-                // boundary this head ends at. Measured on Ornith 1.5 35B-A3B,
-                // the head ended at 20,388 while the anchor sat at 20,375, so
-                // `wanted` came back empty on every request and the anchor was
-                // never captured.
-                //
-                // With no capture the post-answer store fell back to
-                // cacheSnapshotForBoundary, which cannot trim a cache holding
-                // MambaCache layers (BaseKVCache defaults isTrimmable to false
-                // and neither ArraysCache nor MambaCache overrides it) and so
-                // REDERIVED the state with a fresh newCache at a different
-                // prefill step. Restoring that rederived state changed greedy
-                // output: on a 20,406-token prompt at temperature 0 the first
-                // assistant turn differed from cold, while a self-restore to
-                // the captured boundary 27 tokens later was byte-identical.
-                let headCount = head.text.tokenIds?.count ?? head.text.tokens.size
-                // EXPERIMENT: capture ONLY the N-1 seed, not N as well.
-                // Capturing both forces a 1-token prefill chunk between them,
-                // and a 1-token chunk plausibly takes the recurrent kernels'
-                // single-step path rather than the chunked scan.
-                let inner = Set(
-                    originalInput.cacheStablePrefixTokenCounts
-                        .filter { $0 > 1 && $0 < headCount }
-                        .map { $0 - 1 }
-                ).filter { $0 > 0 && $0 < headCount }.sorted()
-
-                var consumed = 0
-                var remainingHead = head
-                for boundary in inner {
-                    guard boundary > consumed,
-                        let split = boundarySplit(of: remainingHead, at: boundary - consumed),
-                        let piece = split.head
-                    else { continue }
-                    let preparedPiece = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-                        try model.prepare(piece, cache: cache, windowSize: windowSize)
-                    }
-                    switch preparedPiece {
-                    case .tokens(let leftover):
-                        _ = model(
-                            leftover[text: .newAxis],
-                            cache: cache.isEmpty ? nil : cache,
-                            state: nil)
-                    case .logits:
-                        break
-                    }
-                    MLX.eval(cache)
-                    stableBoundarySnapshots[boundary] =
-                        makePromptBoundaryCacheSnapshot(from: cache)
-                    remainingHead = split.tail
-                    consumed = boundary
-                }
-
                 let preparedHead = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-                    try model.prepare(remainingHead, cache: cache, windowSize: windowSize)
+                    try model.prepare(head, cache: cache, windowSize: windowSize)
                 }
                 switch preparedHead {
                 case .tokens(let remaining):
