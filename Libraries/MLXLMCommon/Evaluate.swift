@@ -2546,8 +2546,20 @@ public struct TokenIterator: TokenIteratorProtocol {
                 var consumed = 0
                 var remainingHead = head
                 for boundary in inner {
+                    // `boundarySplit` rebases the boundary itself, assuming the
+                    // input it is handed is the LAST `size` tokens of the prompt
+                    // (`split = boundary - (promptTokenIds.count - size)`). That
+                    // holds for a tail but not for the head pieces walked here,
+                    // so undo that rebase instead of subtracting `consumed` on
+                    // top of it. Applying both corrections cut the first piece
+                    // short by `promptCount - headCount` — 5 tokens on Ornith
+                    // 1.5, this template's generation-prompt suffix — and the
+                    // store was then correctly refused, `offsets=[20369]` under
+                    // a claimed `tokens=20374`.
+                    let rebase = promptTokenIds.count - remainingHead.text.tokens.size
                     guard boundary > consumed,
-                        let split = boundarySplit(of: remainingHead, at: boundary - consumed),
+                        let split = boundarySplit(
+                            of: remainingHead, at: boundary - consumed + rebase),
                         let piece = split.head
                     else { continue }
                     let preparedPiece = try MLXPressGenerationProfile.time("prompt.model_prepare") {
@@ -2563,6 +2575,14 @@ public struct TokenIterator: TokenIteratorProtocol {
                         break
                     }
                     MLX.eval(cache)
+                    // The store refuses any snapshot whose layer offsets do not
+                    // all equal the boundary it is keyed under, so prove the
+                    // capture actually landed there rather than assuming it.
+                    if CacheFidelityTrace.isEnabled {
+                        FileHandle.standardError.write(Data(
+                            ("[vmlx][fidelity] capture boundary=\(boundary) "
+                                + "offsets=\(Set(cache.map(\.offset)).sorted())\n").utf8))
+                    }
                     stableBoundarySnapshots[boundary] =
                         makePromptBoundaryCacheSnapshot(from: cache)
                     remainingHead = split.tail
