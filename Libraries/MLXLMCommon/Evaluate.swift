@@ -1937,6 +1937,31 @@ public struct TokenIterator: TokenIteratorProtocol {
                 case .hit(
                     let matchedTokens, let remainingTokens, let detail, let blocks,
                     let ssmStates, let diskArrays):
+                // INVARIANT. The prefill capture stores the N-1 recurrent seed
+                // for a stable boundary, not the boundary itself — the inner
+                // capture maps stable boundaries through `$0 - 1`. So a restore
+                // that lands exactly ON a stable boundary is not the state that
+                // was captured for it, and restoring it is not equivalent to
+                // having prefilled.
+                //
+                // This is not hypothetical: a fidelity sweep produced one run
+                // in eight where a restore matched 20,375 (the anchor) instead
+                // of 20,374 (its seed), and that run's answer differed from
+                // cold in both completion length and tool calls. The failure
+                // has never reproduced, so the point of this check is to make
+                // the next occurrence attributable instead of silent.
+                //
+                // Warning only, deliberately: refusing the restore would change
+                // behaviour on a path that is correct the other seven times in
+                // eight, and the failure is not yet understood well enough to
+                // justify that.
+                if originalInput.cacheStablePrefixTokenCounts.contains(matchedTokens) {
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][cache/restore] WARNING matched a stable boundary "
+                            + "directly (\(matchedTokens)) rather than its N-1 seed; "
+                            + "this is not the captured state and may not reproduce "
+                            + "cold output\n").utf8))
+                }
                 var restored = false
                 var retainedDiskRestore = false
                 var restoredTokenCount = 0
