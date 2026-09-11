@@ -300,6 +300,10 @@ public struct GenerateParameters: Sendable {
     /// `DDTREE-DESIGN.md` for the full spec.
     public var draftStrategy: DraftStrategy? = nil
 
+    /// Fixed native-MTP depth is a ceiling; adaptive exploration must be
+    /// requested explicitly. Either policy may descend to shallower work or AR.
+    public var nativeMTPDepthPolicy: NativeMTPDepthPolicy = .fixed
+
     /// Additional text-level stop sequences. When any of these strings
     /// appears in the user-visible assistant output, the library halts
     /// generation, truncates the match and everything after it, and
@@ -1661,11 +1665,12 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// generated token is fed back into the model.
     var promptCacheSnapshot: [KVCache]?
 
-    /// Absolute index into ``promptTokenIds`` of the hybrid cross-turn reuse
-    /// boundary — the last turn-start token, i.e. the end of the prompt with
-    /// its trailing generation prompt stripped. `nil` when the boundary does
-    /// not apply (dense model, media input, no turn-start token, cache tiers
-    /// all disabled).
+    /// Absolute index into ``promptTokenIds`` of the generation-suffix-stripped
+    /// cross-turn reuse boundary — the last turn-start token, i.e. the end of
+    /// the prompt with its trailing generation prompt stripped. `nil` when the
+    /// boundary does not apply (dense model, media input, no turn-start token,
+    /// cache tiers all disabled, or a topology that is neither hybrid nor a
+    /// standalone rotating/sliding-window cache).
     var hybridStripBoundary: Int?
 
     /// Cache state at ``hybridStripBoundary``, captured *during* prefill.
@@ -2343,13 +2348,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
     }
 
-    /// The hybrid cross-turn reuse boundary. Prefer the canonical history
-    /// boundary derived from the exact active chat template (including the
+    /// The cross-turn reuse boundary for path-dependent hybrid and standalone
+    /// rotating/sliding-window caches. Prefer the canonical history boundary
+    /// derived from the exact active chat template (including the
     /// assistant-continuation LCP proof); fall back to the model-load suffix
     /// heuristic only for raw/benchmark inputs that carry no canonical chat
     /// boundaries. The next chat turn replaces the generation prompt with the
     /// assistant's reply, so the full-prompt key never matches again, but this
-    /// boundary does — it is what gives hybrid models cross-turn prefix reuse.
+    /// boundary does — it is what gives hybrid and standalone rotating/SWA
+    /// models cross-turn prefix reuse.
     ///
     /// Also emits the boundary for non-hybrid topologies that cannot serve a
     /// growing-turn prefix match from any other tier: rotating paged
@@ -2371,7 +2378,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         coordinator: CacheCoordinator?,
         promptTokenIds: [Int],
         input: LMInput,
-        cache: [any KVCache]
+        cache: [KVCache]
     ) -> Int? {
         let heuristicBoundary = coordinator?.genPromptSuffixTokens.first
             .flatMap { promptTokenIds.lastIndex(of: $0) }
@@ -2395,6 +2402,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
         guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
             let coordinator,
+            // KEEP THE FORK'S THIRD CASE. requiresPagedBoundaryCompanion was
+            // added by 318a4e68 so rotating/companion topologies persist their
+            // gen-suffix-stripped boundary; the trace immediately above logs
+            // `companion=` precisely to observe it. Upstream's two-case form
+            // would silently stop persisting boundaries for those models.
             (coordinator.isHybrid
                 || coordinator.requiresPagedBoundaryCompanion
                 || cacheHasStandaloneRotatingWindowState(cache)),
@@ -3101,6 +3113,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         // post-answer snapshots are both larger and not the boundary the next
         // templated turn is guaranteed to contain.  Prompts without this
         // processor-proven boundary keep the existing storage policy.
+        // Standalone rotating/SWA caches deliberately keep the exact/N-1
+        // disk-seed and post-answer policy (see `diskSeedBoundaryIndex`); they
+        // only gain the stripped-boundary store itself.
         let usesCanonicalHybridBoundary =
             coordinator.isHybrid && hybridStripBoundary != nil
         let isReusablePrefixWarmup =
@@ -3272,23 +3287,17 @@ public struct TokenIterator: TokenIteratorProtocol {
                     }
                 }
                 // Cross-turn reuse boundary for hybrid-SSM models (qwen3.5 /
-                // ornith GatedDeltaNet, Nemotron-H Mamba-2, LFM2, ZAYA CCA, …):
-                // store the generation-prompt-STRIPPED prompt, ending just before
-                // the LAST turn-start token (`<|im_start|>` / `<start_of_turn>` —
-                // the first token of the gen-prompt diff computed at load).
-                // `add_generation_prompt` appends `<turn-start>assistant\n` + a
-                // request-dependent scaffold, so we anchor on the structural
-                // turn-start token, not the exact suffix. The NEXT chat turn
-                // replaces that trailing gen prompt with the actual assistant
-                // reply, so the full-prompt key never matches next turn — but
-                // this stripped boundary (ending at the user turn) DOES, which is
-                // what restores hybrid cross-turn prefix reuse (proven live on
-                // qwen-agentworld-35B / qwen3.6-35B-A3B GDN MoE + Qwen3.6-27B MTP:
-                // growing turns HIT the stripped boundary and stay coherent —
-                // byte-identical to cache-off ground truth). Default ON for hybrid
-                // models; disable with `VMLX_HYBRID_STRIPPED_STORE=0`. Dense /
-                // sliding-window models are excluded — they already reuse via the
-                // post-answer boundary and don't need this.
+                // ornith GatedDeltaNet, Nemotron-H Mamba-2, LFM2, ZAYA CCA, …)
+                // and standalone rotating/sliding-window caches: store the
+                // generation-prompt-STRIPPED prompt, ending just before the LAST
+                // turn-start token (`<|im_start|>` / `<start_of_turn>` — the first
+                // token of the gen-prompt diff computed at load). The NEXT chat
+                // turn replaces that trailing gen prompt with the actual assistant
+                // reply, so the full-prompt key never matches next turn — but the
+                // stripped boundary does, restoring cross-turn prefix reuse.
+                // Default ON for hybrid and standalone rotating/SWA topologies;
+                // disable with `VMLX_HYBRID_STRIPPED_STORE=0`. Dense models are
+                // excluded because they already reuse via the post-answer boundary.
                 //
                 // `hybridStripSnapshot` was captured as prefill crossed the
                 // boundary, so this store is just a copy. There is deliberately no

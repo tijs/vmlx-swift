@@ -3350,6 +3350,8 @@ public actor BatchEngine {
             // existing prompt/post-answer policy.
             // Still `isHybrid` on purpose — see the note in Evaluate.swift. This
             // suppresses every other boundary; only an SSM hybrid can afford that.
+            // Standalone rotating/SWA caches keep this policy untouched and only
+            // gain the stripped-boundary store itself (below).
             let usesCanonicalHybridBoundary =
                 coordinator.isHybrid && sharedPromptStripBoundary != nil
             let isReusablePrefixWarmup =
@@ -3667,13 +3669,19 @@ public actor BatchEngine {
                     }
                 }
 
+<<<<<<< HEAD
                 // Gen-suffix-stripped cross-turn boundary (hybrid SSM + rotating
                 // companion topologies).
+=======
+                // Gen-suffix-stripped cross-turn boundary — hybrid SSM and
+                // standalone rotating/SWA.
+>>>>>>> upstream/main
                 //
                 // The prompt boundary stored above ends in the chat template's
                 // generation-prompt suffix (`<|im_start|>assistant\n`, …). The
                 // NEXT chat turn replaces that suffix with the assistant reply +
                 // the following user turn, so the full-prompt key can never match
+<<<<<<< HEAD
                 // as a prefix — which is why growing hybrid turns never reused
                 // prefill and recomputed the whole context every turn. The
                 // boundary the next turn DOES contain as an exact prefix is this
@@ -3684,17 +3692,17 @@ public actor BatchEngine {
                 // are admitted too: their paged tier cannot serve mid-stream
                 // prefix matches (companion exists only at stored boundaries), so
                 // this stripped boundary is their only growing-turn reuse path.
+=======
+                // as a prefix. The stripped boundary does match the next prompt
+                // as an exact prefix, so store it for growing-chat reuse.
+>>>>>>> upstream/main
                 //
                 // Correctness: KV comes from the prompt-boundary trim/re-derive;
                 // clean SSM/GatedDeltaNet state at the stripped position comes from
                 // `storeCacheEntry`'s re-derive (enableSSMReDerive), NOT from the
                 // live post-generation state (which is ahead by the gen suffix).
-                // The store only fires when the prompt's tail actually is the
-                // template's gen-prompt suffix, so non-chat / tool-scaffold prompts
-                // that don't match simply skip it (no reuse, still correct). Proven
-                // cache-ON == cache-OFF (byte-identical, temp=0, fresh disk cache)
-                // on qwen-agentworld-35b-a3b MXFP8 (GatedDeltaNet MoE) and
-                // nemotron-omni-nano (Mamba-2); inert on dense gemma-4-e2b.
+                // The store only fires when the prompt tail matches the template's
+                // generation prompt; non-chat/tool-scaffold prompts simply skip it.
                 // NOTE: intentionally NOT gated on
                 // `!cachePrefixTokenCounts.contains(stripAt)`. For hybrid caches
                 // the history-boundary path can't store this boundary without a
@@ -3703,7 +3711,10 @@ public actor BatchEngine {
                 // the store entirely (the re-derive here is the only writer).
                 if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
                    (coordinator.isHybrid
+<<<<<<< HEAD
                        || coordinator.requiresPagedBoundaryCompanion
+=======
+>>>>>>> upstream/main
                        || cacheHasStandaloneRotatingWindowState(slot.cache)),
                    let stripAt = sharedPromptStripBoundary
                 {

@@ -47,6 +47,7 @@ public enum LLMTypeRegistry {
             "diffusion_gemma": create(DiffusionGemmaConfiguration.self, DiffusionGemmaModel.init),
             "qwen2": create(Qwen2Configuration.self, Qwen2Model.init),
             "qwen3": create(Qwen3Configuration.self, Qwen3Model.init),
+            "spark2_5": create(Spark25Configuration.self, Spark25Model.init),
             "qwen3_moe": create(Qwen3MoEConfiguration.self, Qwen3MoEModel.init),
             "qwen3_next": create(Qwen3NextConfiguration.self, Qwen3NextModel.init),
             "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
@@ -1251,14 +1252,15 @@ internal func llmDefaultAdditionalContext(
     modelType: String?,
     capabilities: JangCapabilities?,
     generationConfig: GenerationConfigFile?,
-    chatConfig: JangChatConfig?
+    chatConfig: JangChatConfig?,
+    chatTemplate: String? = nil
 ) -> [String: any Sendable]? {
     var context: [String: any Sendable] = [:]
 
-    // Trust the bundle's capability stamp. A bundle that explicitly declares
-    // no thinking wins over stale template metadata. Otherwise use the
-    // model-authored default from generation_config.json, falling back to the
-    // mirrored JANG chat stamp. Request/UI context is merged later and wins.
+    // Preserve a native explicit-only generation tail: a capability flag is
+    // not an enable_thinking default. Otherwise retain legacy non-thinking
+    // capability behavior. Explicit defaults come from generation_config or
+    // the mirrored JANG chat stamp; request/UI context is merged later and wins.
     let declaredEnableThinking: Bool?
     if let explicitTemplateDefault =
         generationConfig?.defaultChatTemplateKwargs?.enableThinking
@@ -1277,8 +1279,11 @@ internal func llmDefaultAdditionalContext(
     }
 
     if capabilities?.supportsThinking == false {
-        context["enable_thinking"] = false
-    } else if let enableThinking = declaredEnableThinking {
+        if !ThinkingTemplateContract.preservesOmittedThinking(chatTemplate) {
+            return ["enable_thinking": false]
+        }
+    }
+    if let enableThinking = declaredEnableThinking {
         context["enable_thinking"] = enableThinking
         if enableThinking,
            let effort = chatConfig?.reasoning?.defaultEffort?
@@ -1466,13 +1471,15 @@ private struct LLMUserInputProcessor: UserInputProcessor {
         modelType: String?,
         capabilities: JangCapabilities?,
         generationConfig: GenerationConfigFile?,
-        chatConfig: JangChatConfig?
+        chatConfig: JangChatConfig?,
+        chatTemplate: String?
     ) -> [String: any Sendable]? {
         llmDefaultAdditionalContext(
             modelType: modelType,
             capabilities: capabilities,
             generationConfig: generationConfig,
-            chatConfig: chatConfig)
+            chatConfig: chatConfig,
+            chatTemplate: chatTemplate)
     }
 }
 
@@ -1978,7 +1985,7 @@ public final class LLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? "qwen3"
+                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
                         : reasoningStampFromModelType(baseConfig.modelType))
             } else if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
@@ -1991,7 +1998,7 @@ public final class LLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? "qwen3"
+                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
                         : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
@@ -2069,7 +2076,8 @@ public final class LLMModelFactory: ModelFactory {
                 modelType: baseConfig.modelType,
                 capabilities: jangConfig?.capabilities,
                 generationConfig: generationConfig,
-                chatConfig: jangConfig?.chat),
+                chatConfig: jangConfig?.chat,
+                chatTemplate: chatTemplate),
             templateReadsEnableThinking: BailingThinkingTemplateContext.templateReadsEnableThinking(chatTemplate))
 
         return .init(
