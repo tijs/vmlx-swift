@@ -1970,7 +1970,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // entry).
                     let diskRestored = MLXCacheIOLock.withSerializedMLXCacheIO {
                         () -> Int in
+                        CacheFidelityTrace.dump(
+                            diskArrays, label: "RESTORE payload matched=\(matchedTokens)")
                         let count = restoreFromDiskArrays(diskArrays, into: &self.cache)
+                        CacheFidelityTrace.dumpCache(
+                            self.cache, label: "RESTORE cache-after matched=\(matchedTokens)")
                         if count > 0 {
                             // The v2 disk format has NO LayerKind for the
                             // GatedDeltaNet linear-attention (ArraysCache) state
@@ -2506,8 +2510,92 @@ public struct TokenIterator: TokenIteratorProtocol {
         // generation and does not alter sampler or template behavior.
         if let capture = prefillBoundaryCapture(of: input) {
             if let head = capture.head {
+                // Capture any stable boundaries that sit INSIDE this head on the
+                // way through it, ascending, before prefilling the rest.
+                //
+                // The pass below this one only looks at stable boundaries AFTER
+                // the head, because it filters on `alreadyConsumed`. For a
+                // cross-conversation anchor that filter can never match: the
+                // anchor marks the shared system+tools prefix and is therefore
+                // always EARLIER in the prompt than the generation-stripped
+                // boundary this head ends at. Measured on Ornith 1.5 35B-A3B,
+                // the head ended at 20,388 while the anchor sat at 20,375, so
+                // `wanted` came back empty on every request and the anchor was
+                // never captured.
+                //
+                // With no capture the post-answer store fell back to
+                // cacheSnapshotForBoundary, which cannot trim a cache holding
+                // MambaCache layers (BaseKVCache defaults isTrimmable to false
+                // and neither ArraysCache nor MambaCache overrides it) and so
+                // REDERIVED the state with a fresh newCache at a different
+                // prefill step. Restoring that rederived state changed greedy
+                // output: on a 20,406-token prompt at temperature 0 the first
+                // assistant turn differed from cold, while a self-restore to
+                // the captured boundary 27 tokens later was byte-identical.
+                let headCount = head.text.tokenIds?.count ?? head.text.tokens.size
+                // EXPERIMENT: capture ONLY the N-1 seed, not N as well.
+                // Capturing both forces a 1-token prefill chunk between them,
+                // and a 1-token chunk plausibly takes the recurrent kernels'
+                // single-step path rather than the chunked scan.
+                // `cacheStablePrefixTokenCounts` are ABSOLUTE positions in the
+                // whole prompt; `headCount` is the length of the slice this
+                // prefill will process. They coincide only when the cache
+                // started empty. After a restore prefill begins partway in —
+                // measured live: promptTokenIds=4102 inputSize=1031
+                // headCount=1026 stable=[4087] — so the strip boundary fails
+                // `$0 < headCount` and `inner` comes back EMPTY. Nothing is
+                // captured, and the post-answer store replays the whole prefix
+                // through the model after the answer has already streamed,
+                // making a restoring turn slower (12.9 s) than a cold one
+                // (10.5 s).
+                let alreadyInCache = promptTokenIds.count - input.text.tokens.size
+                let headEnd = alreadyInCache + headCount
+                let inner = Set(
+                    originalInput.cacheStablePrefixTokenCounts
+                        .filter { $0 > 1 && $0 < headEnd }
+                        .map { $0 - 1 }
+                ).filter { $0 > alreadyInCache && $0 < headEnd }.sorted()
+
+                var consumed = alreadyInCache
+                var remainingHead = head
+                for boundary in inner {
+                    // `boundarySplit` rebases the boundary itself, assuming the
+                    // input it is handed is the LAST `size` tokens of the prompt
+                    // (`split = boundary - (promptTokenIds.count - size)`). That
+                    // holds for a tail but not for the head pieces walked here,
+                    // so undo that rebase instead of subtracting `consumed` on
+                    // top of it. Applying both corrections cut the first piece
+                    // short by `promptCount - headCount` — 5 tokens on Ornith
+                    // 1.5, this template's generation-prompt suffix — and the
+                    // store was then correctly refused, `offsets=[20369]` under
+                    // a claimed `tokens=20374`.
+                    let rebase = promptTokenIds.count - remainingHead.text.tokens.size
+                    guard boundary > consumed,
+                        let split = boundarySplit(
+                            of: remainingHead, at: boundary - consumed + rebase),
+                        let piece = split.head
+                    else { continue }
+                    let preparedPiece = try MLXPressGenerationProfile.time("prompt.model_prepare") {
+                        try model.prepare(piece, cache: cache, windowSize: windowSize)
+                    }
+                    switch preparedPiece {
+                    case .tokens(let leftover):
+                        _ = model(
+                            leftover[text: .newAxis],
+                            cache: cache.isEmpty ? nil : cache,
+                            state: nil)
+                    case .logits:
+                        break
+                    }
+                    MLX.eval(cache)
+                    stableBoundarySnapshots[boundary] =
+                        makePromptBoundaryCacheSnapshot(from: cache)
+                    remainingHead = split.tail
+                    consumed = boundary
+                }
+
                 let preparedHead = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-                    try model.prepare(head, cache: cache, windowSize: windowSize)
+                    try model.prepare(remainingHead, cache: cache, windowSize: windowSize)
                 }
                 switch preparedHead {
                 case .tokens(let remaining):
@@ -2534,7 +2622,20 @@ public struct TokenIterator: TokenIteratorProtocol {
             if let head = capture.head {
                 capturedHeadCount = head.text.tokenIds?.count ?? head.text.tokens.size
                 if capturedHeadCount > 0 {
-                    stableBoundarySnapshots[capturedHeadCount] = snapshot
+                    // Key by the ABSOLUTE boundary, not the head's local length.
+                    // When the cache was restored from an earlier boundary this
+                    // prefill starts partway through the prompt, so the head is
+                    // only the slice from there — filing the snapshot under its
+                    // local length means the store loop, which asks for absolute
+                    // boundaries, never finds it and replays the whole prefix
+                    // through the model instead. Measured on a 4,102-token
+                    // prompt restoring 3,071: the head is 1,016 tokens and the
+                    // store asks for 4,087, so every restoring request paid a
+                    // ~9.8 s rederive AFTER its answer had already streamed —
+                    // making a restoring turn slower (12.9 s) than a cold one
+                    // (10.5 s).
+                    let alreadyInCache = promptTokenIds.count - input.text.tokens.size
+                    stableBoundarySnapshots[alreadyInCache + capturedHeadCount] = snapshot
                 }
             }
             // Keep going through the stable boundaries that sit AFTER this
@@ -2603,6 +2704,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                 .filter { $0 > alreadyConsumed && $0 < promptCount }
                 .flatMap { [$0, $0 - 1] }
         ).filter { $0 > alreadyConsumed }.sorted()
+        if CacheFidelityTrace.isEnabled {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][fidelity] capture-loop stable=\(originalInput.cacheStablePrefixTokenCounts) "
+                    + "alreadyConsumed=\(alreadyConsumed) promptCount=\(promptCount) "
+                    + "wanted=\(wanted)\n").utf8))
+        }
         guard !wanted.isEmpty else { return false }
 
         var consumed = alreadyConsumed
@@ -2626,6 +2733,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
             MLX.eval(cache)
             stableBoundarySnapshots[boundary] = makePromptBoundaryCacheSnapshot(from: cache)
+            CacheFidelityTrace.dumpCache(
+                stableBoundarySnapshots[boundary]!,
+                label: "STORE stable boundary=\(boundary)")
             remaining = split.tail
             consumed = boundary
         }
@@ -3264,10 +3374,23 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 + " store=\(storeBoundary) stable=\(isStableBoundary)"
                                 + " allowRederive=\(allowRederive)"
                                 + " snapshotTokens=\(storageSnapshotTokenCount)"
-                                + " snapshot=\(boundarySnapshotOrNil == nil ? "nil" : "ok")\n")
+                                + " snapshot=\(boundarySnapshotOrNil == nil ? "nil" : "ok")"
+                                // WHICH path produced it is the whole cost
+                                // question: a captured snapshot is free, the
+                                // fallback replays the prefix through the model
+                                // after the answer is already visible. Without
+                                // this the trace reports "ok" either way, which
+                                // is what made a 9.8 s per-task cost invisible.
+                                + " captured=\(stableBoundarySnapshots[storeBoundary] != nil)\n")
                                 .utf8))
                     }
                     if let boundarySnapshot = boundarySnapshotOrNil {
+                        CacheFidelityTrace.dumpCache(
+                            boundarySnapshot,
+                            label: "STORE boundary=\(storeBoundary) "
+                                + "captured=\(stableBoundarySnapshots[storeBoundary] != nil) "
+                                + "capturedKeys=\(stableBoundarySnapshots.keys.sorted()) "
+                                + "stable=\(isStableBoundary)")
                         store(
                             tokens: boundaryTokens,
                             cache: boundarySnapshot,
