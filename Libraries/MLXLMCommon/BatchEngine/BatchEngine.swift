@@ -3669,19 +3669,13 @@ public actor BatchEngine {
                     }
                 }
 
-<<<<<<< HEAD
-                // Gen-suffix-stripped cross-turn boundary (hybrid SSM + rotating
-                // companion topologies).
-=======
-                // Gen-suffix-stripped cross-turn boundary — hybrid SSM and
-                // standalone rotating/SWA.
->>>>>>> upstream/main
+                // Gen-suffix-stripped cross-turn boundary — hybrid SSM,
+                // rotating-companion, and standalone rotating/SWA topologies.
                 //
                 // The prompt boundary stored above ends in the chat template's
                 // generation-prompt suffix (`<|im_start|>assistant\n`, …). The
                 // NEXT chat turn replaces that suffix with the assistant reply +
                 // the following user turn, so the full-prompt key can never match
-<<<<<<< HEAD
                 // as a prefix — which is why growing hybrid turns never reused
                 // prefill and recomputed the whole context every turn. The
                 // boundary the next turn DOES contain as an exact prefix is this
@@ -3692,10 +3686,6 @@ public actor BatchEngine {
                 // are admitted too: their paged tier cannot serve mid-stream
                 // prefix matches (companion exists only at stored boundaries), so
                 // this stripped boundary is their only growing-turn reuse path.
-=======
-                // as a prefix. The stripped boundary does match the next prompt
-                // as an exact prefix, so store it for growing-chat reuse.
->>>>>>> upstream/main
                 //
                 // Correctness: KV comes from the prompt-boundary trim/re-derive;
                 // clean SSM/GatedDeltaNet state at the stripped position comes from
@@ -3711,10 +3701,7 @@ public actor BatchEngine {
                 // the store entirely (the re-derive here is the only writer).
                 if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
                    (coordinator.isHybrid
-<<<<<<< HEAD
                        || coordinator.requiresPagedBoundaryCompanion
-=======
->>>>>>> upstream/main
                        || cacheHasStandaloneRotatingWindowState(slot.cache)),
                    let stripAt = sharedPromptStripBoundary
                 {
