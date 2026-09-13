@@ -380,6 +380,34 @@ public struct BaseConfiguration: Codable, Sendable {
                 }
             }
         }
+
+        /// True when `other` describes exactly the same quantization plan:
+        /// the same default and an identical per-layer override map.
+        ///
+        /// Used to accept `quantization_config` as a drop-in alias for
+        /// `quantization` only when the two are provably identical. A bundle
+        /// that disagrees with itself (the same spelling declared twice with
+        /// different widths) is rejected at decode time rather than silently
+        /// resolved by key order.
+        func isEquivalent(to other: QuantizationContainer) -> Bool {
+            guard quantization.asTuple == other.quantization.asTuple else { return false }
+            let mine = perLayerQuantization.perLayerQuantization
+            let theirs = other.perLayerQuantization.perLayerQuantization
+            guard mine.count == theirs.count else { return false }
+
+            for (key, option) in mine {
+                guard let otherOption = theirs[key] else { return false }
+                switch (option, otherOption) {
+                case (.skip, .skip):
+                    continue
+                case (.quantize(let a), .quantize(let b)):
+                    guard a.asTuple == b.asTuple else { return false }
+                default:
+                    return false
+                }
+            }
+            return true
+        }
     }
 
     public var quantizationContainer: QuantizationContainer?
@@ -399,6 +427,59 @@ public struct BaseConfiguration: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case quantizationContainer = "quantization"
+        case quantizationConfigContainer = "quantization_config"
         case eosTokenIds = "eos_token_id"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.modelType = try container.decode(String.self, forKey: .modelType)
+        self.eosTokenIds = try container.decodeIfPresent(
+            IntOrIntArray.self, forKey: .eosTokenIds)
+        self.quantizationContainer = try Self.decodeQuantizationContainer(from: container)
+    }
+
+    /// Resolve the quantization map whether the checkpoint spells it
+    /// `quantization` (the historical mlx-swift name) or
+    /// `quantization_config` (the Hugging Face config.json name, used by
+    /// e.g. mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit).
+    ///
+    /// When BOTH keys are present the two must describe exactly the same
+    /// quantization plan; otherwise decoding fails with a clear error
+    /// instead of silently preferring one spelling.
+    private static func decodeQuantizationContainer(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) throws -> QuantizationContainer? {
+        let quantization = try container.decodeIfPresent(
+            QuantizationContainer.self, forKey: .quantizationContainer)
+        let quantizationConfig = try container.decodeIfPresent(
+            QuantizationContainer.self, forKey: .quantizationConfigContainer)
+
+        switch (quantization, quantizationConfig) {
+        case (nil, nil):
+            return nil
+        case (let value?, nil):
+            return value
+        case (nil, let value?):
+            return value
+        case (let value?, let config?):
+            guard value.isEquivalent(to: config) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .quantizationConfigContainer,
+                    in: container,
+                    debugDescription:
+                        "config.json declares both \"quantization\" and \"quantization_config\" "
+                        + "but they describe different quantization plans; refusing to pick one. "
+                        + "Remove one of the keys or make them identical.")
+            }
+            return value
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(modelType, forKey: .modelType)
+        try container.encodeIfPresent(quantizationContainer, forKey: .quantizationContainer)
+        try container.encodeIfPresent(eosTokenIds, forKey: .eosTokenIds)
     }
 }
