@@ -1795,6 +1795,47 @@ public final class LLMModelFactory: ModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        // Bonsai 2 Prism-Hadamard gate (portability slice, default OFF).
+        // `prism_hadamard_qwen35` (root `model_type` OR nested
+        // `text_config.model_type`) must never flow into the generic registry
+        // or the text_config fallback below: that fallback would build a
+        // default-parameter Qwen35TextModel out of the pack's root config and
+        // fail late and ambiguously at weight application. This gate makes the
+        // decision deterministic — OFF: clean unsupportedModelType reject;
+        // ON: strict manifest + hadamard.json sign validation, then an
+        // explicit "transform not implemented" refusal until the transform
+        // slice lands (see `PrismBonsaiPortability`; env
+        // `VMLX_BONSAI_PRISM_HADAMARD=1`). No ordinary model is ever
+        // constructed for this type.
+        switch PrismBonsaiPortability.decide(
+            configData: configData,
+            hadamardData: try? Data(
+                contentsOf: modelDirectory.appending(
+                    component: PrismBonsaiPortability.requiredHadamardConfigFilename)),
+            gateEnabled: PrismBonsaiPortability.isEnabled
+        ) {
+        case .notBonsai:
+            break
+        case .gateOffReject:
+            throw ModelFactoryError.unsupportedModelType(
+                PrismBonsaiPortability.prismHadamardQwen35)
+        case .gateOnManifestValid:
+            throw ModelFactoryError.configurationFileError(
+                configurationURL.lastPathComponent, configuration.name,
+                NSError(
+                    domain: "PrismBonsaiPortability",
+                    code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "gate enabled and the Bonsai manifest validates, but the "
+                            + "Prism-Hadamard activation-transform slice is not implemented "
+                            + "yet — refusing to load \(PrismBonsaiPortability.prismHadamardQwen35)"
+                    ]))
+        case .gateOnManifestInvalid(let validationError):
+            throw ModelFactoryError.configurationFileError(
+                configurationURL.lastPathComponent, configuration.name, validationError)
+        }
+
         let earlyJangConfig: JangConfig?
         if JangLoader.isJangModel(at: modelDirectory) {
             earlyJangConfig = try JangLoader.loadConfig(at: modelDirectory)
