@@ -3394,20 +3394,23 @@ public struct TokenIterator: TokenIteratorProtocol {
                         // it is several guards deep and only logs at debug
                         // level, which is not persisted — so report the inputs
                         // and the outcome for each boundary considered.
-                        FileHandle.standardError.write(Data(
-                            ("[vmlx][cache/store-boundary] boundary=\(boundary)"
-                                + " store=\(storeBoundary) stable=\(isStableBoundary)"
-                                + " allowRederive=\(allowRederive)"
-                                + " snapshotTokens=\(storageSnapshotTokenCount)"
-                                + " snapshot=\(boundarySnapshotOrNil == nil ? "nil" : "ok")"
-                                // WHICH path produced it is the whole cost
-                                // question: a captured snapshot is free, the
-                                // fallback replays the prefix through the model
-                                // after the answer is already visible. Without
-                                // this the trace reports "ok" either way, which
-                                // is what made a 9.8 s per-task cost invisible.
-                                + " captured=\(stableBoundarySnapshots[storeBoundary] != nil)\n")
-                                .utf8))
+                        let capturedSnapshot =
+                            stableBoundarySnapshots[storeBoundary] != nil
+                        let snapshotState =
+                            boundarySnapshotOrNil == nil ? "nil" : "ok"
+                        // WHICH path produced it is the whole cost
+                        // question: a captured snapshot is free, the
+                        // fallback replays the prefix through the model
+                        // after the answer is already visible. Without
+                        // this the trace reports "ok" either way, which
+                        // is what made a 9.8 s per-task cost invisible.
+                        let boundaryMessage =
+                            "[vmlx][cache/store-boundary] boundary=\(boundary)"
+                            + " store=\(storeBoundary) stable=\(isStableBoundary)"
+                            + " allowRederive=\(allowRederive)"
+                            + " snapshotTokens=\(storageSnapshotTokenCount)"
+                            + " snapshot=\(snapshotState) captured=\(capturedSnapshot)\n"
+                        FileHandle.standardError.write(Data(boundaryMessage.utf8))
                     }
                     if let boundarySnapshot = boundarySnapshotOrNil {
                         CacheFidelityTrace.dumpCache(
