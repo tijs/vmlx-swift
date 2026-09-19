@@ -58,6 +58,7 @@ struct PrismBonsaiHadamardTests {
             "gdn_activation_layout": "grouped",
             "base_model_type": "qwen3_5",
             "quantization": ["bits": 2, "group_size": 128, "mode": "affine"],
+            "text_config": ["model_type": "qwen3_5_text"],
             "modules": [
                 [
                     "path": "lm_head", "block": 1024, "embedding": false,

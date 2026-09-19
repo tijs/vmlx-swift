@@ -26,10 +26,14 @@ import MLXNN
 ///   model is ever constructed for it.
 /// - ON: the pack must pass strict manifest + `hadamard.json` sign validation
 ///   (see `decide(configData:hadamardData:gateEnabled:)`); every validation
-///   failure aborts early with a configuration error. A VALID pack is still
-///   refused in this slice with an explicit "transform not implemented"
-///   configuration error — never an ordinary model, never a partial load,
-///   never a silent fall-through.
+///   failure aborts early with a configuration error. A VALID pack enters the
+///   isolated transform load path only when the root `model_type` matches the
+///   pinned contract (`prism_hadamard_qwen35` with the `qwen3_5_text` text
+///   decoder and a root config that self-describes the decoder size); the
+///   `qwen3_5_text` decoder is constructed explicitly and the validated plan
+///   is handed to `loadWeights(bonsaiTransform:)`, which installs the packed
+///   transform modules and consumes the packed/signs keys transactionally
+///   before the final `update(verify: [.noUnusedKeys])`.
 ///
 /// The env gate follows the repo convention of `DSV4_FORCE_JANGTQ` and the
 /// `VMLX_*` gates (process environment, exact string `"1"`): it is local to
@@ -38,26 +42,34 @@ import MLXNN
 /// manifest load — it only changes WHERE the load fails (early, with a clear
 /// reason).
 ///
-/// NEXT SEAM (implemented in the transform-slice commit; parity still pending):
+/// SEAM STATUS (transform-slice commits):
 /// 1. `MLXNN`: `HadamardActivation` + forward-FWHT packed Linear
 ///    (`HadamardPackedLinear`) and inverse-FWHT packed Embedding
 ///    (`HadamardPackedEmbedding`) over `MLX.hadamardTransform`
 ///    (`Source/MLX/Ops.swift`), mirroring the pack runtime
 ///    `runtime/runtime.py:16-70` semantics clean-room
-///    (`Source/MLXNN/PrismBonsaiHadamard.swift`).
+///    (`Source/MLXNN/PrismBonsaiHadamard.swift`). DONE + pinned-runtime
+///    FWHT parity gate (`PrismBonsaiHadamardPinnedParityTests`,
+///    `tools/BonsaiPrismFWHTParity`).
 /// 2. `MLXLMCommon/Load.swift`: `loadWeights(..., bonsaiTransform:)` installs
 ///    those modules via the affine-quantize module-swap machinery when a
 ///    validated plan is passed, consumes the per-module `.signs` tensors, and
 ///    bypasses the standard affine `QuantizedLinear` swap for packed paths so
-///    the final `update(verify: [.noUnusedKeys])` passes.
-/// 3. Replace the `.gateOnManifestValid` refusal below with the transformed
-///    load entry point once (1)+(2) exist AND the required model-level
-///    identity/parity gates have run (parity vs the pinned Python runtime is
-///    the first of those and has NOT run yet — refusal remains correct).
+///    the final `update(verify: [.noUnusedKeys])` passes. DONE.
+/// 3. `LLMModelFactory` gate-on-manifest-valid wiring: the validated plan is
+///    built in `_load` and handed to `loadWeights(bonsaiTransform:)` with an
+///    explicitly constructed `Qwen35TextModel` — never the registry, never
+///    the `text_config.model_type` fallback. DONE (loader/factory wiring only;
+///    a real-pack load/benchmark is a later identity/parity gate).
 enum PrismBonsaiPortability {
 
     /// Root model_type of the Bonsai 2 pack (config.json `model_type`).
     static let prismHadamardQwen35 = "prism_hadamard_qwen35"
+
+    /// Nested text decoder of the pinned pack (config.json
+    /// `text_config.model_type`). The transform load path constructs this
+    /// decoder explicitly; any other nested value (or none) fails closed.
+    static let requiredTextDecoderModelType = "qwen3_5_text"
 
     /// Environment variable that turns the gate ON. Absent or not exactly
     /// `"1"` → OFF.
@@ -117,10 +129,13 @@ enum PrismBonsaiPortability {
         case gateOffReject
         /// Gate ON and the pack manifest + hadamard signs validate. The
         /// transformed load path (MLXNN packed modules + the
-        /// `MLXLMCommon/Load.swift` `bonsaiTransform:` seam) exists but is
-        /// NOT wired to the factory until the model-level identity/parity
-        /// gates run; until then the load is refused with an explicit
-        /// configuration error.
+        /// `MLXLMCommon/Load.swift` `bonsaiTransform:` seam + the factory
+        /// handoff) is wired: the factory builds the validated plan and
+        /// hands it to `loadWeights(bonsaiTransform:)` alongside an
+        /// explicitly constructed `qwen3_5_text` decoder. Identity reached
+        /// only through nested `text_config` (VLM-wrapped shape) is refused
+        /// by the factory with a clear error — it is not this factory's
+        /// load to absorb.
         case gateOnManifestValid
         /// Gate ON and validation failed; the attached error is the reason.
         case gateOnManifestInvalid(ManifestValidationError)
@@ -248,6 +263,18 @@ enum PrismBonsaiPortability {
             return invalid(
                 "base_model_type must be \"\(requiredBaseModelType)\", got "
                     + "\(probe.baseModelType.map { "\"\($0)\"" } ?? "nil")")
+        }
+        // Pinned text-decoder contract: when the ROOT model_type is the
+        // prism pack, the nested text_config.model_type must be exactly
+        // `qwen3_5_text`. A different or missing decoder (e.g.
+        // `qwen3_5_moe`, or a plain `qwen3_5_text` at the root with a
+        // prism nested value) would either fail late in the transform path
+        // or route to the wrong architecture — fail closed here instead.
+        if rootType == prismHadamardQwen35, textType != requiredTextDecoderModelType {
+            return invalid(
+                "text_config.model_type must be \"\(requiredTextDecoderModelType)\" "
+                    + "when model_type is \"\(prismHadamardQwen35)\", got "
+                    + "\(textType.map { "\"\($0)\"" } ?? "nil")")
         }
         guard let tensorNamespace = probe.tensorNamespace, !tensorNamespace.isEmpty else {
             return invalid("tensor_namespace must be present and non-empty")
@@ -389,5 +416,52 @@ enum PrismBonsaiPortability {
 
     private static func invalid(_ reason: String) -> Decision {
         .gateOnManifestInvalid(ManifestValidationError(reason))
+    }
+
+    /// True only when the prism identity is carried by the ROOT `model_type`
+    /// — the pinned, LLM-factory-loadable shape. A prism identity that exists
+    /// only under `text_config.model_type` is a VLM-wrapped pack that must
+    /// route through the VLM factory; the LLM transform load refuses it.
+    static func isRootPrismIdentity(rootModelType: String?) -> Bool {
+        rootModelType == prismHadamardQwen35
+    }
+
+    // MARK: - Text-decoder size probe
+
+    /// Probe the pack's ROOT config for the `qwen3_5_text` decoder's core
+    /// size parameters.
+    ///
+    /// `Qwen35TextConfiguration` defaults every field when its key is absent
+    /// (`hidden_size` → 4096, `num_hidden_layers` → 32, `vocab_size` →
+    /// 151936), so decoding a bare Bonsai manifest (which carries only the
+    /// prism contract fields) would silently construct a default-parameter
+    /// `Qwen35TextModel` — the exact wrong-model trap the gate exists to
+    /// close. The factory therefore requires the pack's ROOT config to
+    /// explicitly carry positive `hidden_size`, `num_hidden_layers` and
+    /// `vocab_size` before any decoder is constructed; absence (or a
+    /// `text_config`-nested layout) fails closed with a configuration error
+    /// instead of defaulting.
+    static func textDecoderRootSizeParameters(
+        configData: Data
+    ) -> (hiddenSize: Int, hiddenLayers: Int, vocabSize: Int)? {
+        struct Probe: Codable {
+            let hiddenSize: Int?
+            let hiddenLayers: Int?
+            let vocabSize: Int?
+
+            enum CodingKeys: String, CodingKey {
+                case hiddenSize = "hidden_size"
+                case hiddenLayers = "num_hidden_layers"
+                case vocabSize = "vocab_size"
+            }
+        }
+        guard let probe = try? JSONDecoder.json5().decode(Probe.self, from: configData),
+            let hiddenSize = probe.hiddenSize, hiddenSize > 0,
+            let hiddenLayers = probe.hiddenLayers, hiddenLayers > 0,
+            let vocabSize = probe.vocabSize, vocabSize > 0
+        else {
+            return nil
+        }
+        return (hiddenSize, hiddenLayers, vocabSize)
     }
 }

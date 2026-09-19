@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 /// Creates a function that decodes configuration data and instantiates a model with the proper configuration
 private func create<C: Codable, M: LanguageModel>(
@@ -1802,16 +1803,18 @@ public final class LLMModelFactory: ModelFactory {
         // default-parameter Qwen35TextModel out of the pack's root config and
         // fail late and ambiguously at weight application. This gate makes the
         // decision deterministic — OFF: clean unsupportedModelType reject;
-        // ON: strict manifest + hadamard.json sign validation, then an
-        // explicit "transform not implemented" refusal until the transform
-        // slice lands (see `PrismBonsaiPortability`; env
-        // `VMLX_BONSAI_PRISM_HADAMARD=1`). No ordinary model is ever
+        // ON: strict manifest + hadamard.json sign validation, then the
+        // validated plan is handed to `loadWeights(bonsaiTransform:)` with an
+        // EXPLICITLY constructed `qwen3_5_text` decoder (never the registry,
+        // never the text_config fallback). See `PrismBonsaiPortability`; env
+        // `VMLX_BONSAI_PRISM_HADAMARD=1`. No ordinary model is ever
         // constructed for this type.
+        var bonsaiPlan: PrismBonsaiHadamardPlan?
+        let hadamardURL = modelDirectory.appending(
+            component: PrismBonsaiPortability.requiredHadamardConfigFilename)
         switch PrismBonsaiPortability.decide(
             configData: configData,
-            hadamardData: try? Data(
-                contentsOf: modelDirectory.appending(
-                    component: PrismBonsaiPortability.requiredHadamardConfigFilename)),
+            hadamardData: try? Data(contentsOf: hadamardURL),
             gateEnabled: PrismBonsaiPortability.isEnabled
         ) {
         case .notBonsai:
@@ -1820,20 +1823,58 @@ public final class LLMModelFactory: ModelFactory {
             throw ModelFactoryError.unsupportedModelType(
                 PrismBonsaiPortability.prismHadamardQwen35)
         case .gateOnManifestValid:
-            throw ModelFactoryError.configurationFileError(
-                configurationURL.lastPathComponent, configuration.name,
-                NSError(
-                    domain: "PrismBonsaiPortability",
-                    code: 1,
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            "gate enabled and the Bonsai manifest validates; the "
-                            + "Prism-Hadamard transform modules and the "
-                            + "Load.swift bonsaiTransform: seam exist, but the "
-                            + "transformed load entry point is not wired until "
-                            + "the model-level identity/parity gates run — "
-                            + "refusing to load \(PrismBonsaiPortability.prismHadamardQwen35)"
-                    ]))
+            // Pinned-shape guard: the transform load engages only when the
+            // ROOT model_type is the prism pack. Identity established only
+            // through nested text_config (VLM-wrapped) is not this factory's
+            // load — refuse with a clear configuration error instead of
+            // absorbing it or letting the text_config fallback run.
+            guard PrismBonsaiPortability.isRootPrismIdentity(
+                rootModelType: baseConfig.modelType
+            ) else {
+                throw ModelFactoryError.configurationFileError(
+                    configurationURL.lastPathComponent, configuration.name,
+                    NSError(
+                        domain: "PrismBonsaiPortability",
+                        code: 1,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "\(PrismBonsaiPortability.prismHadamardQwen35) identity "
+                                + "reached only through text_config.model_type: "
+                                + "VLM-wrapped packs route through the VLM factory, "
+                                + "not the LLM transform load path"
+                        ]))
+            }
+            // Default-parameter trap: the qwen3_5_text decoder defaults every
+            // field when absent (hidden_size 4096, num_hidden_layers 32,
+            // vocab_size 151936), so a bare Bonsai manifest must never
+            // construct a default-parameter Qwen35TextModel. The root config
+            // must explicitly carry the decoder's size parameters.
+            guard PrismBonsaiPortability.textDecoderRootSizeParameters(
+                configData: configData
+            ) != nil else {
+                throw ModelFactoryError.configurationFileError(
+                    configurationURL.lastPathComponent, configuration.name,
+                    NSError(
+                        domain: "PrismBonsaiPortability",
+                        code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "the Bonsai manifest validates but config.json does "
+                                + "not carry explicit hidden_size/num_hidden_layers/"
+                                + "vocab_size for the qwen3_5_text decoder at the top "
+                                + "level; refusing a default-parameter Qwen35TextModel"
+                        ]))
+            }
+            do {
+                bonsaiPlan = try PrismBonsaiHadamardPlan(
+                    configData: configData, hadamardData: Data(contentsOf: hadamardURL))
+            } catch let error as PrismBonsaiHadamardPlan.BuildError {
+                throw ModelFactoryError.configurationFileError(
+                    configurationURL.lastPathComponent, configuration.name, error)
+            } catch {
+                throw ModelFactoryError.configurationFileError(
+                    configurationURL.lastPathComponent, configuration.name, error)
+            }
         case .gateOnManifestInvalid(let validationError):
             throw ModelFactoryError.configurationFileError(
                 configurationURL.lastPathComponent, configuration.name, validationError)
@@ -1888,31 +1929,50 @@ public final class LLMModelFactory: ModelFactory {
             enum CodingKeys: String, CodingKey { case textConfig = "text_config" }
         }
         let model: LanguageModel
-        do {
-            model = try await typeRegistry.createModel(
-                configuration: configData, modelType: baseConfig.modelType,
-                requesting: configuration.requestedModalities)
-        } catch {
-            // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
-            // or the config couldn't be decoded for that type).
-            // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
-            if let wrapper = try? JSONDecoder.json5().decode(TextConfigWrapper.self, from: configData),
-                let textModelType = wrapper.textConfig?.modelType,
-                textModelType != baseConfig.modelType
-            {
-                do {
-                    model = try await typeRegistry.createModel(
-                        configuration: configData, modelType: textModelType,
-                        requesting: configuration.requestedModalities)
-                } catch let innerError as DecodingError {
-                    throw ModelFactoryError.configurationDecodingError(
-                        configurationURL.lastPathComponent, configuration.name, innerError)
-                }
-            } else if let decodingError = error as? DecodingError {
+        if let bonsaiPlan {
+            // Validated prism pack: the pinned text decoder is qwen3_5_text.
+            // Construct it EXPLICITLY from configData — never the registry
+            // (prism_hadamard_qwen35 is not registered) and never the
+            // text_config.model_type fallback below (which would rebuild a
+            // default-parameter Qwen35TextModel out of the wrong container —
+            // the wrong-model trap). loadWeights() then consumes the packed
+            // tensors via `bonsaiTransform:` (the plan) and the final
+            // noUnusedKeys verification stays meaningful.
+            do {
+                let textConfiguration = try JSONDecoder.json5().decode(
+                    Qwen35TextConfiguration.self, from: configData)
+                model = Qwen35TextModel(textConfiguration)
+            } catch let error as DecodingError {
                 throw ModelFactoryError.configurationDecodingError(
-                    configurationURL.lastPathComponent, configuration.name, decodingError)
-            } else {
-                throw error
+                    configurationURL.lastPathComponent, configuration.name, error)
+            }
+        } else {
+            do {
+                model = try await typeRegistry.createModel(
+                    configuration: configData, modelType: baseConfig.modelType,
+                    requesting: configuration.requestedModalities)
+            } catch {
+                // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
+                // or the config couldn't be decoded for that type).
+                // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
+                if let wrapper = try? JSONDecoder.json5().decode(TextConfigWrapper.self, from: configData),
+                    let textModelType = wrapper.textConfig?.modelType,
+                    textModelType != baseConfig.modelType
+                {
+                    do {
+                        model = try await typeRegistry.createModel(
+                            configuration: configData, modelType: textModelType,
+                            requesting: configuration.requestedModalities)
+                    } catch let innerError as DecodingError {
+                        throw ModelFactoryError.configurationDecodingError(
+                            configurationURL.lastPathComponent, configuration.name, innerError)
+                    }
+                } else if let decodingError = error as? DecodingError {
+                    throw ModelFactoryError.configurationDecodingError(
+                        configurationURL.lastPathComponent, configuration.name, decodingError)
+                } else {
+                    throw error
+                }
             }
         }
 
@@ -2075,7 +2135,8 @@ public final class LLMModelFactory: ModelFactory {
             // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
             jangConfig: jangConfig,
-            loadPreservedMTP: loadNativeMTP)
+            loadPreservedMTP: loadNativeMTP,
+            bonsaiTransform: bonsaiPlan)
 
         let tokenizer = try await tokenizerTask
 

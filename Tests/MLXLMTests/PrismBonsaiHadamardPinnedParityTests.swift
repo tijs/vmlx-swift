@@ -47,7 +47,11 @@ struct PrismBonsaiHadamardPinnedParityTests {
         let roundtrip: [Float]?
     }
 
-    private static let fixture: (pin: [String: Any], cases: [FixtureCase]) = {
+    // Immutable fixture loaded once from the packaged JSON (contents are
+    // never mutated); `nonisolated(unsafe)` documents that the payload's
+    // [String: Any] shape is not Sendable by construction but is read-only
+    // after load, so the concurrency-safety diagnostic is not applicable.
+    private static nonisolated(unsafe) let fixture: (pin: [String: Any], cases: [FixtureCase]) = {
         guard
             let url = Bundle.module.url(
                 forResource: "PrismBonsaiPinnedFWHTFixture", withExtension: "json"),
@@ -139,11 +143,14 @@ struct PrismBonsaiHadamardPinnedParityTests {
         let actual = hadamardFWHT(
             x, block: Self.pinnedBlock, signs: MLXArray(c.signs), inverse: false)
         let expected = MLXArray(c.forward).reshaped(c.shape)
-        #expect(actual.dtype == .float16)
+        // The transform casts back to the INPUT dtype (f16 pack contract);
+        // the fixture arrays load as f32, so the invariant is
+        // output-dtype == input-dtype.
+        #expect(actual.dtype == x.dtype)
         #expect(actual.shape == expected.shape)
         #expect(
             maxAbsDiff(actual, expected)
-                <= parityTolerance(referenceMaxAbs: c.forward))
+                <= parityTolerance(referenceMaxAbs: referenceMaxAbs(c.forward)))
     }
 
     @Test("forward block-1024 FWHT matches the pinned runtime at width 6144")
@@ -154,7 +161,7 @@ struct PrismBonsaiHadamardPinnedParityTests {
             x, block: Self.pinnedBlock, signs: MLXArray(c.signs), inverse: false)
         #expect(
             maxAbsDiff(actual, MLXArray(c.forward).reshaped(c.shape))
-                <= parityTolerance(referenceMaxAbs: c.forward))
+                <= parityTolerance(referenceMaxAbs: referenceMaxAbs(c.forward)))
     }
 
     @Test("forward block-1024 FWHT matches the pinned runtime at width 17408")
@@ -165,7 +172,7 @@ struct PrismBonsaiHadamardPinnedParityTests {
             x, block: Self.pinnedBlock, signs: MLXArray(c.signs), inverse: false)
         #expect(
             maxAbsDiff(actual, MLXArray(c.forward).reshaped(c.shape))
-                <= parityTolerance(referenceMaxAbs: c.forward))
+                <= parityTolerance(referenceMaxAbs: referenceMaxAbs(c.forward)))
     }
 
     // MARK: 3. Inverse FWHT parity against the pinned runtime
@@ -178,7 +185,7 @@ struct PrismBonsaiHadamardPinnedParityTests {
             x, block: Self.pinnedBlock, signs: MLXArray(c.signs), inverse: true)
         #expect(
             maxAbsDiff(actual, MLXArray(c.inverse).reshaped(c.shape))
-                <= parityTolerance(referenceMaxAbs: c.inverse))
+                <= parityTolerance(referenceMaxAbs: referenceMaxAbs(c.inverse)))
     }
 
     @Test("inverse block-1024 FWHT matches the pinned runtime at width 6144")
@@ -189,7 +196,7 @@ struct PrismBonsaiHadamardPinnedParityTests {
             x, block: Self.pinnedBlock, signs: MLXArray(c.signs), inverse: true)
         #expect(
             maxAbsDiff(actual, MLXArray(c.inverse).reshaped(c.shape))
-                <= parityTolerance(referenceMaxAbs: c.inverse))
+                <= parityTolerance(referenceMaxAbs: referenceMaxAbs(c.inverse)))
     }
 
     @Test("inverse block-1024 FWHT matches the pinned runtime at width 17408")
@@ -200,7 +207,7 @@ struct PrismBonsaiHadamardPinnedParityTests {
             x, block: Self.pinnedBlock, signs: MLXArray(c.signs), inverse: true)
         #expect(
             maxAbsDiff(actual, MLXArray(c.inverse).reshaped(c.shape))
-                <= parityTolerance(referenceMaxAbs: c.inverse))
+                <= parityTolerance(referenceMaxAbs: referenceMaxAbs(c.inverse)))
     }
 
     // MARK: 4. Inverse/round-trip semantics
@@ -217,7 +224,7 @@ struct PrismBonsaiHadamardPinnedParityTests {
         let expected = MLXArray(rt).reshaped(c.shape)
         #expect(
             maxAbsDiff(swiftRoundTrip, expected)
-                <= parityTolerance(referenceMaxAbs: rt))
+                <= parityTolerance(referenceMaxAbs: referenceMaxAbs(rt)))
     }
 
     @Test("forward-then-inverse FWHT recovers the input at every pack width")
@@ -234,7 +241,7 @@ struct PrismBonsaiHadamardPinnedParityTests {
             // pinned runtime is an exact involution, see fixture roundtrip).
             #expect(
                 maxAbsDiff(roundTripped, x)
-                    <= parityTolerance(referenceMaxAbs: c.x),
+                    <= parityTolerance(referenceMaxAbs: referenceMaxAbs(c.x)),
                 "round trip diverged for \(name)")
         }
     }
@@ -251,8 +258,8 @@ struct PrismBonsaiHadamardPinnedParityTests {
         let actual = hadamardFWHT(
             ones, block: Self.pinnedBlock, signs: MLXArray(c.signs), inverse: false)
         #expect(
-            maxAbsDiff(actual, expected)
-                <= parityTolerance(referenceMaxAbs: c.forward))
+            maxAbsDiff(actual, expected.reshaped(c.shape))
+                <= parityTolerance(referenceMaxAbs: referenceMaxAbs(c.forward)))
         // The transform is blockwise: the spike lands once per 1024 block.
         let multi = MLXArray.ones([1, 2048], dtype: .float16)
         let multiOut = hadamardFWHT(
@@ -281,7 +288,7 @@ struct PrismBonsaiHadamardPinnedParityTests {
         let expected = MLXArray(c.forward).reshaped(c.shape)
         #expect(
             maxAbsDiff(pinnedOrder, expected)
-                <= parityTolerance(referenceMaxAbs: c.forward))
+                <= parityTolerance(referenceMaxAbs: referenceMaxAbs(c.forward)))
         // Wrong order (transform first, then signs) must NOT satisfy the
         // pinned reference — this is what makes sign placement observable.
         let wrongOrder =
@@ -293,7 +300,7 @@ struct PrismBonsaiHadamardPinnedParityTests {
             * signs.asType(.float32)
         #expect(
             maxAbsDiff(wrongOrder, expected)
-                > parityTolerance(referenceMaxAbs: c.forward))
+                > parityTolerance(referenceMaxAbs: referenceMaxAbs(c.forward)))
     }
 
     @Test("sign placement matches the pinned runtime order (post-transform inverse)")
@@ -307,14 +314,15 @@ struct PrismBonsaiHadamardPinnedParityTests {
         let expected = MLXArray(c.inverse).reshaped(c.shape)
         #expect(
             maxAbsDiff(pinnedOrder, expected)
-                <= parityTolerance(referenceMaxAbs: c.inverse))
+                <= parityTolerance(referenceMaxAbs: referenceMaxAbs(c.inverse)))
         // Wrong order (signs before the transform in inverse) must not match.
         let wrongOrder = hadamardFWHT(
             x.asType(.float32) * signs.asType(.float32),
-            block: Self.pinnedBlock, signs: MLXArray(repeating: 1, count: c.width),
+            block: Self.pinnedBlock,
+            signs: MLXArray(Array(repeating: Float(1), count: c.width)),
             inverse: true)
         #expect(
             maxAbsDiff(wrongOrder, expected)
-                > parityTolerance(referenceMaxAbs: c.inverse))
+                > parityTolerance(referenceMaxAbs: referenceMaxAbs(c.inverse)))
     }
 }

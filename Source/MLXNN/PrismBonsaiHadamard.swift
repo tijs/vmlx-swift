@@ -372,6 +372,7 @@ public struct PrismBonsaiHadamardPlan: Equatable, Sendable {
     // PrismBonsaiPortability for the factory-side decision).
 
     public static let prismHadamardQwen35 = "prism_hadamard_qwen35"
+    public static let requiredTextDecoderModelType = "qwen3_5_text"
     public static let requiredRuntime = "runtime/artifact.py"
     public static let requiredHadamardConfigFilename = "hadamard.json"
     public static let requiredSchemaVersion = 2
@@ -477,6 +478,17 @@ public struct PrismBonsaiHadamardPlan: Equatable, Sendable {
                 == Self.prismHadamardQwen35
         else {
             throw BuildError("model_type must be \(Self.prismHadamardQwen35)")
+        }
+        // Pinned text-decoder contract: a root `prism_hadamard_qwen35`
+        // manifest must nest exactly the `qwen3_5_text` decoder (mirrors
+        // the factory gate). Any other/missing nested value fails closed.
+        if stringValue(config["model_type"]) == Self.prismHadamardQwen35,
+            stringValue((config["text_config"] as? [String: Any])?["model_type"])
+                != Self.requiredTextDecoderModelType
+        {
+            throw BuildError(
+                "text_config.model_type must be \"\(Self.requiredTextDecoderModelType)\" "
+                    + "when model_type is \"\(Self.prismHadamardQwen35)\"")
         }
         guard intValue(config["schema_version"]) == Self.requiredSchemaVersion
         else {
