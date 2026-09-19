@@ -28,12 +28,15 @@ import MLXNN
 ///   (see `decide(configData:hadamardData:gateEnabled:)`); every validation
 ///   failure aborts early with a configuration error. A VALID pack enters the
 ///   isolated transform load path only when the root `model_type` matches the
-///   pinned contract (`prism_hadamard_qwen35` with the `qwen3_5_text` text
-///   decoder and a root config that self-describes the decoder size); the
-///   `qwen3_5_text` decoder is constructed explicitly and the validated plan
-///   is handed to `loadWeights(bonsaiTransform:)`, which installs the packed
-///   transform modules and consumes the packed/signs keys transactionally
-///   before the final `update(verify: [.noUnusedKeys])`.
+///   pinned contract (`prism_hadamard_qwen35` with a nested `text_config`
+///   that self-describes the `qwen3_5_text` decoder: the pinned pack carries
+///   the decoder's size parameters — `hidden_size`/`num_hidden_layers`/
+///   `vocab_size` — under `text_config`, never at the root); the
+///   `qwen3_5_text` decoder is constructed explicitly from that nested object
+///   and the validated plan is handed to `loadWeights(bonsaiTransform:)`,
+///   which installs the packed transform modules and consumes the
+///   packed/signs keys transactionally before the final
+///   `update(verify: [.noUnusedKeys])`.
 ///
 /// The env gate follows the repo convention of `DSV4_FORCE_JANGTQ` and the
 /// `VMLX_*` gates (process environment, exact string `"1"`): it is local to
@@ -426,25 +429,33 @@ enum PrismBonsaiPortability {
         rootModelType == prismHadamardQwen35
     }
 
-    // MARK: - Text-decoder size probe
+    // MARK: - Pinned text-decoder extraction
 
-    /// Probe the pack's ROOT config for the `qwen3_5_text` decoder's core
-    /// size parameters.
+    /// Extract the pinned `qwen3_5_text` decoder's config object (config.json
+    /// `text_config`) re-encoded as standalone JSON, or nil when the root
+    /// Prism pack does not carry a valid nested decoder.
     ///
-    /// `Qwen35TextConfiguration` defaults every field when its key is absent
-    /// (`hidden_size` → 4096, `num_hidden_layers` → 32, `vocab_size` →
-    /// 151936), so decoding a bare Bonsai manifest (which carries only the
-    /// prism contract fields) would silently construct a default-parameter
-    /// `Qwen35TextModel` — the exact wrong-model trap the gate exists to
-    /// close. The factory therefore requires the pack's ROOT config to
-    /// explicitly carry positive `hidden_size`, `num_hidden_layers` and
-    /// `vocab_size` before any decoder is constructed; absence (or a
-    /// `text_config`-nested layout) fails closed with a configuration error
-    /// instead of defaulting.
-    static func textDecoderRootSizeParameters(
+    /// The pinned pack stores the decoder architecture under `text_config`:
+    /// the root carries NO `hidden_size` / `num_hidden_layers` / `vocab_size`
+    /// (only the prism identity + manifest fields), so decoding
+    /// `Qwen35TextConfiguration` from the root would silently build the
+    /// default-parameter decoder (4096 / 32 / 151936) — the exact wrong-model
+    /// trap this gate exists to close. The factory therefore decodes the
+    /// actual nested `text_config` object instead. This helper requires:
+    ///
+    /// - root `model_type` == `prism_hadamard_qwen35` (the pinned LLM shape);
+    /// - nested `text_config.model_type` == `qwen3_5_text`;
+    /// - explicit positive `hidden_size`, `num_hidden_layers`, `vocab_size`
+    ///   in the nested object — a missing/bare nested decoder fails closed
+    ///   (nil) instead of defaulting.
+    ///
+    /// The re-encoded nested object is returned so the factory can decode
+    /// `Qwen35TextConfiguration` from the decoder's own fields and nothing
+    /// else (no invented defaults, no flattened unrelated root data).
+    static func textDecoderConfigurationData(
         configData: Data
-    ) -> (hiddenSize: Int, hiddenLayers: Int, vocabSize: Int)? {
-        struct Probe: Codable {
+    ) -> Data? {
+        struct DecoderSizeProbe: Codable {
             let hiddenSize: Int?
             let hiddenLayers: Int?
             let vocabSize: Int?
@@ -455,13 +466,23 @@ enum PrismBonsaiPortability {
                 case vocabSize = "vocab_size"
             }
         }
-        guard let probe = try? JSONDecoder.json5().decode(Probe.self, from: configData),
+        guard let object = (try? JSONSerialization.jsonObject(with: configData))
+            as? [String: Any],
+            object["model_type"] as? String == prismHadamardQwen35,
+            let textConfig = object["text_config"] as? [String: Any],
+            textConfig["model_type"] as? String == requiredTextDecoderModelType
+        else {
+            return nil
+        }
+        guard let nestedData = try? JSONSerialization.data(withJSONObject: textConfig),
+            let probe = try? JSONDecoder.json5().decode(
+                DecoderSizeProbe.self, from: nestedData),
             let hiddenSize = probe.hiddenSize, hiddenSize > 0,
             let hiddenLayers = probe.hiddenLayers, hiddenLayers > 0,
             let vocabSize = probe.vocabSize, vocabSize > 0
         else {
             return nil
         }
-        return (hiddenSize, hiddenLayers, vocabSize)
+        return nestedData
     }
 }

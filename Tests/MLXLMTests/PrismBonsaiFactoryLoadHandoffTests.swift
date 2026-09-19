@@ -10,22 +10,31 @@ import Testing
 /// Focused tests for the Bonsai 2 Prism-Hadamard FACTORY/LOAD handoff:
 /// the exact sequence `LLMModelFactory._load` now runs when
 /// `VMLX_BONSAI_PRISM_HADAMARD=1` and the manifest validates — decide →
-/// pinned-shape guard → text-decoder size probe → plan build →
+/// pinned-shape guard → nested text_config decoder extraction → plan build →
 /// explicit `qwen3_5_text` decoder construction → `loadWeights`
 /// `bonsaiTransform:` install → final `update(verify: [.noUnusedKeys])`.
 ///
+/// The fixtures mirror the PINNED pack layout (`prism-ml/
+/// Ternary-Bonsai-2-27B-mlx-2bit` at
+/// `3f926b415992eaa2ae9dd7b573706494d6bbf787`): root `model_type` is
+/// `prism_hadamard_qwen35` with the manifest fields at the root, and the
+/// `qwen3_5_text` decoder architecture (incl. `hidden_size`/
+/// `num_hidden_layers`/`vocab_size`) lives under `text_config` — the root
+/// carries NO decoder dimensions.
+///
 /// These are REAL target tests: a genuine `Qwen35TextModel` (small dims,
 /// all-attention so the plan's `model.layers.0.self_attn.q_proj` leaf
-/// exists) is constructed and the internal `installBonsaiPrismHadamard`
-/// seam swaps its leaves in-memory with the pack's own key naming
-/// (`language_model.*` checkpoint namespace). No weights, no network, no
-/// Metal compute beyond the quantize helper the existing install tests
-/// already use.
+/// exists) is constructed from the nested text_config and the internal
+/// `installBonsaiPrismHadamard` seam swaps its leaves in-memory with the
+/// pack's own key naming (`language_model.*` checkpoint namespace). No
+/// weights, no network, no Metal compute beyond the quantize helper the
+/// existing install tests already use.
 @Suite("Prism Bonsai factory/load handoff")
 struct PrismBonsaiFactoryLoadHandoffTests {
 
-    // MARK: Fixtures (mirror the portability-gate fixtures, plus the root
-    // qwen3_5_text decoder dimensions the factory requires)
+    // MARK: Fixtures (mirror the portability-gate fixtures, plus the nested
+    // qwen3_5_text decoder dimensions in text_config, exactly like the pinned
+    // pack)
 
     private let modules: [[String: Any]] = [
         ["path": "lm_head", "block": 1024, "embedding": false, "dtype": "float16"],
@@ -53,17 +62,21 @@ struct PrismBonsaiFactoryLoadHandoffTests {
             "base_model_type": "qwen3_5",
             "quantization": ["bits": 2, "group_size": 128, "mode": "affine"],
             "modules": modules,
-            "text_config": ["model_type": textDecoder],
-            // qwen3_5_text decoder dimensions: the factory refuses to
-            // construct the decoder when these are absent at the root.
-            "hidden_size": 1024,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "intermediate_size": 256,
-            "full_attention_interval": 1,
             "tie_word_embeddings": false,
-            "vocab_size": 16,
+            // Mirror the pinned pack: the decoder architecture (sizes, heads,
+            // rope, ...) lives under text_config; the ROOT carries no
+            // hidden_size/num_hidden_layers/vocab_size.
+            "text_config": [
+                "model_type": textDecoder,
+                "hidden_size": 1024,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "intermediate_size": 256,
+                "full_attention_interval": 1,
+                "tie_word_embeddings": false,
+                "vocab_size": 16,
+            ],
         ]
         for (key, value) in overrides { dict[key] = value }
         return try! JSONSerialization.data(withJSONObject: dict)
@@ -105,10 +118,20 @@ struct PrismBonsaiFactoryLoadHandoffTests {
             configData: bonsaiConfig(), hadamardData: hadamardData())
     }
 
-    /// Build the real (small) qwen3_5_text decoder exactly like `_load` does.
+    /// Build the real (small) qwen3_5_text decoder exactly like `_load` does:
+    /// decode `Qwen35TextConfiguration` from the NESTED `text_config` object
+    /// (the factory never decodes from the root, which carries no decoder
+    /// dims in the pinned layout).
     private func makeRealDecoder() throws -> Qwen35TextModel {
+        guard let textDecoderData =
+            PrismBonsaiPortability.textDecoderConfigurationData(
+                configData: bonsaiConfig())
+        else {
+            Issue.record("expected nested text_config decoder data")
+            throw PrismBonsaiInstall.Error("handoff precondition failed")
+        }
         let configuration = try JSONDecoder.json5().decode(
-            Qwen35TextConfiguration.self, from: bonsaiConfig())
+            Qwen35TextConfiguration.self, from: textDecoderData)
         return Qwen35TextModel(configuration)
     }
 
@@ -183,31 +206,82 @@ struct PrismBonsaiFactoryLoadHandoffTests {
                 == "language_model.model.embed_tokens.weight")
     }
 
-    @Test("bare manifest (no decoder dimensions) fails the factory size probe")
-    func bareManifestFailsDecoderSizeProbe() {
-        // The manifest itself is valid (decide approves) ...
+    @Test("bare nested decoder (no dimensions) fails the factory extraction")
+    func bareNestedDecoderFailsClosed() {
+        // decide() still approves: the manifest itself is valid ...
+        let bare = bonsaiConfig([
+            "text_config": ["model_type": "qwen3_5_text"],
+        ])
         let decision = PrismBonsaiPortability.decide(
-            configData: bonsaiConfig([
-                "hidden_size": NSNull(), "num_hidden_layers": NSNull(),
-                "vocab_size": NSNull(),
-            ]),
-            hadamardData: hadamardData(), gateEnabled: true)
+            configData: bare, hadamardData: hadamardData(), gateEnabled: true)
         #expect(decision == .gateOnManifestValid)
-        // ... but the factory's default-parameter trap refuses to construct
-        // a Qwen35TextModel without explicit root size parameters.
+        // ... but the factory's default-parameter trap refuses to decode a
+        // Qwen35TextConfiguration without explicit NESTED size parameters.
         #expect(
-            PrismBonsaiPortability.textDecoderRootSizeParameters(
+            PrismBonsaiPortability.textDecoderConfigurationData(
+                configData: bare) == nil)
+        // Missing text_config entirely also fails closed.
+        #expect(
+            PrismBonsaiPortability.textDecoderConfigurationData(
+                configData: bonsaiConfig(["text_config": NSNull()])) == nil)
+        // A root-flattened decoder (dims at the root, no text_config) fails
+        // closed too — the pinned layout is nested, never root-flattened.
+        #expect(
+            PrismBonsaiPortability.textDecoderConfigurationData(
                 configData: bonsaiConfig([
-                    "hidden_size": NSNull(), "num_hidden_layers": NSNull(),
-                    "vocab_size": NSNull(),
+                    "text_config": NSNull(),
+                    "hidden_size": 1024,
+                    "num_hidden_layers": 1,
+                    "vocab_size": 16,
                 ])) == nil)
+        // The full nested decoder extracts.
         #expect(
-            PrismBonsaiPortability.textDecoderRootSizeParameters(
+            PrismBonsaiPortability.textDecoderConfigurationData(
                 configData: bonsaiConfig()) != nil)
-        // Non-positive sizes also fail closed.
+        // Non-positive nested sizes fail closed.
+        let nonPositive: [String: Any] = [
+            "model_type": "qwen3_5_text",
+            "hidden_size": 1024,
+            "num_hidden_layers": 0,
+            "vocab_size": 16,
+        ]
         #expect(
-            PrismBonsaiPortability.textDecoderRootSizeParameters(
-                configData: bonsaiConfig(["num_hidden_layers": 0])) == nil)
+            PrismBonsaiPortability.textDecoderConfigurationData(
+                configData: bonsaiConfig(["text_config": nonPositive])) == nil)
+    }
+
+    @Test("nested text_config builds the explicit qwen3_5_text decoder, never the default 4096/32/151936")
+    func nestedTextConfigBuildsExplicitDecoder() throws {
+        // Pre-fix behavior (decoding from the ROOT configData) silently yields
+        // the default-parameter decoder: the root carries no decoder dims.
+        let rootDecoded = try JSONDecoder.json5().decode(
+            Qwen35TextConfiguration.self, from: bonsaiConfig())
+        #expect(rootDecoded.hiddenSize == 4096)
+        #expect(rootDecoded.hiddenLayers == 32)
+        #expect(rootDecoded.vocabularySize == 151_936)
+
+        // The factory now decodes the actual nested text_config object: the
+        // explicit small decoder, not the default one.
+        guard let textDecoderData =
+            PrismBonsaiPortability.textDecoderConfigurationData(
+                configData: bonsaiConfig())
+        else {
+            Issue.record("expected nested text_config decoder data")
+            throw PrismBonsaiInstall.Error("handoff precondition failed")
+        }
+        let nestedDecoded = try JSONDecoder.json5().decode(
+            Qwen35TextConfiguration.self, from: textDecoderData)
+        #expect(nestedDecoded.modelType == "qwen3_5_text")
+        #expect(nestedDecoded.hiddenSize == 1024)
+        #expect(nestedDecoded.hiddenLayers == 1)
+        #expect(nestedDecoded.vocabularySize == 16)
+
+        // The model the factory constructs (via makeRealDecoder) therefore
+        // carries the explicit nested dimensions.
+        let model = try makeRealDecoder()
+        #expect(model.configuration.hiddenSize == 1024)
+        #expect(model.configuration.hiddenLayers == 1)
+        #expect(model.configuration.vocabularySize == 16)
     }
 
     @Test("root prism with a wrong nested decoder fails closed (gate + plan)")
