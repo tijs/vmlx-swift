@@ -716,6 +716,18 @@ public func loadWeights(
     if let bonsaiTransform {
         try installBonsaiPrismHadamard(
             bonsaiTransform, model: model, weights: &weights)
+        // The TEXT-ONLY Bonsai decoder binds its modules at the top level
+        // (`model.*`, `lm_head.*`) while the pack publishes the body/head
+        // under the VLM `language_model.` wrapper and ships `vision_tower.*`
+        // sidecar tensors for a model that is text-only by construction.
+        // Apply the shared prefix strip + sidecar drop AFTER the install (the
+        // packed tensors are consumed by the pack's own prefixed key names,
+        // so their resolution is untouched) so the final
+        // `update(verify: [.noUnusedKeys])` binds every remaining key
+        // instead of failing with unhandled `language_model`/`vision_tower`.
+        // Scoped to this branch: `bonsaiTransform` is non-nil only on the
+        // explicit text-only Bonsai path; ordinary loads never enter it.
+        weights = normalizeBonsaiTextDecoderWeights(weights)
     }
 
     // JANGTQ native: load the signs/codebook sidecar into the runtime cache
@@ -2018,6 +2030,34 @@ func installBonsaiPrismHadamard(
             + "packed module(s) (block \(plan.block), \(plan.bits)-bit/"
             + "group-\(plan.groupSize)), consumed \(consumedCount) "
             + "checkpoint key(s)\n").utf8))
+}
+
+/// Normalize the remaining checkpoint keys of the TEXT-ONLY Bonsai load
+/// before the final `update(parameters:verify: [.noUnusedKeys])`.
+///
+/// The pinned pack (`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`) publishes its
+/// `qwen3_5_text` decoder under the VLM `language_model.` wrapper namespace
+/// (`language_model.model.*`, `language_model.lm_head.*`) and carries
+/// `vision_tower.*` sidecar tensors, but the factory constructs the bare
+/// `Qwen35TextModel` decoder, which binds its body and output head at the
+/// top level (`model.*`, `lm_head.*`). The `installBonsaiPrismHadamard`
+/// seam consumes the packed tensors by the pack's own prefixed key names,
+/// so this runs AFTER the install and only rewrites what remains:
+///
+/// - `Weights.stripLanguageModelPrefix` flattens the VLM wrapper onto the
+///   decoder's module paths (`language_model.model.foo` → `model.foo`,
+///   `language_model.lm_head.foo` → `lm_head.foo`). Keys that already sit
+///   flat pass through untouched, and a mixed-provenance re-bake carrying
+///   BOTH spellings of a key resolves deterministically (unprefixed
+///   destination wins; see `Weights.stripLanguageModelPrefix`).
+/// - `vision_tower.*` / `model.visual.*` tensors are dropped: sidecar
+///   vision weights for a decoder that is text-only by construction.
+func normalizeBonsaiTextDecoderWeights(
+    _ weights: [String: MLXArray]
+) -> [String: MLXArray] {
+    Weights.stripLanguageModelPrefix(weights).filter {
+        !$0.key.hasPrefix("vision_tower") && !$0.key.hasPrefix("model.visual")
+    }
 }
 
 /// Resolve a `modules[]` dtype declaration to the module's output dtype.

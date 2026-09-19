@@ -430,4 +430,147 @@ struct PrismBonsaiFactoryLoadHandoffTests {
         #expect(leaves["model.embed_tokens"] == "Embedding")
         #expect(weights["language_model.lm_head.signs"] != nil)
     }
+
+    // MARK: 3. Text-only decoder key normalization (VLM wrapper + vision sidecar)
+
+    /// Distinct shape per tensor, so a mis-bind is visible as the wrong
+    /// extent without forcing an evaluation (same tagging convention as
+    /// `WeightsTests`).
+    private static func tagged(_ tag: Int) -> MLXArray {
+        MLXArray.zeros([tag])
+    }
+
+    @Test("text-only Bonsai normalization flattens language_model body/head, drops vision sidecar, preserves flat keys")
+    func normalizesPrefixedBodyHeadAndDropsVisionSidecar() {
+        // The pinned pack's post-install remainder: ordinary decoder keys
+        // under the VLM `language_model.` wrapper (`model.*` body,
+        // `lm_head.*` head) plus `vision_tower.*` sidecar tensors, with a
+        // few already-flat keys mixed in.
+        let weights: [String: MLXArray] = [
+            "language_model.model.norm.weight": Self.tagged(1),
+            "language_model.model.layers.0.input_layernorm.weight": Self.tagged(2),
+            "language_model.lm_head.weight": Self.tagged(3),
+            // Already-flat keys: pass through untouched, same key, same tensor.
+            "model.embed_tokens.weight": Self.tagged(4),
+            "model.layers.0.post_attention_layernorm.weight": Self.tagged(5),
+            // vision_tower sidecar: dropped entirely.
+            "vision_tower.visual.blocks.0.attn.qkv.weight": Self.tagged(6),
+            "vision_tower.visual.positional_embedding": Self.tagged(7),
+        ]
+
+        let normalized = normalizeBonsaiTextDecoderWeights(weights)
+
+        // Body/head wrapper flattened onto the decoder's module paths.
+        #expect(normalized["model.norm.weight"]?.shape == [1])
+        #expect(normalized["model.layers.0.input_layernorm.weight"]?.shape == [2])
+        #expect(normalized["lm_head.weight"]?.shape == [3])
+        // No spelling of the wrapper survives.
+        #expect(!normalized.keys.contains { $0.hasPrefix("language_model") })
+        // Flat keys preserved under their own key names.
+        #expect(normalized["model.embed_tokens.weight"]?.shape == [4])
+        #expect(normalized["model.layers.0.post_attention_layernorm.weight"]?.shape == [5])
+        // vision sidecar gone.
+        #expect(!normalized.keys.contains { $0.hasPrefix("vision_tower") })
+        #expect(normalized.count == 5)
+    }
+
+    @Test("text-only Bonsai normalization resolves duplicate spellings deterministically")
+    func normalizesDuplicateSpellingsDeterministically() {
+        // Mixed-provenance re-bake: the checkpoint carries BOTH spellings of
+        // the same destination. The documented rule in
+        // `Weights.stripLanguageModelPrefix` is that an unprefixed key
+        // already at the destination always wins — never dictionary
+        // iteration order.
+        let weights: [String: MLXArray] = [
+            "language_model.model.norm.weight": Self.tagged(11),
+            "model.norm.weight": Self.tagged(22),  // the one that must win
+        ]
+
+        let normalized = normalizeBonsaiTextDecoderWeights(weights)
+
+        #expect(normalized.count == 1)
+        #expect(normalized["model.norm.weight"]?.shape == [22])
+        #expect(normalized["language_model.model.norm.weight"] == nil)
+    }
+
+    @Test("install → normalization → final noUnusedKeys: VLM-wrapped ordinary keys + vision sidecar bind cleanly")
+    func installThenNormalizeThenNoUnusedKeysPasses() throws {
+        // Admission replay: the real pack resolves/consumes every packed
+        // tensor under its own `language_model.*` key names, then leaves the
+        // ORDINARY decoder keys still VLM-wrapped plus a `vision_tower.*`
+        // sidecar. Before this fix the final update on the bare
+        // Qwen35TextModel failed with `Unhandled keys ["language_model",
+        // "vision_tower"]`.
+        let plan = try factoryPlan()
+        let model = try makeRealDecoder()
+
+        let lmHead = packedTensors(out: 16, inputWidth: 1024, seed: 61)
+        let qProj = packedTensors(out: 2048, inputWidth: 1024, seed: 62)
+        let embed = packedTensors(out: 16, inputWidth: 1024, seed: 63)
+        var weights: [String: MLXArray] = [
+            // Packed tensors, consumed by the install seam.
+            "language_model.lm_head.weight": lmHead.weight,
+            "language_model.lm_head.scales": lmHead.scales,
+            "language_model.lm_head.biases": lmHead.biases,
+            "language_model.lm_head.signs": lmHead.signs,
+            "language_model.model.layers.0.self_attn.q_proj.weight": qProj.weight,
+            "language_model.model.layers.0.self_attn.q_proj.scales": qProj.scales,
+            "language_model.model.layers.0.self_attn.q_proj.biases": qProj.biases,
+            "language_model.model.layers.0.self_attn.q_proj.signs": qProj.signs,
+            "language_model.model.embed_tokens.weight": embed.weight,
+            "language_model.model.embed_tokens.scales": embed.scales,
+            "language_model.model.embed_tokens.biases": embed.biases,
+            "language_model.model.embed_tokens.signs": embed.signs,
+            // Ordinary decoder keys the plan does NOT cover — VLM-wrapped.
+            "language_model.model.norm.weight": MLXRandom.normal([1024]),
+            "language_model.model.layers.0.input_layernorm.weight": MLXRandom.normal([1024]),
+            // Already-flat ordinary key: survives untouched.
+            "model.layers.0.post_attention_layernorm.weight": MLXRandom.normal([1024]),
+            // vision_tower sidecar (333 tensors in the real pack).
+            "vision_tower.visual.blocks.0.attn.qkv.weight": MLXRandom.normal([1]),
+            "vision_tower.visual.positional_embedding": MLXRandom.normal([2]),
+        ]
+
+        try installBonsaiPrismHadamard(plan, model: model, weights: &weights)
+        // Packed tensors are gone; the ordinary VLM-wrapped keys remain.
+        #expect(weights["language_model.model.norm.weight"] != nil)
+        #expect(weights["vision_tower.visual.positional_embedding"] != nil)
+        #expect(!weights.keys.contains { $0.contains("lm_head.weight") })
+
+        // Pre-normalization replay of the observed blocker: the final update
+        // on the bare text decoder rejects the VLM wrapper + vision sidecar
+        // containers.
+        do {
+            try model.update(
+                parameters: ModuleParameters.unflattened(weights),
+                verify: [.noUnusedKeys])
+            Issue.record(
+                "expected the observed unhandled-keys rejection before normalization")
+        } catch let error as UpdateError {
+            guard case .unhandledKeys(let path, let modules, let keys) = error else {
+                Issue.record("unexpected update error \(error)")
+                return
+            }
+            #expect(keys == ["language_model", "vision_tower"])
+            #expect(path.isEmpty)
+            #expect(modules.contains("Qwen35TextModel"))
+        } catch {
+            Issue.record("unexpected error \(error)")
+        }
+
+        // Post-normalization: wrapper flattened onto the decoder module
+        // paths, vision sidecar gone, every remaining key binds.
+        let normalized = normalizeBonsaiTextDecoderWeights(weights)
+        #expect(!normalized.keys.contains { $0.hasPrefix("language_model") })
+        #expect(!normalized.keys.contains { $0.hasPrefix("vision_tower") })
+        #expect(normalized["model.norm.weight"] != nil)
+        #expect(normalized["model.layers.0.input_layernorm.weight"] != nil)
+        #expect(normalized["model.layers.0.post_attention_layernorm.weight"] != nil)
+        #expect(normalized.count == 3)
+
+        // The exact tail of loadWeights: noUnusedKeys must pass with no
+        // unhandled keys.
+        let parameters = ModuleParameters.unflattened(normalized)
+        try model.update(parameters: parameters, verify: [.noUnusedKeys])
+    }
 }
