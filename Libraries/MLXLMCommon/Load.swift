@@ -1880,7 +1880,7 @@ func installBonsaiPrismHadamard(
         checkpointKeys: Set(weights.keys))
 
     var updates: [(String, Module)] = []
-    var consumedCount = 0
+    var consumedKeys: [String] = []
 
     for update in resolved.updates {
         guard let leaf = leafByPath[update.modulePath] else {
@@ -1903,23 +1903,50 @@ func installBonsaiPrismHadamard(
             signs, packedWeightWidth: weight.shape[weight.shape.count - 1],
             bits: plan.bits, block: plan.block)
 
-        // Tensor/module shape agreement: the packed input width must equal
-        // the leaf's own weight width (catches tensors from the wrong
-        // layer/size before any module is swapped).
-        let leafInputWidth: Int
-        if let embedding = leaf as? Embedding {
-            leafInputWidth =
-                embedding.weight.shape[embedding.weight.shape.count - 1]
-        } else if let linear = leaf as? Linear {
-            leafInputWidth = linear.weight.shape[linear.weight.shape.count - 1]
-        } else {
-            leafInputWidth = inputWidth
+        // Deterministic role/leaf agreement first: the plan's role fixes the
+        // leaf's module type, so a wrong-typed leaf fails here regardless of
+        // tensor shape and can never slip through a defaulted width.
+        let leafDims: (out: Int, inputWidth: Int)
+        switch update.role {
+        case .inversePackedEmbedding:
+            guard let embedding = leaf as? Embedding else {
+                throw PrismBonsaiInstall.Error(
+                    "Bonsai inverse-embedding entry \(update.checkpointBase) "
+                        + "must replace an Embedding leaf, got "
+                        + "\(type(of: leaf))")
+            }
+            // Embedding rows are stored in the rotated basis: the leaf's
+            // [vocab, dims] table must agree on the packed row count and on
+            // the unpacked width.
+            leafDims = (
+                embedding.weight.shape[0], embedding.weight.shape[1])
+        case .forwardPackedLinear:
+            guard let linear = leaf as? Linear else {
+                throw PrismBonsaiInstall.Error(
+                    "Bonsai packed-linear entry \(update.checkpointBase) must "
+                        + "replace a Linear leaf, got \(type(of: leaf))")
+            }
+            // Linear weight [out, in]: both dims must agree with the packed
+            // tensor's row count and unpacked input width.
+            leafDims = (linear.weight.shape[0], linear.weight.shape[1])
         }
-        guard leafInputWidth == inputWidth else {
+
+        // Tensor/module shape agreement on BOTH packed dimensions: the row
+        // count (outputs / vocabulary) and the unpacked input width must each
+        // equal the leaf's own weight shape (catches tensors from the wrong
+        // layer/size — input width AND output/vocab width — before any
+        // module is swapped).
+        guard leafDims.out == weight.shape[0] else {
+            throw PrismBonsaiInstall.Error(
+                "Bonsai packed output count \(weight.shape[0]) for "
+                    + "\(update.checkpointBase) does not match module leaf "
+                    + "output count \(leafDims.out)")
+        }
+        guard leafDims.inputWidth == inputWidth else {
             throw PrismBonsaiInstall.Error(
                 "Bonsai packed input width \(inputWidth) for "
                     + "\(update.checkpointBase) does not match module leaf "
-                    + "width \(leafInputWidth)")
+                    + "width \(leafDims.inputWidth)")
         }
 
         let outputDType: DType?
@@ -1961,11 +1988,11 @@ func installBonsaiPrismHadamard(
             updates.append((update.modulePath, linear))
         }
 
-        for key in update.weightKeysToConsume {
-            if weights.removeValue(forKey: key) != nil {
-                consumedCount += 1
-            }
-        }
+        // Defer key consumption: nothing is removed from the inout weights
+        // dictionary until every resolved entry has passed validation and
+        // the single update below has succeeded, so a later-entry failure
+        // (or an update failure) leaves the original dictionary intact.
+        consumedKeys += update.weightKeysToConsume
     }
 
     do {
@@ -1974,6 +2001,15 @@ func installBonsaiPrismHadamard(
         FileHandle.standardError.write(Data(
             "[loadWeights] Bonsai transform module update failed: \(error)\n".utf8))
         throw error
+    }
+
+    // Transactional consumption: only now (all entries validated and the
+    // update succeeded) remove the packed/signs keys from the dictionary.
+    var consumedCount = 0
+    for key in consumedKeys {
+        if weights.removeValue(forKey: key) != nil {
+            consumedCount += 1
+        }
     }
     MLX.eval(model)
     MLX.Memory.clearCache()

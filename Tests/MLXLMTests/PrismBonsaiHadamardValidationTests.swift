@@ -514,6 +514,105 @@ struct PrismBonsaiHadamardValidationTests {
         #expect(leaves["model.embed_tokens"] == "Embedding")
     }
 
+    @Test("install fails before any swap when the packed output count is wrong but input width is valid")
+    func installFailsBeforeSwapOnPackedOutputMismatch() throws {
+        let plan = try PrismBonsaiHadamardPlan(
+            configData: validConfigData(), hadamardData: validHadamardData())
+        let model = makeMiniModel()
+        var weights = makeInstallWeights()
+        // lm_head leaf is Linear(1024, 64) -> weight [64, 1024]. Swap in a
+        // pack whose 1024-wide input is valid but whose row count (32) does
+        // not match the leaf's 64 outputs: the input-width-only check would
+        // accept these tensors and install a wrong-shaped lm_head.
+        let wrong = packedTensors(out: 32, inputWidth: 1024, seed: 31)
+        weights["lm_head.weight"] = wrong.weight
+        weights["lm_head.scales"] = wrong.scales
+        weights["lm_head.biases"] = wrong.biases
+
+        do {
+            try installBonsaiPrismHadamard(plan, model: model, weights: &weights)
+            Issue.record("expected install to throw on packed output mismatch")
+        } catch let error as PrismBonsaiInstall.Error {
+            #expect(
+                error.reason.contains("does not match module leaf output count"))
+        }
+
+        let leaves = leafTypes(model)
+        #expect(leaves["lm_head"] == "Linear")
+        #expect(leaves["model.layers.0.self_attn.q_proj"] == "Linear")
+        #expect(leaves["model.embed_tokens"] == "Embedding")
+        // No key was consumed, including lm_head's own packed keys.
+        #expect(weights["lm_head.weight"] != nil)
+        #expect(weights["lm_head.scales"] != nil)
+        #expect(weights["lm_head.biases"] != nil)
+        #expect(weights["lm_head.signs"] != nil)
+    }
+
+    @Test("install fails before any swap when the packed embedding row count is wrong")
+    func installFailsBeforeSwapOnPackedEmbeddingRowMismatch() throws {
+        let plan = try PrismBonsaiHadamardPlan(
+            configData: validConfigData(), hadamardData: validHadamardData())
+        let model = makeMiniModel()
+        var weights = makeInstallWeights()
+        // embed_tokens leaf is Embedding(16, 1024) -> weight [16, 1024].
+        // Swap in a pack whose 1024-wide input is valid but which stores
+        // only 8 rotated rows: the vocabulary/row count must still match.
+        let wrong = packedTensors(out: 8, inputWidth: 1024, seed: 32)
+        weights["model.embed_tokens.weight"] = wrong.weight
+        weights["model.embed_tokens.scales"] = wrong.scales
+        weights["model.embed_tokens.biases"] = wrong.biases
+
+        do {
+            try installBonsaiPrismHadamard(plan, model: model, weights: &weights)
+            Issue.record("expected install to throw on embedding row mismatch")
+        } catch let error as PrismBonsaiInstall.Error {
+            #expect(
+                error.reason.contains("does not match module leaf output count"))
+        }
+
+        let leaves = leafTypes(model)
+        #expect(leaves["lm_head"] == "Linear")
+        #expect(leaves["model.embed_tokens"] == "Embedding")
+        #expect(weights["model.embed_tokens.weight"] != nil)
+        #expect(weights["model.embed_tokens.scales"] != nil)
+        #expect(weights["model.embed_tokens.biases"] != nil)
+    }
+
+    @Test("a later-entry failure keeps earlier checkpoint keys and swaps nothing")
+    func laterEntryFailurePreservesEarlierKeysAndSwapsNothing() throws {
+        let plan = try PrismBonsaiHadamardPlan(
+            configData: validConfigData(), hadamardData: validHadamardData())
+        let model = makeMiniModel()
+        var weights = makeInstallWeights()
+        // The last resolved entry (model.embed_tokens, modules[2]) is
+        // missing its sign vector; the two earlier entries (lm_head,
+        // q_proj) are fully valid and would otherwise have their keys
+        // consumed by the time the later entry fails.
+        weights["model.embed_tokens.signs"] = nil
+
+        expectInstallToThrow({
+            try installBonsaiPrismHadamard(plan, model: model, weights: &weights)
+        })
+
+        let leaves = leafTypes(model)
+        #expect(leaves["lm_head"] == "Linear")
+        #expect(leaves["model.layers.0.self_attn.q_proj"] == "Linear")
+        #expect(leaves["model.embed_tokens"] == "Embedding")
+        // Transactional consumption: every key of the earlier entries is
+        // still available on failure.
+        for key in [
+            "lm_head.weight", "lm_head.scales", "lm_head.biases", "lm_head.signs",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.scales",
+            "model.layers.0.self_attn.q_proj.biases",
+            "model.layers.0.self_attn.q_proj.signs",
+            "model.embed_tokens.weight", "model.embed_tokens.scales",
+            "model.embed_tokens.biases",
+        ] {
+            #expect(weights[key] != nil, "key \(key) must still be available")
+        }
+    }
+
     @Test("install fails before any swap on non-unit sign values")
     func installFailsBeforeSwapOnNonUnitSigns() throws {
         let plan = try PrismBonsaiHadamardPlan(
