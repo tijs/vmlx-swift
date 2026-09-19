@@ -349,6 +349,7 @@ let package = Package(
         .executable(name: "Qwen35TPProofRunner", targets: ["Qwen35TPProofRunner"]),
         .executable(name: "mlxpress", targets: ["MLXPressCLI"]),
         .executable(name: "mlxpress-selfcheck", targets: ["MLXPressSelfCheck"]),
+        .executable(name: "BonsaiPrismFWHTParity", targets: ["BonsaiPrismFWHTParity"]),
     ],
     dependencies: [
         // for Complex type
@@ -675,6 +676,11 @@ let package = Package(
             path: "CompileBench"
         ),
         .executableTarget(
+            name: "BonsaiPrismFWHTParity",
+            dependencies: ["MLX", "MLXNN"],
+            path: "tools/BonsaiPrismFWHTParity"
+        ),
+        .executableTarget(
             name: "TPRankWorker",
             dependencies: [
                 "MLXLMCommon",
@@ -830,6 +836,7 @@ let package = Package(
             resources: [
                 .process("Resources/1080p_30.mov"),
                 .process("Resources/audio_only.mov"),
+                .process("Resources/PrismBonsaiPinnedFWHTFixture.json"),
             ]
         ),
         .testTarget(
