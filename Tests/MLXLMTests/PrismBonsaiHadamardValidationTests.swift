@@ -584,11 +584,16 @@ struct PrismBonsaiHadamardValidationTests {
             configData: validConfigData(), hadamardData: validHadamardData())
         let model = makeMiniModel()
         var weights = makeInstallWeights()
-        // The last resolved entry (model.embed_tokens, modules[2]) is
-        // missing its sign vector; the two earlier entries (lm_head,
-        // q_proj) are fully valid and would otherwise have their keys
-        // consumed by the time the later entry fails.
-        weights["model.embed_tokens.signs"] = nil
+        // The last resolved entry (model.embed_tokens, modules[2]) carries a
+        // complete, resolvable tensor set whose output row count (8) does not
+        // match the leaf's 16-row vocabulary: resolution succeeds, the two
+        // earlier entries (lm_head, q_proj) fully pass their in-loop
+        // validation, and only then does the row-count check fail here —
+        // inside the install loop — on the wrong packed output count.
+        let wrongEmbed = packedTensors(out: 8, inputWidth: 1024, seed: 32)
+        weights["model.embed_tokens.weight"] = wrongEmbed.weight
+        weights["model.embed_tokens.scales"] = wrongEmbed.scales
+        weights["model.embed_tokens.biases"] = wrongEmbed.biases
 
         expectInstallToThrow({
             try installBonsaiPrismHadamard(plan, model: model, weights: &weights)
@@ -598,8 +603,8 @@ struct PrismBonsaiHadamardValidationTests {
         #expect(leaves["lm_head"] == "Linear")
         #expect(leaves["model.layers.0.self_attn.q_proj"] == "Linear")
         #expect(leaves["model.embed_tokens"] == "Embedding")
-        // Transactional consumption: every key of the earlier entries is
-        // still available on failure.
+        // Transactional consumption: every key of the earlier entries and of
+        // the failing last entry is still available on failure.
         for key in [
             "lm_head.weight", "lm_head.scales", "lm_head.biases", "lm_head.signs",
             "model.layers.0.self_attn.q_proj.weight",
@@ -607,7 +612,7 @@ struct PrismBonsaiHadamardValidationTests {
             "model.layers.0.self_attn.q_proj.biases",
             "model.layers.0.self_attn.q_proj.signs",
             "model.embed_tokens.weight", "model.embed_tokens.scales",
-            "model.embed_tokens.biases",
+            "model.embed_tokens.biases", "model.embed_tokens.signs",
         ] {
             #expect(weights[key] != nil, "key \(key) must still be available")
         }
