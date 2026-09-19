@@ -1864,7 +1864,10 @@ func readAttentionOutputDimHintsForJANGQuantization(at modelDirectory: URL) -> S
 /// companion outside the manifest — throws before any module is swapped, so
 /// a malformed pack fails the load early and no partial transform model is
 /// ever left behind.
-private func installBonsaiPrismHadamard(
+///
+/// Internal so the deterministic install-path tests can drive a real module
+/// tree + weight dictionary entirely in memory (no safetensors, no network).
+func installBonsaiPrismHadamard(
     _ plan: PrismBonsaiHadamardPlan,
     model: LanguageModel,
     weights: inout [String: MLXArray]
@@ -1893,15 +1896,31 @@ private func installBonsaiPrismHadamard(
             throw PrismBonsaiInstall.Error(
                 "Bonsai packed tensors missing for \(update.checkpointBase)")
         }
-        guard weight.shape.count >= 2 else {
-            throw PrismBonsaiInstall.Error(
-                "Bonsai packed weight \(update.weightKey) must be 2-D, got "
-                    + "\(weight.shape)")
-        }
-        let packedWidth = weight.shape[weight.shape.count - 1]
+        let inputWidth = try HadamardPackedCheck.validatePackedTensors(
+            weight: weight, scales: scales, biases: biases,
+            groupSize: plan.groupSize, bits: plan.bits, block: plan.block)
         try HadamardPackedCheck.validateSigns(
-            signs, packedWeightWidth: packedWidth, bits: plan.bits,
-            block: plan.block)
+            signs, packedWeightWidth: weight.shape[weight.shape.count - 1],
+            bits: plan.bits, block: plan.block)
+
+        // Tensor/module shape agreement: the packed input width must equal
+        // the leaf's own weight width (catches tensors from the wrong
+        // layer/size before any module is swapped).
+        let leafInputWidth: Int
+        if let embedding = leaf as? Embedding {
+            leafInputWidth =
+                embedding.weight.shape[embedding.weight.shape.count - 1]
+        } else if let linear = leaf as? Linear {
+            leafInputWidth = linear.weight.shape[linear.weight.shape.count - 1]
+        } else {
+            leafInputWidth = inputWidth
+        }
+        guard leafInputWidth == inputWidth else {
+            throw PrismBonsaiInstall.Error(
+                "Bonsai packed input width \(inputWidth) for "
+                    + "\(update.checkpointBase) does not match module leaf "
+                    + "width \(leafInputWidth)")
+        }
 
         let outputDType: DType?
         if let dtypeName = plan.entry(forCheckpointBase: update.checkpointBase)?

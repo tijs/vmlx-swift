@@ -262,6 +262,65 @@ public enum HadamardPackedCheck {
         }
         return inputWidth
     }
+
+    /// Validate a packed 2-bit affine tensor group (`.weight` + `.scales` +
+    /// `.biases`) against the quantization contract before any module is
+    /// swapped: the packed width must unpack to a positive activation width
+    /// divisible by the group size and the Hadamard block, and the affine
+    /// scales/biases shapes must match the packed layout exactly.
+    ///
+    /// - Parameters:
+    ///   - weight: the packed `.weight` tensor (2-D `[out, in / (32/bits)]`)
+    ///   - scales: the affine `.scales` tensor
+    ///   - biases: the affine per-group `.biases` tensor (nil when absent)
+    ///   - groupSize: quantization group size (`128` for this pack)
+    ///   - bits: quantization bits (`2` for this pack)
+    ///   - block: Hadamard block size
+    /// - Returns: the activation input width (`packedWidth * 32 / bits`)
+    @discardableResult
+    public static func validatePackedTensors(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray?,
+        groupSize: Int, bits: Int, block: Int
+    ) throws -> Int {
+        guard weight.shape.count == 2 else {
+            throw PrismBonsaiInstall.Error(
+                "packed weight must be 2-D, got \(weight.shape)")
+        }
+        let out = weight.shape[0]
+        let packedWidth = weight.shape[1]
+        guard packedWidth > 0 else {
+            throw PrismBonsaiInstall.Error(
+                "packed weight width must be positive, got \(packedWidth)")
+        }
+        let inputWidth = packedWidth * 32 / bits
+        guard inputWidth % groupSize == 0 else {
+            throw PrismBonsaiInstall.Error(
+                "packed input width \(inputWidth) must be divisible by group "
+                    + "size \(groupSize)")
+        }
+        let expectedScalesShape = [out, inputWidth / groupSize]
+        guard scales.shape.count == 2,
+            scales.shape[0] == expectedScalesShape[0],
+            scales.shape[1] == expectedScalesShape[1]
+        else {
+            throw PrismBonsaiInstall.Error(
+                "packed scales shape \(scales.shape) does not match weight "
+                    + "\(weight.shape) at group \(groupSize) "
+                    + "(expected \(expectedScalesShape))")
+        }
+        if let biases {
+            guard biases.shape == scales.shape else {
+                throw PrismBonsaiInstall.Error(
+                    "packed biases shape \(biases.shape) must equal scales "
+                        + "shape \(scales.shape)")
+            }
+        }
+        guard inputWidth % block == 0 else {
+            throw PrismBonsaiInstall.Error(
+                "Hadamard block \(block) does not divide activation width \(inputWidth)")
+        }
+        return inputWidth
+    }
 }
 
 // MARK: - Manifest-derived plan
@@ -294,6 +353,19 @@ public struct PrismBonsaiHadamardPlan: Equatable, Sendable {
         /// `modules[]` dtype declaration (e.g. `float16`); drives the packed
         /// embedding output dtype.
         public let dtypeName: String?
+
+        /// Public memberwise initializer so a validated plan can also be
+        /// constructed/consumed across modules (the install seam and the
+        /// parity gate) and so `resolve`'s assumptions can be exercised
+        /// deterministically in tests.
+        public init(
+            checkpointBase: String, role: Role, block: Int, dtypeName: String?
+        ) {
+            self.checkpointBase = checkpointBase
+            self.role = role
+            self.block = block
+            self.dtypeName = dtypeName
+        }
     }
 
     // MARK: Contract constants (mirrors the MLXLLM gate — see
@@ -353,6 +425,25 @@ public struct PrismBonsaiHadamardPlan: Equatable, Sendable {
 
     public func entry(forCheckpointBase base: String) -> Entry? {
         entries.first { $0.checkpointBase == base }
+    }
+
+    /// Normalize a module path or checkpoint weight base for manifest
+    /// comparison: strips the pack's optional `language_model.` / `model.`
+    /// namespace prefixes and a trailing `.weight` suffix so the
+    /// `prism.hadamard.weight_names` and `inverse_weight_names` key lists
+    /// can be compared on a common base.
+    public static func normalizedModuleBase(_ path: String) -> String {
+        var base = path
+        for prefix in ["language_model.model.", "language_model.", "model."] {
+            if base.hasPrefix(prefix) {
+                base = String(base.dropFirst(prefix.count))
+                break
+            }
+        }
+        if base.hasSuffix(".weight") {
+            base = String(base.dropLast(".weight".count))
+        }
+        return base
     }
 
     // MARK: Strict builder
@@ -472,6 +563,13 @@ public struct PrismBonsaiHadamardPlan: Equatable, Sendable {
         else {
             throw BuildError("modules[] must contain an embedding module")
         }
+        guard Set(modulePaths).count == modulePaths.count else {
+            throw BuildError("modules[] paths must be unique")
+        }
+        guard modules.filter({ ($0["embedding"] as? Bool) == true }).count == 1
+        else {
+            throw BuildError("modules[] must contain exactly one embedding module")
+        }
 
         guard let hadamard =
             (try? JSONSerialization.jsonObject(with: hadamardData))
@@ -522,12 +620,30 @@ public struct PrismBonsaiHadamardPlan: Equatable, Sendable {
             throw BuildError(
                 "\(Self.hadamardInverseWeightNamesKey) must be non-empty")
         }
+        // The forward and inverse weight-name lists must be disjoint (a folded
+        // tensor is either forward or inverse, never both). They are NOT
+        // cross-checked against modules[] paths: the pinned pack's modules[]
+        // paths and hadamard.json weight_names use different names/namespaces
+        // for the same modules (e.g. modules[] `self_attn.q_proj` vs
+        // weight_names `layers.0.linear_attn.in_proj_qkv.weight`), so an
+        // exact partition check would reject the valid pack.
+        let foldedBases = Set(folded.map(Self.normalizedModuleBase))
+        let inverseBases = Set(inverse.map(Self.normalizedModuleBase))
+        guard foldedBases.isDisjoint(with: inverseBases) else {
+            throw BuildError(
+                Self.hadamardWeightNamesKey + " and "
+                    + Self.hadamardInverseWeightNamesKey + " must not overlap")
+        }
         let widths = (hadamard[Self.hadamardSignWidthsKey] as? [Any])?
             .compactMap { ($0 as? NSNumber)?.intValue } ?? []
         let values = (hadamard[Self.hadamardSignValuesKey] as? [Any])?
             .compactMap { ($0 as? NSNumber)?.doubleValue } ?? []
         guard !widths.isEmpty else {
             throw BuildError("\(Self.hadamardSignWidthsKey) must be non-empty")
+        }
+        guard widths.allSatisfy({ $0 >= 1 }) else {
+            throw BuildError(
+                Self.hadamardSignWidthsKey + " must contain only positive widths")
         }
         guard !values.isEmpty else {
             throw BuildError("\(Self.hadamardSignValuesKey) must be non-empty")
@@ -732,6 +848,12 @@ public enum PrismBonsaiInstall {
                     signsKey: signsKey,
                     optionalBiasKey: biasKey,
                     weightKeysToConsume: consume))
+        }
+
+        // Two manifest entries must never collapse onto the same model leaf
+        // (namespace aliases would make the module swap ambiguous).
+        guard Set(updates.map(\.modulePath)).count == updates.count else {
+            throw Error("modules[] entries must map to distinct module paths")
         }
 
         // No affine companion or sign tensor may exist outside the plan: a

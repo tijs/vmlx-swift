@@ -2,6 +2,7 @@
 
 import Foundation
 import MLXLMCommon
+import MLXNN
 
 /// Bonsai 2 Prism-Hadamard portability gate (vmlx LLM load path only).
 ///
@@ -292,6 +293,13 @@ enum PrismBonsaiPortability {
         guard modules.contains(where: { $0.embedding == true }) else {
             return invalid("modules[] must contain an embedding module")
         }
+        let modulePaths = modules.compactMap { $0.path }
+        guard Set(modulePaths).count == modulePaths.count else {
+            return invalid("modules[] paths must be unique")
+        }
+        guard modules.filter({ $0.embedding == true }).count == 1 else {
+            return invalid("modules[] must contain exactly one embedding module")
+        }
 
         // hadamard.json — the sign manifest.
         guard let hadamardData,
@@ -335,12 +343,31 @@ enum PrismBonsaiPortability {
         else {
             return invalid("\(hadamardInverseWeightNamesKey) must be non-empty")
         }
+        // Mirror of the plan builder: the forward and inverse weight-name lists
+        // must be disjoint (a folded tensor is either forward or inverse,
+        // never both). The two lists use the pack's own checkpoint key
+        // naming, which is deliberately NOT cross-checked against modules[]
+        // paths — the pinned pack's modules[] paths and hadamard.json
+        // weight_names use different namespaces/names for the same modules.
+        let foldedBases = Set(
+            weightNames.map(PrismBonsaiHadamardPlan.normalizedModuleBase))
+        let inverseBases = Set(
+            inverseWeightNames.map(PrismBonsaiHadamardPlan.normalizedModuleBase))
+        guard foldedBases.isDisjoint(with: inverseBases) else {
+            return invalid(
+                hadamardWeightNamesKey + " and " + hadamardInverseWeightNamesKey
+                    + " must not overlap")
+        }
         let signWidths = (hadamard[hadamardSignWidthsKey] as? [Any])?
             .compactMap { ($0 as? NSNumber)?.intValue } ?? []
         let signValues = (hadamard[hadamardSignValuesKey] as? [Any])?
             .compactMap { ($0 as? NSNumber)?.doubleValue } ?? []
         guard !signWidths.isEmpty else {
             return invalid("\(hadamardSignWidthsKey) must be non-empty")
+        }
+        guard signWidths.allSatisfy({ $0 >= 1 }) else {
+            return invalid(
+                hadamardSignWidthsKey + " must contain only positive widths")
         }
         guard !signValues.isEmpty else {
             return invalid("\(hadamardSignValuesKey) must be non-empty")
