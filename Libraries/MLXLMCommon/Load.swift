@@ -259,7 +259,8 @@ public func loadWeights(
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     jangConfig: JangConfig? = nil,
-    loadPreservedMTP: Bool = false
+    loadPreservedMTP: Bool = false,
+    bonsaiTransform: PrismBonsaiHadamardPlan? = nil
 ) throws {
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
@@ -702,6 +703,21 @@ public func loadWeights(
     }
     weights = model.sanitize(weights: weights, metadata: metadata)
 
+    // Bonsai 2 Prism-Hadamard transform install (default-off portability
+    // seam, `VMLX_BONSAI_PRISM_HADAMARD=1`). When a validated plan is passed
+    // the pack's packed 2-bit affine tensors are consumed here: forward-FWHT
+    // packed linear / inverse-FWHT packed embedding modules are installed at
+    // the plan's module paths and the per-module `.signs` (+weight/scales/
+    // biases) keys are removed from the update dictionary so the final
+    // `update(verify: [.noUnusedKeys])` remains meaningful. This runs right
+    // after sanitize (post-rename key forms) and BEFORE the generic affine
+    // QuantizedLinear swap below, which is bypassed entirely for the packed
+    // path. Ordinary loads pass `nil` and never enter this branch.
+    if let bonsaiTransform {
+        try installBonsaiPrismHadamard(
+            bonsaiTransform, model: model, weights: &weights)
+    }
+
     // JANGTQ native: load the signs/codebook sidecar into the runtime cache
     // before model.update() so TurboQuantSwitchGLU has everything it needs
     // on first forward.
@@ -1013,7 +1029,15 @@ public func loadWeights(
     let qwen4ExpNativeBF16Affine = false
 
     // quantize if needed
-    if quantization != nil || effectivePerLayerQuantization != nil {
+    // Bonsai Prism-Hadamard loads bypass this block entirely: every packed
+    // affine path was installed above with its transform module and its
+    // weight/scales/biases/signs were consumed, so running the ordinary
+    // QuantizedLinear swap over the (now transformed) tree would either
+    // re-wrap packed modules without their transforms or fail on consumed
+    // keys.
+    if bonsaiTransform == nil,
+        quantization != nil || effectivePerLayerQuantization != nil
+    {
         func quantizedWeightBaseCandidates(_ path: String) -> [String] {
             var seen = Set<String>()
             var out: [String] = []
@@ -1824,4 +1848,129 @@ func readAttentionOutputDimHintsForJANGQuantization(at modelDirectory: URL) -> S
         fallbackDimKey: "global_head_dim")
 
     return dims
+}
+
+// MARK: - Bonsai 2 Prism-Hadamard transform install
+
+/// Install the Bonsai Prism-Hadamard packed modules selected by a validated
+/// plan and consume the per-module `.signs`/packed tensors so the final
+/// `update(parameters:verify: [.noUnusedKeys])` passes with the transform
+/// path in place and no leftover keys.
+///
+/// The plan (`PrismBonsaiHadamardPlan`) is produced only from a strictly
+/// validated config.json + hadamard.json pair (factory gate first; the plan
+/// builder re-validates). Every inconsistency — unresolvable module path,
+/// missing packed tensor, missing/mis-shaped/non-±1 `.signs` vector, affine
+/// companion outside the manifest — throws before any module is swapped, so
+/// a malformed pack fails the load early and no partial transform model is
+/// ever left behind.
+private func installBonsaiPrismHadamard(
+    _ plan: PrismBonsaiHadamardPlan,
+    model: LanguageModel,
+    weights: inout [String: MLXArray]
+) throws {
+    let leaves = model.leafModules().flattened()
+    let leafByPath = Dictionary(uniqueKeysWithValues: leaves.map { ($0.0, $0.1) })
+    let resolved = try PrismBonsaiInstall.resolve(
+        plan: plan,
+        leafModulePaths: Set(leafByPath.keys),
+        checkpointKeys: Set(weights.keys))
+
+    var updates: [(String, Module)] = []
+    var consumedCount = 0
+
+    for update in resolved.updates {
+        guard let leaf = leafByPath[update.modulePath] else {
+            throw PrismBonsaiInstall.Error(
+                "Bonsai module \(update.checkpointBase) resolved to missing "
+                    + "leaf \(update.modulePath)")
+        }
+        guard let weight = weights[update.weightKey],
+            let scales = weights[update.scalesKey],
+            let biases = weights[update.biasesKey],
+            let signs = weights[update.signsKey]
+        else {
+            throw PrismBonsaiInstall.Error(
+                "Bonsai packed tensors missing for \(update.checkpointBase)")
+        }
+        guard weight.shape.count >= 2 else {
+            throw PrismBonsaiInstall.Error(
+                "Bonsai packed weight \(update.weightKey) must be 2-D, got "
+                    + "\(weight.shape)")
+        }
+        let packedWidth = weight.shape[weight.shape.count - 1]
+        try HadamardPackedCheck.validateSigns(
+            signs, packedWeightWidth: packedWidth, bits: plan.bits,
+            block: plan.block)
+
+        let outputDType: DType?
+        if let dtypeName = plan.entry(forCheckpointBase: update.checkpointBase)?
+            .dtypeName
+        {
+            outputDType = bonsaiDType(fromName: dtypeName)
+        } else {
+            outputDType = nil
+        }
+
+        switch update.role {
+        case .inversePackedEmbedding:
+            guard leaf is Embedding else {
+                throw PrismBonsaiInstall.Error(
+                    "Bonsai inverse-embedding entry \(update.checkpointBase) "
+                        + "must replace an Embedding leaf, got "
+                        + "\(type(of: leaf))")
+            }
+            let embedding = HadamardPackedEmbedding(
+                weight: weight, scales: scales, biases: biases,
+                groupSize: plan.groupSize, bits: plan.bits,
+                block: plan.block, signs: signs)
+            embedding.outputDType = outputDType
+            updates.append((update.modulePath, embedding))
+        case .forwardPackedLinear:
+            guard leaf is Linear else {
+                throw PrismBonsaiInstall.Error(
+                    "Bonsai packed-linear entry \(update.checkpointBase) must "
+                        + "replace a Linear leaf, got \(type(of: leaf))")
+            }
+            let linear = HadamardPackedLinear(
+                weight: weight,
+                bias: update.optionalBiasKey.flatMap { weights[$0] }
+                    ?? (leaf as? Linear)?.bias,
+                scales: scales, biases: biases,
+                groupSize: plan.groupSize, bits: plan.bits,
+                block: plan.block, signs: signs)
+            updates.append((update.modulePath, linear))
+        }
+
+        for key in update.weightKeysToConsume {
+            if weights.removeValue(forKey: key) != nil {
+                consumedCount += 1
+            }
+        }
+    }
+
+    do {
+        try model.update(modules: ModuleChildren.unflattened(updates), verify: .none)
+    } catch {
+        FileHandle.standardError.write(Data(
+            "[loadWeights] Bonsai transform module update failed: \(error)\n".utf8))
+        throw error
+    }
+    MLX.eval(model)
+    MLX.Memory.clearCache()
+    FileHandle.standardError.write(Data(
+        ("[loadWeights] Bonsai Prism-Hadamard: installed \(updates.count) "
+            + "packed module(s) (block \(plan.block), \(plan.bits)-bit/"
+            + "group-\(plan.groupSize)), consumed \(consumedCount) "
+            + "checkpoint key(s)\n").utf8))
+}
+
+/// Resolve a `modules[]` dtype declaration to the module's output dtype.
+private func bonsaiDType(fromName name: String) -> DType? {
+    switch name.lowercased() {
+    case "float16", "fp16", "half": .float16
+    case "bfloat16", "bf16": .bfloat16
+    case "float32", "fp32": .float32
+    default: nil
+    }
 }

@@ -1827,9 +1827,12 @@ public final class LLMModelFactory: ModelFactory {
                     code: 1,
                     userInfo: [
                         NSLocalizedDescriptionKey:
-                            "gate enabled and the Bonsai manifest validates, but the "
-                            + "Prism-Hadamard activation-transform slice is not implemented "
-                            + "yet — refusing to load \(PrismBonsaiPortability.prismHadamardQwen35)"
+                            "gate enabled and the Bonsai manifest validates; the "
+                            + "Prism-Hadamard transform modules and the "
+                            + "Load.swift bonsaiTransform: seam exist, but the "
+                            + "transformed load entry point is not wired until "
+                            + "the model-level identity/parity gates run — "
+                            + "refusing to load \(PrismBonsaiPortability.prismHadamardQwen35)"
                     ]))
         case .gateOnManifestInvalid(let validationError):
             throw ModelFactoryError.configurationFileError(

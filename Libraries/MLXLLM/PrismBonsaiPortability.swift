@@ -37,17 +37,22 @@ import MLXLMCommon
 /// manifest load — it only changes WHERE the load fails (early, with a clear
 /// reason).
 ///
-/// NEXT SEAM (planned transform work, NOT implemented in this slice):
-/// 1. `MLXLLM`: `HadamardActivation` + forward-FWHT packed Linear and
-///    inverse-FWHT packed Embedding modules over `MLX.hadamardTransform`
-///    (`Source/MLX/Ops.swift`), mirroring `runtime/runtime.py:16-70`.
-/// 2. `MLXLMCommon/Load.swift`: in `loadWeights`, when this gate is ON and
-///    the manifest validates, install those modules via the existing
-///    affine-quantize module-swap machinery, consume the per-module `.signs`
-///    tensors, and bypass the standard affine `QuantizedLinear` swap for
-///    packed paths so the final `update(verify: [.noUnusedKeys])` passes.
+/// NEXT SEAM (implemented in the transform-slice commit; parity still pending):
+/// 1. `MLXNN`: `HadamardActivation` + forward-FWHT packed Linear
+///    (`HadamardPackedLinear`) and inverse-FWHT packed Embedding
+///    (`HadamardPackedEmbedding`) over `MLX.hadamardTransform`
+///    (`Source/MLX/Ops.swift`), mirroring the pack runtime
+///    `runtime/runtime.py:16-70` semantics clean-room
+///    (`Source/MLXNN/PrismBonsaiHadamard.swift`).
+/// 2. `MLXLMCommon/Load.swift`: `loadWeights(..., bonsaiTransform:)` installs
+///    those modules via the affine-quantize module-swap machinery when a
+///    validated plan is passed, consumes the per-module `.signs` tensors, and
+///    bypasses the standard affine `QuantizedLinear` swap for packed paths so
+///    the final `update(verify: [.noUnusedKeys])` passes.
 /// 3. Replace the `.gateOnManifestValid` refusal below with the transformed
-///    load entry point once (1)+(2) exist and are parity-tested.
+///    load entry point once (1)+(2) exist AND the required model-level
+///    identity/parity gates have run (parity vs the pinned Python runtime is
+///    the first of those and has NOT run yet — refusal remains correct).
 enum PrismBonsaiPortability {
 
     /// Root model_type of the Bonsai 2 pack (config.json `model_type`).
@@ -110,8 +115,11 @@ enum PrismBonsaiPortability {
         /// `unsupportedModelType`, never the text_config fallback.
         case gateOffReject
         /// Gate ON and the pack manifest + hadamard signs validate. The
-        /// transformed load path is the next seam; until it lands, the load is
-        /// refused with an explicit configuration error.
+        /// transformed load path (MLXNN packed modules + the
+        /// `MLXLMCommon/Load.swift` `bonsaiTransform:` seam) exists but is
+        /// NOT wired to the factory until the model-level identity/parity
+        /// gates run; until then the load is refused with an explicit
+        /// configuration error.
         case gateOnManifestValid
         /// Gate ON and validation failed; the attached error is the reason.
         case gateOnManifestInvalid(ManifestValidationError)
