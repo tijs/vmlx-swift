@@ -378,6 +378,16 @@ struct PrismBonsaiHadamardValidationTests {
         // block 1024 does not divide the 128-wide activation
         expectReject(MLXArray.zeros([64, 8]), .zeros([64, 1]), nil,
             block: 1024, containing: "does not divide activation width")
+        // Affine metadata must be floating point: an integer scales tensor
+        // (e.g. a mis-resolved packed weight) fails closed instead of
+        // dequantizing through garbage.
+        expectReject(
+            MLXArray.zeros([64, 8]), MLXArray.zeros([64, 1], dtype: .int32), nil,
+            containing: "scales dtype")
+        expectReject(
+            MLXArray.zeros([64, 8]), .zeros([64, 1]),
+            MLXArray.zeros([64, 1], dtype: .int32),
+            containing: "biases dtype")
     }
 
     // MARK: 4. Resolve boundaries

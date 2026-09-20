@@ -308,11 +308,23 @@ public enum HadamardPackedCheck {
                     + "\(weight.shape) at group \(groupSize) "
                     + "(expected \(expectedScalesShape))")
         }
+        // Affine metadata must be floating point: quantizedMM dequantizes
+        // through scales/biases, so an integer affine tensor (e.g. a mis-
+        // resolved packed weight or a wrong key match) would silently
+        // produce garbage instead of failing. Fail closed here.
+        guard scales.dtype.isFloatingPoint else {
+            throw PrismBonsaiInstall.Error(
+                "packed scales dtype \(scales.dtype) must be floating point")
+        }
         if let biases {
             guard biases.shape == scales.shape else {
                 throw PrismBonsaiInstall.Error(
                     "packed biases shape \(biases.shape) must equal scales "
                         + "shape \(scales.shape)")
+            }
+            guard biases.dtype.isFloatingPoint else {
+                throw PrismBonsaiInstall.Error(
+                    "packed biases dtype \(biases.dtype) must be floating point")
             }
         }
         guard inputWidth % block == 0 else {
