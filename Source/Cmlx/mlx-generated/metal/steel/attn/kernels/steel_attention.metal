@@ -25,4 +25,13 @@ instantiate_attn_mask_helper(float16, half);
 instantiate_attn_mask_helper(bfloat16, bfloat16_t);
 
 instantiate_attn_mask_helper(float32, float);
+
+// float32 bd=256 experiment remedy tile (bq=16/bk=8/wm=2/wn=1), dispatched
+// only by the regular full arm under VMLX_BONSAI2_SDPA_FULL_HD256=1
+// (see mlx/backend/metal/scaled_dot_product_attention.h). The historical
+// bq32/bk16/bd256/wm4/wn1 tile needs 53,760 B threadgroup memory versus the
+// applegpu_g13s 32,768 B maximum; this derived candidate is 28,928 B. Only
+// float32 needs instantiations: the remedy never fires for other dtypes.
+instantiate_attn(float32, float, 16, 8, 256, 2, 1, float32, float)
+instantiate_attn(float32, float, 16, 8, 256, 2, 1, bool_, bool)
 // clang-format on
