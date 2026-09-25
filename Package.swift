@@ -58,6 +58,7 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/metal/utils.cpp",
         "mlx/mlx/backend/metal/kernels",  // Exclude kernels directory
         "mlx/mlx/backend/metal/jit",  // Exclude jit directory
+        "mlx/mlx/backend/metal/tests",  // Exclude standalone SDPA-admission doctest
 
         "mlx/mlx/backend/gpu",  // Exclude GPU backend on Linux, use no_gpu instead
         "mlx/mlx/backend/no_cpu",  // Exclude no_cpu backend on Linux, use cpu instead
@@ -88,6 +89,7 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/no_gpu",
         "mlx/mlx/backend/no_cpu",
         "mlx/mlx/backend/metal/no_metal.cpp",
+        "mlx/mlx/backend/metal/tests",  // Exclude standalone SDPA-admission doctest
 
         // bnns instead of simd (accelerate)
         "mlx/mlx/backend/cpu/gemms/simd_fp16.cpp",
@@ -345,6 +347,7 @@ let package = Package(
         .executable(name: "Qwen35TPProofRunner", targets: ["Qwen35TPProofRunner"]),
         .executable(name: "mlxpress", targets: ["MLXPressCLI"]),
         .executable(name: "mlxpress-selfcheck", targets: ["MLXPressSelfCheck"]),
+        .executable(name: "BonsaiPrismFWHTParity", targets: ["BonsaiPrismFWHTParity"]),
     ],
     dependencies: [
         // for Complex type
@@ -671,6 +674,11 @@ let package = Package(
             path: "CompileBench"
         ),
         .executableTarget(
+            name: "BonsaiPrismFWHTParity",
+            dependencies: ["MLX", "MLXNN"],
+            path: "tools/BonsaiPrismFWHTParity"
+        ),
+        .executableTarget(
             name: "TPRankWorker",
             dependencies: [
                 "MLXLMCommon",
@@ -828,6 +836,7 @@ let package = Package(
                 .process("Resources/audio_only.mov"),
                 .copy("Resources/modernbert-tiny.safetensors"),
                 .copy("Resources/modernbert-tiny.json"),
+                .process("Resources/PrismBonsaiPinnedFWHTFixture.json"),
             ]
         ),
         .testTarget(

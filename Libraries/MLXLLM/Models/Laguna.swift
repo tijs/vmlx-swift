@@ -543,6 +543,54 @@ internal final class LagunaMoE: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: Module
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaDenseMLP
 
+    /// Narrow decode fast-path switch for the affine SwitchGLU MoE.
+    ///
+    /// `SwitchGLU(compileSeparatedDecode: true)` engages the validated
+    /// `Qwen4ExpCompiledRoutedSwitchGLU` trusted region — the same fused
+    /// single-token gate/up/silu/down decode trace Qwen3.5 18B already
+    /// default-enables for its routed MoE (same 2048→512→2048 top-8
+    /// geometry). The region is guarded at call time (bf16 activations and
+    /// affine metadata, uniform quantization across gate/up/down, one decode
+    /// row, small route count, no outer compiled trace) and falls back to the
+    /// generic three-`gatherQuantizedMM` path whenever any guard fails, so
+    /// nothing outside the affine SwitchGLU decode path is affected. The
+    /// default is still reserved for the verified S-2.1 XS affine archetype
+    /// so other Laguna variants keep their historical eager path; the
+    /// TurboQuant (mxtq) path is excluded because `TurboQuantSwitchGLU` has
+    /// no compiled separated decode.
+    ///
+    /// Override with `VMLX_LAGUNA_COMPILE_DECODE_REGIONS` (boolean, legacy
+    /// `VMLINUX_` spelling honoured via `RuntimeEnvironment`).
+    static func shouldCompileSeparatedDecode(
+        _ cfg: LagunaConfiguration,
+        jangtq: LagunaMoEContext?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        RuntimeEnvironment.flag(
+            "VMLX_LAGUNA_COMPILE_DECODE_REGIONS",
+            default: isAffineS21XSArchetype(cfg, jangtq: jangtq),
+            in: environment)
+    }
+
+    /// Affine (non-codebook) S-2.1 XS signature: 40 layers, hidden 2048,
+    /// moe intermediate 512, 256 experts, top-8. These are the exact routed
+    /// MoE dimensions whose compiled decode region is already validated in
+    /// this checkout (Qwen3.5 18B); the predicate narrows default
+    /// enablement to that archetype while the env flag above remains the
+    /// escape hatch for any other Laguna bundle.
+    private static func isAffineS21XSArchetype(
+        _ cfg: LagunaConfiguration, jangtq: LagunaMoEContext?
+    ) -> Bool {
+        guard jangtq == nil,
+            cfg.numHiddenLayers == 40,
+            cfg.hiddenSize == 2048,
+            cfg.moeIntermediateSize == 512,
+            cfg.numExperts == 256,
+            cfg.numExpertsPerTok == 8
+        else { return false }
+        return true
+    }
+
     init(_ cfg: LagunaConfiguration, layerIndex: Int, jangtq: LagunaMoEContext?) {
         self.cfg = cfg
         self.layerIndex = layerIndex
@@ -562,7 +610,9 @@ internal final class LagunaMoE: Module, UnaryLayer {
             self._switchMLP.wrappedValue = SwitchGLU(
                 inputDims: cfg.hiddenSize,
                 hiddenDims: cfg.moeIntermediateSize,
-                numExperts: cfg.numExperts)
+                numExperts: cfg.numExperts,
+                compileSeparatedDecode: Self.shouldCompileSeparatedDecode(
+                    cfg, jangtq: nil))
         }
         // Shared expert is affine-quant Linear (NOT codebook) on both paths.
         self._sharedExpert.wrappedValue = LagunaDenseMLP(
@@ -764,6 +814,15 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        // Some conversions (VLM-style / JANG) wrap the whole text-only body
+        // under a `language_model.` prefix — `language_model.model.*` and
+        // `language_model.lm_head.*` — while this model binds its modules at
+        // the top level. Absorb the wrapper before the `model.` strip below
+        // so the keys land on the expected module paths instead of failing
+        // with "Unhandled keys [language_model]". Unprefixed keys pass
+        // through untouched.
+        let weights = Weights.stripLanguageModelPrefix(weights)
+
         // Map HF Laguna weight key prefixes to the Swift module pathing:
         //   - `model.layers.N.{...}` → `layers.N.{...}` (drop "model." prefix)
         //   - `model.embed_tokens.weight` → `embed_tokens.weight`
@@ -800,6 +859,25 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
             k = k.replacingOccurrences(
                 of: ".mlp.experts.",
                 with: ".mlp.switch_mlp."
+            )
+            // Router gate layout on current affine bundles: the router is a
+            // quantized projection nested under `gate.proj.*`
+            // ({weight,scales,biases}), while `LagunaMoE` declares `gate` as a
+            // plain Linear and `e_score_correction_bias` as a SIBLING parameter.
+            // Flatten `gate.proj.*` → `gate.*` first so Load.swift's
+            // `dequantizeMoEGates` (which matches plain
+            // `.gate.{weight,scales,biases}` keys after sanitize) picks the
+            // tensors up, then hoist `gate.e_score_correction_bias` to the
+            // `mlp.e_score_correction_bias` slot the module declares. Flatten
+            // runs before the bias remap so a hypothetical
+            // `gate.proj.e_score_correction_bias` also lands correctly.
+            k = k.replacingOccurrences(
+                of: ".mlp.gate.proj.",
+                with: ".mlp.gate."
+            )
+            k = k.replacingOccurrences(
+                of: ".mlp.gate.e_score_correction_bias",
+                with: ".mlp.e_score_correction_bias"
             )
             // Drop unused / config-only keys.
             if k.contains("self_attn.rotary_emb.inv_freq") { continue }
