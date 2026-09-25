@@ -71,3 +71,12 @@ extern "C" int vmlx_graph_stats(
         return 1;
     }
 }
+
+extern "C" int vmlx_graph_array_is_tracer(VMLXGraphArray array) {
+    if (!array) { return 1; }
+    try {
+        return mlx_array_get_(vmlx_graph_arr(array)).is_tracer() ? 1 : 0;
+    } catch (const std::exception&) {
+        return 1;
+    }
+}

@@ -47,6 +47,7 @@ public enum LLMTypeRegistry {
             "diffusion_gemma": create(DiffusionGemmaConfiguration.self, DiffusionGemmaModel.init),
             "qwen2": create(Qwen2Configuration.self, Qwen2Model.init),
             "qwen3": create(Qwen3Configuration.self, Qwen3Model.init),
+            "spark2_5": create(Spark25Configuration.self, Spark25Model.init),
             "qwen3_moe": create(Qwen3MoEConfiguration.self, Qwen3MoEModel.init),
             "qwen3_next": create(Qwen3NextConfiguration.self, Qwen3NextModel.init),
             "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
@@ -107,7 +108,13 @@ public enum LLMTypeRegistry {
             "granitemoehybrid": create(
                 GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
             "mimo": create(MiMoConfiguration.self, MiMoModel.init),
-            "mimo_v2": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
+            "mimo_v2": { data, _ in
+                let config = try JSONDecoder.json5().decode(MiMoV2FlashConfiguration.self, from: data)
+                if MiMoV26Contract.matches(data) {
+                    return try MiMoV26TextModel(config)
+                }
+                return MiMoV2FlashModel(config)
+            },
             "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
             "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
             "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
@@ -1251,14 +1258,15 @@ internal func llmDefaultAdditionalContext(
     modelType: String?,
     capabilities: JangCapabilities?,
     generationConfig: GenerationConfigFile?,
-    chatConfig: JangChatConfig?
+    chatConfig: JangChatConfig?,
+    chatTemplate: String? = nil
 ) -> [String: any Sendable]? {
     var context: [String: any Sendable] = [:]
 
-    // Trust the bundle's capability stamp. A bundle that explicitly declares
-    // no thinking wins over stale template metadata. Otherwise use the
-    // model-authored default from generation_config.json, falling back to the
-    // mirrored JANG chat stamp. Request/UI context is merged later and wins.
+    // Preserve a native explicit-only generation tail: a capability flag is
+    // not an enable_thinking default. Otherwise retain legacy non-thinking
+    // capability behavior. Explicit defaults come from generation_config or
+    // the mirrored JANG chat stamp; request/UI context is merged later and wins.
     let declaredEnableThinking: Bool?
     if let explicitTemplateDefault =
         generationConfig?.defaultChatTemplateKwargs?.enableThinking
@@ -1277,8 +1285,11 @@ internal func llmDefaultAdditionalContext(
     }
 
     if capabilities?.supportsThinking == false {
-        context["enable_thinking"] = false
-    } else if let enableThinking = declaredEnableThinking {
+        if !ThinkingTemplateContract.preservesOmittedThinking(chatTemplate) {
+            return ["enable_thinking": false]
+        }
+    }
+    if let enableThinking = declaredEnableThinking {
         context["enable_thinking"] = enableThinking
         if enableThinking,
            let effort = chatConfig?.reasoning?.defaultEffort?
@@ -1315,7 +1326,7 @@ internal func llmMergedAdditionalContext(
     )
 }
 
-private struct LLMUserInputProcessor: UserInputProcessor {
+struct LLMUserInputProcessor: UserInputProcessor {
 
     let tokenizer: Tokenizer
     let configuration: ModelConfiguration
@@ -1362,14 +1373,11 @@ private struct LLMUserInputProcessor: UserInputProcessor {
             additionalContext: additionalContext,
             templateReadsEnableThinking: templateReadsEnableThinking
         )
-        var messages = NemotronToolChoiceTemplateContext.apply(
+        let messages = NemotronToolChoiceTemplateContext.apply(
             to: bailingMessages,
             modelType: modelType,
             additionalContext: additionalContext
         )
-        if shouldCompactGemma4RequiredToolHistory(additionalContext) {
-            messages = compactGemma4RequiredToolHistory(messages)
-        }
         do {
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: input.tools, additionalContext: additionalContext)
@@ -1415,64 +1423,19 @@ private struct LLMUserInputProcessor: UserInputProcessor {
         )
     }
 
-    private func shouldCompactGemma4RequiredToolHistory(
-        _ additionalContext: [String: any Sendable]?
-    ) -> Bool {
-        guard let modelType else { return false }
-        let normalized = modelType
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_")
-        let compact = normalized.replacingOccurrences(of: "_", with: "")
-        guard compact.hasPrefix("gemma4") else {
-            return false
-        }
-        if (additionalContext?["tool_choice"] as? String) == "required" {
-            return true
-        }
-        if let name = additionalContext?["tool_choice_name"] as? String,
-           !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            return true
-        }
-        return false
-    }
-
-    private func compactGemma4RequiredToolHistory(
-        _ messages: [[String: any Sendable]]
-    ) -> [[String: any Sendable]] {
-        guard let latestUserIndex = messages.lastIndex(where: {
-            let role = $0["role"] as? String
-            return role == "user" || role == "developer"
-        }) else {
-            return messages
-        }
-
-        var compacted: [[String: any Sendable]] = []
-        compacted.reserveCapacity(messages.count)
-        for message in messages[..<latestUserIndex] {
-            guard let role = message["role"] as? String else { continue }
-            if role == "system" || role == "developer" {
-                compacted.append(message)
-            }
-        }
-        compacted.append(messages[latestUserIndex])
-        if latestUserIndex + 1 < messages.endIndex {
-            compacted.append(contentsOf: messages[(latestUserIndex + 1)...])
-        }
-        return compacted
-    }
-
     static func defaultContext(
         modelType: String?,
         capabilities: JangCapabilities?,
         generationConfig: GenerationConfigFile?,
-        chatConfig: JangChatConfig?
+        chatConfig: JangChatConfig?,
+        chatTemplate: String?
     ) -> [String: any Sendable]? {
         llmDefaultAdditionalContext(
             modelType: modelType,
             capabilities: capabilities,
             generationConfig: generationConfig,
-            chatConfig: chatConfig)
+            chatConfig: chatConfig,
+            chatTemplate: chatTemplate)
     }
 }
 
@@ -1872,6 +1835,10 @@ public final class LLMModelFactory: ModelFactory {
             }
         }
 
+        if let mimo = model as? MiMoV26TextModel {
+            try mimo.configure(modelDirectory: modelDirectory)
+        }
+
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig =
             if let generationData = try? Data(contentsOf: generationConfigURL) {
@@ -1922,7 +1889,7 @@ public final class LLMModelFactory: ModelFactory {
             // — older bundles use it, and the new schema inherits it
             // as a fallback. Finally `model_type` infer.
             let chatStamped = ToolCallFormat.fromCapabilityName(
-                jangConfig?.chat?.toolCalling?.parser)
+                jangConfig?.chat?.toolCalling?.parser, modelType: baseConfig.modelType)
             let templateAwareJang =
                 ParserResolution.toolCall(
                     capabilities: jangConfig?.capabilities,
@@ -1978,7 +1945,7 @@ public final class LLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? "qwen3"
+                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
                         : reasoningStampFromModelType(baseConfig.modelType))
             } else if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
@@ -1991,7 +1958,7 @@ public final class LLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? "qwen3"
+                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
                         : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
@@ -2069,7 +2036,8 @@ public final class LLMModelFactory: ModelFactory {
                 modelType: baseConfig.modelType,
                 capabilities: jangConfig?.capabilities,
                 generationConfig: generationConfig,
-                chatConfig: jangConfig?.chat),
+                chatConfig: jangConfig?.chat,
+                chatTemplate: chatTemplate),
             templateReadsEnableThinking: BailingThinkingTemplateContext.templateReadsEnableThinking(chatTemplate))
 
         return .init(

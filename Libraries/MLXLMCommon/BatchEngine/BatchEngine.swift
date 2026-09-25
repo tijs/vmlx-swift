@@ -365,6 +365,7 @@ public actor BatchEngine {
     /// decode coherently on the uncompiled path but diverge on the compiled
     /// trace until each path has dedicated parity proof.
     private var compiledDecodeDeniedForModel: Bool {
+        guard context.model.supportsWholeForwardCompilation else { return true }
         if context.configuration.toolCallFormat == .hunyuan {
             return true
         }
@@ -1473,7 +1474,7 @@ public actor BatchEngine {
 
     private func finishSoloFastPath(id: UUID) {
         guard soloFastPathID == id else { return }
-        Stream().synchronize()
+        StreamOrDevice.default.stream.synchronize()
         let shouldPurgeMediaWorkingSet = soloFastPathHadMedia
         soloFastPathID = nil
         soloFastPathTask = nil
@@ -1633,7 +1634,7 @@ public actor BatchEngine {
 
         // Final fence: producers submit via `asyncEval`, so their last
         // command buffers may still be in flight when the tasks return.
-        Stream().synchronize()
+        StreamOrDevice.default.stream.synchronize()
         if shouldPurgeSoloMediaWorkingSet {
             Memory.clearCache()
             stepsSinceMemoryPurge = 0
@@ -1713,6 +1714,10 @@ public actor BatchEngine {
     private func ensureLoopRunning() {
         guard loopTask == nil else { return }
         loopTask = Task {
+            // The solo path owns its activity in generateLoopTask; the real
+            // batched scheduler needs the same finite-work protection.
+            let activity = GenerationActivity()
+            defer { activity.end() }
             // Give immediately-following submits a bounded coalescing window
             // before the scheduler enters a potentially long prefill. A plain
             // `Task.yield()` is not deterministic enough: the scheduler can
@@ -2032,7 +2037,8 @@ public actor BatchEngine {
                     mediaSalt: slot.mediaSalt,
                     skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: slot.originalInput
-                        .cacheStablePrefixTokenCounts)
+                        .cacheStablePrefixTokenCounts,
+                    chainId: slot.parameters.cacheChainId)
                 if case .hit(
                     let matchedTokens, let remaining, let detail, let blocks,
                     let ssmStates, let diskArrays) = result
@@ -2041,7 +2047,9 @@ public actor BatchEngine {
                     var retainedDiskRestore = false
                     var restoredTokenCount = 0
                     if !blocks.isEmpty {
-                        let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
+                        let restoredTokens = restoreLayerData(
+                            from: blocks, into: slot.cache,
+                            preserveStandardKVStorageDType: coordinator.config.preserveStandardKVStorageDType)
                         coordinator.release(blocks: blocks)
                         if restoredTokens > 0 {
                             restoredTokenCount = restoredTokens
@@ -2071,7 +2079,8 @@ public actor BatchEngine {
                         // prevents.
                         let diskRestored = MLXCacheIOLock.withSerializedMLXCacheIO {
                             () -> Int in
-                            let count = restoreFromDiskArrays(diskArrays, into: &slot.cache)
+                            let count = restoreFromDiskArrays(
+                                diskArrays, into: &slot.cache, requirePromptBoundary: true)
                             if count > 0 {
                                 // The v2 disk format has NO LayerKind for the
                                 // GatedDeltaNet linear-attention (ArraysCache)
@@ -2140,6 +2149,11 @@ public actor BatchEngine {
                             Self.logger.info(
                                 "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(diskRestored) tokens from disk, prefilling \(remaining.count) remaining"
                             )
+                        } else if detail == .disk {
+                            coordinator.reportDiskRestoreRejected(
+                                tokens: tokenIds, boundary: matchedTokens,
+                                mediaSalt: slot.mediaSalt,
+                                reason: "payload does not fit the runtime cache")
                         }
                     }
 
@@ -2151,6 +2165,12 @@ public actor BatchEngine {
                             slot.cache, matchedTokens: matchedTokens,
                             restoredTokens: restoredTokenCount, detail: detail.rawValue)
                     {
+                        if detail == .disk {
+                            coordinator.reportDiskRestoreRejected(
+                                tokens: tokenIds, boundary: matchedTokens,
+                                mediaSalt: slot.mediaSalt,
+                                reason: "restored offsets do not match the boundary")
+                        }
                         restored = false
                         retainedDiskRestore = false
                         slot.cache = context.model.newCache(parameters: slot.parameters)
@@ -2414,7 +2434,8 @@ public actor BatchEngine {
         _ snapshot: [KVCache],
         for slot: BatchSlot
     ) {
-        guard let coordinator = cacheCoordinator,
+        guard slot.originalInput.cachePromptIntent != .auxiliary,
+            let coordinator = cacheCoordinator,
             slot.cachePromptTokenIds.count > 1,
             CacheStoreBudget.canStore(snapshot)
         else { return }
@@ -2431,7 +2452,8 @@ public actor BatchEngine {
             perLayerData: [],
             ssmStates: nil,
             cache: diskStoreCache,
-            mediaSalt: slot.mediaSalt)
+            mediaSalt: slot.mediaSalt,
+            chainId: slot.parameters.cacheChainId)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
                 "[vmlx][cache/store] label=disk-backed-safe-prompt-boundary-prefill count=\(tokens.count)\n".utf8))
@@ -2444,6 +2466,12 @@ public actor BatchEngine {
         slot initialSlot: BatchSlot? = nil
     ) {
         var slot = initialSlot ?? activeSlots[slotIndex]
+
+        // Alignment after preparation does not prove that a warm restore used
+        // the same partition as cold prefill. Only a genuinely cold start can
+        // mint durable canonical checkpoint provenance here.
+        let canonicalPrefillStart = slot.cache.allSatisfy { $0.offset == 0 }
+            && inputForPrepare.text.tokens.size == slot.cachePromptTokenIds.count
 
         let totalPromptUnits = max(0, slot.promptTokenCount)
         let remainingPromptUnits = max(0, inputForPrepare.text.tokens.size)
@@ -2472,7 +2500,8 @@ public actor BatchEngine {
                 // the ordinary prepare path. A later exact replay restores the
                 // N-1 disk entry and performs only this one-token prefill.
                 let shouldCaptureDiskSeed =
-                    cacheCoordinator?.canPersistBoundaries == true
+                    slot.originalInput.cachePromptIntent != .auxiliary
+                    && cacheCoordinator?.canPersistBoundaries == true
                     && slot.diskSeedSnapshot == nil
                     && cacheRequiresPrefillCapturedDiskSeed(slot.cache)
                     && !slot.originalInput.hasMediaContent
@@ -2618,6 +2647,40 @@ public actor BatchEngine {
         let firstToken: MLXArray
         switch prepareResult {
         case .tokens(let remainingText):
+            // prepare() has already forwarded complete chunks. Preserve that
+            // exact boundary rather than repeating those chunks after decode.
+            // Do not split/reorder prefill, and reject custom token/mask/media
+            // paths or an unaligned restored prefix.
+            let consumed = slot.cachePromptTokenIds.count - remainingText.tokens.size
+            let chunkSize = max(1, slot.prefillStepSize)
+            let seedBoundary = max(0, slot.cachePromptTokenIds.count - 1)
+            let expectedChunk = max(0, (seedBoundary - 1) / chunkSize) * chunkSize
+            if slot.originalInput.cachePromptIntent != .auxiliary,
+               slot.originalInput.cachePromptIntent != .reusablePrefixWarmup,
+               cacheCoordinator?.canPersistBoundaries == true,
+               !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
+               !slot.originalInput.hasMediaContent,
+               !slot.originalInput.requiresPostPrepareCacheKey,
+               slot.originalInput.text.mask == nil, remainingText.mask == nil,
+               consumed > 0, consumed == expectedChunk || consumed == seedBoundary,
+               slot.cache.contains(where: { $0 is RotatingKVCache }),
+               slot.cache.allSatisfy({
+                   ($0 is RotatingKVCache || $0 is KVCacheSimple) && $0.offset == consumed
+               }),
+               remainingText.tokens.reshaped(-1).asArray(Int32.self)
+                   == slot.cachePromptTokenIds.suffix(remainingText.tokens.size).map(Int32.init),
+               CacheStoreBudget.canStore(slot.cache)
+            {
+                slot.prefillReplaySeed = BatchPrefillReplaySeed(
+                    tokens: Array(slot.cachePromptTokenIds.prefix(consumed)),
+                    cache: makePromptBoundaryCacheSnapshot(from: slot.cache),
+                    canonicalChunkSize: canonicalPrefillStart && consumed % chunkSize == 0
+                        ? chunkSize : nil)
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        "[vmlx][cache/prefill-replay-seed] captured=\(consumed) prompt=\(slot.cachePromptTokenIds.count)\n".utf8))
+                }
+            }
             // Seed the processor with the full prompt tokens.
             let promptTokens = slot.originalInput.text.tokens
             slot.processor?.prompt(promptTokens)
@@ -3266,7 +3329,7 @@ public actor BatchEngine {
     /// (not cancelled), stores prompt and safe post-answer boundaries for
     /// future cache reuse.
     private func finishSlot(_ liveSlot: inout BatchSlot, reason: GenerateStopReason) {
-        let slot = liveSlot
+        var slot = liveSlot
         slot.nanTrace?.finish(totalSteps: slot.generatedTokenCount)
         defer {
             // Cache stores are synchronous. Drop the sole retained prompt/seed
@@ -3274,6 +3337,8 @@ public actor BatchEngine {
             // scheduler's next completed-slot cleanup pass.
             liveSlot.promptCacheSnapshot = nil
             liveSlot.diskSeedSnapshot = nil
+            liveSlot.prefillReplaySeed?.discard()
+            liveSlot.prefillReplaySeed = nil
         }
         let now = Date()
         let prefillTime = (slot.decodeStartTime ?? now).timeIntervalSince(slot.prefillStartTime)
@@ -3350,6 +3415,8 @@ public actor BatchEngine {
             // existing prompt/post-answer policy.
             // Still `isHybrid` on purpose — see the note in Evaluate.swift. This
             // suppresses every other boundary; only an SSM hybrid can afford that.
+            // Standalone rotating/SWA caches keep this policy untouched and only
+            // gain the stripped-boundary store itself (below).
             let usesCanonicalHybridBoundary =
                 coordinator.isHybrid && sharedPromptStripBoundary != nil
             let isReusablePrefixWarmup =
@@ -3360,6 +3427,8 @@ public actor BatchEngine {
                     coordinator.requiresRecurrentSSMCompanion)
 
             func storeCacheEntry(tokens: [Int], snapshot: [KVCache], label: String) {
+                var trace = CacheFinalizationTrace("batch-entry-" + label, tokens: tokens.count)
+                defer { trace.mark("return") }
                 guard !tokens.isEmpty else { return }
                 // Serialising the cache materialises it again (host `Data` for the
                 // disk write, plus the disk-store cache) while the snapshot and the
@@ -3439,7 +3508,13 @@ public actor BatchEngine {
                     perLayerData: perLayerData,
                     ssmStates: ssmStates,
                     cache: diskStoreCache,
-                    mediaSalt: slot.mediaSalt
+                    mediaSalt: slot.mediaSalt,
+                    chainId: slot.parameters.cacheChainId,
+                    isStableRoot: label.hasPrefix("stable-system-tool"),
+                    // The rows a later prompt of this chat starts with; the
+                    // exact prompt and the post-answer snapshot are not.
+                    isResumeBoundary: label == "history-boundary" || label == "gen-suffix-stripped",
+                    isPostAnswer: label == "post-answer"
                 )
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                     FileHandle.standardError.write(Data(
@@ -3450,6 +3525,21 @@ public actor BatchEngine {
                 )
             }
 
+            // Adjacent rotating boundaries share the same completed prefill
+            // chunks. Retain one sealed seed for this finalization only; each
+            // consumer gets its own evaluated copy before advancing the tail.
+            var boundaryReplaySeed = slot.prefillReplaySeed?.takeSnapshot()
+            slot.prefillReplaySeed = nil
+            liveSlot.prefillReplaySeed = nil
+            let canReuseBoundaryReplay =
+                !slot.originalInput.hasMediaContent
+                && !slot.originalInput.requiresPostPrepareCacheKey
+                && slot.originalInput.text.mask == nil
+                && storageTopologySnapshot.contains { $0 is RotatingKVCache }
+                && storageTopologySnapshot.allSatisfy {
+                    $0 is RotatingKVCache || $0 is KVCacheSimple
+                }
+
             func boundarySnapshot(tokens: [Int], forceRederive: Bool = false) -> [KVCache]? {
                 guard !tokens.isEmpty,
                     tokens.count <= storageSnapshotTokenCount,
@@ -3459,6 +3549,11 @@ public actor BatchEngine {
                 }
                 if tokens.count == storageSnapshotTokenCount {
                     return storageTopologySnapshot.map { $0.copy() }
+                }
+                if canReuseBoundaryReplay, let seed = boundaryReplaySeed,
+                   seed.tokens == tokens, CacheStoreBudget.canStore(seed.cache)
+                {
+                    return makePromptBoundaryCacheSnapshot(from: seed.cache)
                 }
                 let trimCount = storageSnapshotTokenCount - tokens.count
                 let trimmed = storageTopologySnapshot.map { $0.copy() }
@@ -3536,8 +3631,62 @@ public actor BatchEngine {
                 }
 
                 do {
-                    let boundaryTokens = MLXArray(tokens.map { Int32($0) })
-                        .reshaped(1, tokens.count)
+                    let traceRebuild = ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+                    let rebuildStart = traceRebuild ? DispatchTime.now().uptimeNanoseconds : 0
+                    let chunkSize = max(1, slot.prefillStepSize)
+                    let expectedSeedCount = ((tokens.count - 1) / chunkSize) * chunkSize
+                    let contract = CanonicalPrefillCheckpoint(chunkSize: chunkSize)!
+                    func canContinue(_ seed: BatchPrefillReplaySeed.State) -> Bool {
+                        canReuseBoundaryReplay
+                            && contract.canContinue(seedTokens: seed.tokens, targetTokens: tokens,
+                                                    storedChunkSize: seed.canonicalChunkSize)
+                            && CacheStoreBudget.canStore(seed.cache)
+                    }
+                    if let seed = boundaryReplaySeed, !canContinue(seed) {
+                        boundaryReplaySeed = nil
+                    }
+                    // A disk checkpoint has a separate namespace and recorded
+                    // canonical schedule. Never infer this from an arbitrary
+                    // warm chat boundary merely having a divisible offset.
+                    if canReuseBoundaryReplay,
+                       boundaryReplaySeed == nil,
+                       let persisted = coordinator.diskCache?.fetchCanonicalCheckpoint(
+                            targetTokens: tokens, contract: contract, requestSalt: slot.mediaSalt)
+                    {
+                        let validDType = persisted.arrays[TQDiskSerializer.preserveStandardKVStorageDTypeKey]
+                            .map { $0.size == 1 && $0.dtype == .int32 && $0.item(Int32.self) == 1 } ?? false
+                        var restored = context.model.newCache(parameters: slot.parameters)
+                        if validDType,
+                           restoreFromDiskArrays(persisted.arrays, into: &restored, requirePromptBoundary: true)
+                            == persisted.tokens.count,
+                           restored.count == storageTopologySnapshot.count,
+                           restored.allSatisfy({
+                               ($0 is KVCacheSimple || $0 is RotatingKVCache)
+                                   && $0.offset == persisted.tokens.count
+                           }), CacheStoreBudget.canStore(restored)
+                        {
+                            boundaryReplaySeed = (persisted.tokens, restored, chunkSize)
+                            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                                FileHandle.standardError.write(Data(
+                                    "[vmlx][cache/canonical-checkpoint] restored=\(persisted.tokens.count) target=\(tokens.count) chunk=\(chunkSize)\n".utf8))
+                            }
+                        } else {
+                            // Let the next canonical rebuild replace this
+                            // payload instead of preserving it via store dedup.
+                            coordinator.diskCache?.markRestoreRejected(
+                                tokens: persisted.tokens,
+                                mediaSalt: contract.storageSalt(requestSalt: slot.mediaSalt),
+                                countedHit: false)
+                        }
+                    }
+                    let reusableSeed = boundaryReplaySeed.flatMap { seed in
+                        canContinue(seed) ? seed : nil
+                    }
+                    if reusableSeed == nil { boundaryReplaySeed = nil }
+                    let reusedCount = reusableSeed?.tokens.count ?? 0
+                    let remainingTokens = Array(tokens.dropFirst(reusedCount))
+                    let boundaryTokens = MLXArray(remainingTokens.map { Int32($0) })
+                        .reshaped(1, remainingTokens.count)
                     let boundaryInput = LMInput(
                         text: LMInput.Text(tokens: boundaryTokens),
                         image: slot.originalInput.image,
@@ -3545,13 +3694,39 @@ public actor BatchEngine {
                         audio: slot.originalInput.audio,
                         mediaTokenIds: slot.originalInput.mediaTokenIds,
                         cacheScopeSalt: slot.originalInput.cacheScopeSalt)
-                    let cache = context.model.newCache(parameters: slot.parameters)
+                    let cache = reusableSeed.map {
+                        // Full chunked prefill clears freed allocator blocks
+                        // between chunks. Reuse skips those chunks, so preserve
+                        // that cleanup before allocating the independent tail.
+                        MLX.Memory.clearCache()
+                        return makePromptBoundaryCacheSnapshot(from: $0.cache)
+                    } ?? context.model.newCache(parameters: slot.parameters)
                     switch try context.model.prepare(
                         boundaryInput,
                         cache: cache,
                         windowSize: slot.prefillStepSize)
                     {
                     case .tokens(let remaining):
+                        // Require an unchanged token suffix and exact offsets,
+                        // not merely a cache-shaped object from custom prepare.
+                        let consumed = tokens.count - remaining.tokens.size
+                        if reusableSeed == nil || reusableSeed?.canonicalChunkSize == chunkSize,
+                           canReuseBoundaryReplay,
+                           consumed > 0, consumed == expectedSeedCount,
+                           remaining.mask == nil,
+                           remaining.tokens.reshaped(-1).asArray(Int32.self)
+                            == tokens.suffix(remaining.tokens.size).map(Int32.init),
+                           cache.count == storageTopologySnapshot.count,
+                           cache.allSatisfy({
+                               ($0 is RotatingKVCache || $0 is KVCacheSimple)
+                                   && $0.offset == consumed
+                           }),
+                           CacheStoreBudget.canStore(cache)
+                        {
+                            boundaryReplaySeed = (
+                                Array(tokens.prefix(consumed)),
+                                makePromptBoundaryCacheSnapshot(from: cache), chunkSize)
+                        }
                         // Match the main prefill path's batch-first shape.
                         // ZAYA CCA reads B/T from activation rank and traps
                         // on a 1D token tensor during coordinator-only
@@ -3564,6 +3739,11 @@ public actor BatchEngine {
                         break
                     }
                     MLX.eval(cache)
+                    if traceRebuild {
+                        let milliseconds = Double(DispatchTime.now().uptimeNanoseconds - rebuildStart) / 1_000_000
+                        FileHandle.standardError.write(Data(
+                            "[vmlx][cache/boundary-rederive] tokens=\(tokens.count) reused=\(reusedCount) ms=\(String(format: "%.3f", milliseconds))\n".utf8))
+                    }
                     return cache
                 } catch {
                     if ProcessInfo.processInfo.environment["VMLX_SSM_STORE_TRACE"] != nil {
@@ -3667,34 +3847,22 @@ public actor BatchEngine {
                     }
                 }
 
-                // Gen-suffix-stripped cross-turn boundary (hybrid SSM + rotating
-                // companion topologies).
+// Gen-suffix-stripped cross-turn boundary — hybrid SSM and
+                // standalone rotating/SWA.
                 //
                 // The prompt boundary stored above ends in the chat template's
                 // generation-prompt suffix (`<|im_start|>assistant\n`, …). The
                 // NEXT chat turn replaces that suffix with the assistant reply +
                 // the following user turn, so the full-prompt key can never match
-                // as a prefix — which is why growing hybrid turns never reused
-                // prefill and recomputed the whole context every turn. The
-                // boundary the next turn DOES contain as an exact prefix is this
-                // prompt stripped back to the end of the last real (user) message,
-                // i.e. everything before the final turn-start token. Store it so
-                // hybrid multi-turn chat reuses prior prefill. Non-hybrid
-                // rotating-companion topologies (Gemma4-style mixed rotating+KV)
-                // are admitted too: their paged tier cannot serve mid-stream
-                // prefix matches (companion exists only at stored boundaries), so
-                // this stripped boundary is their only growing-turn reuse path.
+// as a prefix. The stripped boundary does match the next prompt
+                // as an exact prefix, so store it for growing-chat reuse.
                 //
                 // Correctness: KV comes from the prompt-boundary trim/re-derive;
                 // clean SSM/GatedDeltaNet state at the stripped position comes from
                 // `storeCacheEntry`'s re-derive (enableSSMReDerive), NOT from the
                 // live post-generation state (which is ahead by the gen suffix).
-                // The store only fires when the prompt's tail actually is the
-                // template's gen-prompt suffix, so non-chat / tool-scaffold prompts
-                // that don't match simply skip it (no reuse, still correct). Proven
-                // cache-ON == cache-OFF (byte-identical, temp=0, fresh disk cache)
-                // on qwen-agentworld-35b-a3b MXFP8 (GatedDeltaNet MoE) and
-                // nemotron-omni-nano (Mamba-2); inert on dense gemma-4-e2b.
+                // The store only fires when the prompt tail matches the template's
+                // generation prompt; non-chat/tool-scaffold prompts simply skip it.
                 // NOTE: intentionally NOT gated on
                 // `!cachePrefixTokenCounts.contains(stripAt)`. For hybrid caches
                 // the history-boundary path can't store this boundary without a
@@ -3754,6 +3922,12 @@ public actor BatchEngine {
                     "Skipped post-answer cache entry for slot \(slot.id.description, privacy: .public): reason=\(String(describing: reason), privacy: .public) generated=\(slot.generatedTokenIds.count) cacheOffset=\((slot.cache.map(\.offset).max() ?? 0), privacy: .public)"
                 )
             }
+            if canReuseBoundaryReplay, reason == .stop,
+               let seed = boundaryReplaySeed, let chunkSize = seed.canonicalChunkSize {
+                coordinator.storeCanonicalCheckpoint(
+                    tokens: seed.tokens, cache: seed.cache, chunkSize: chunkSize,
+                    requestSalt: slot.mediaSalt, chainId: slot.parameters.cacheChainId)
+            }
             } else {
                 Self.logger.debug(
                     "Slot \(slot.id.description, privacy: .public): skipped cache store because no new prompt-boundary snapshot was retained"
@@ -3775,7 +3949,7 @@ public actor BatchEngine {
         // THIS thread — which owns the command buffers — drains them in order
         // with no foreign-commit hazard, so "stream finished" provably means
         // "GPU idle." Mirrors the solo-fast-path drain in `finishSoloFastPath`.
-        Stream().synchronize()
+        StreamOrDevice.default.stream.synchronize()
 
         slot.continuation.finish()
 

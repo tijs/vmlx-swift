@@ -1,5 +1,6 @@
 import Foundation
-import MLX  // pulls Cmlx symbols into the link
+import MLX
+import CmlxDistributedShim
 
 /// Swift wrapper around an MLX `mlx_distributed_group` handle. Created
 /// once per process via `Group.init(strict:backend:)`; subsequent
@@ -7,11 +8,7 @@ import MLX  // pulls Cmlx symbols into the link
 ///
 /// Phase 5 scope:
 /// - rank, size, split queryable.
-/// - Lifecycle: leaks on shutdown (mlx-c does NOT expose a public
-///   `_free` for groups; the C++ Group is shared_ptr-managed but the
-///   wrapper allocates with `new` and the only deleter is private).
-///   Single Group per process is the expected pattern, so this
-///   shouldn't matter in practice.
+/// - Lifecycle: shared handle storage frees the pinned C ABI group on last release.
 public struct Group: Sendable {
     /// Opaque mlx_distributed_group handle (just a void* ctx wrapper).
     public let handle: MLXDistributedGroupHandle
@@ -27,21 +24,21 @@ public struct Group: Sendable {
     public init(strict: Bool = false, backend: String? = nil) {
         if let backend {
             self.handle = backend.withCString { bk in
-                MLXDistributedGroupHandle(_mlx_distributed_init(strict, bk))
+                MLXDistributedGroupHandle(_MLXDistributedGroupRaw(ctx: vmlx_group_init(strict, bk)))
             }
         } else {
-            self.handle = MLXDistributedGroupHandle(_mlx_distributed_init(strict, nil))
+            self.handle = MLXDistributedGroupHandle(_MLXDistributedGroupRaw(ctx: vmlx_group_init(strict, nil)))
         }
     }
 
     /// Number of ranks in this group.
     public var size: Int {
-        Int(_mlx_distributed_group_size(handle.raw))
+        Int(vmlx_group_size(handle.raw.ctx))
     }
 
     /// Local rank within this group.
     public var rank: Int {
-        Int(_mlx_distributed_group_rank(handle.raw))
+        Int(vmlx_group_rank(handle.raw.ctx))
     }
 
     /// Returns true if this group has more than one rank — i.e. real
@@ -55,7 +52,7 @@ public struct Group: Sendable {
     /// handle that would result).
     public func split(color: Int, key: Int) -> Group {
         guard isMultiRank else { return self }
-        let raw = _mlx_distributed_group_split(handle.raw, Int32(color), Int32(key))
+        let raw = _MLXDistributedGroupRaw(ctx: vmlx_group_split(handle.raw.ctx, Int32(color), Int32(key)))
         return Group(handle: MLXDistributedGroupHandle(raw))
     }
 
@@ -68,37 +65,19 @@ public struct Group: Sendable {
 /// `void* ctx` pointer). The underlying C++ Group is reference-counted
 /// internally; passing this handle by value is safe.
 public struct MLXDistributedGroupHandle: @unchecked Sendable {
-    let raw: _MLXDistributedGroupRaw
+    private final class Storage {
+        let raw: _MLXDistributedGroupRaw
+        init(_ raw: _MLXDistributedGroupRaw) { self.raw = raw }
+        deinit { vmlx_group_free(raw.ctx) }
+    }
+    private let storage: Storage
+    var raw: _MLXDistributedGroupRaw { storage.raw }
 
-    init(_ raw: _MLXDistributedGroupRaw) { self.raw = raw }
+    init(_ raw: _MLXDistributedGroupRaw) { storage = Storage(raw) }
 }
 
-/// Mirror of the C-level `mlx_distributed_group` struct (a struct with
-/// a single `void*` ctx field). Layout-compatible so we can pass by
-/// value across the @_silgen_name boundary.
+/// Opaque context shared with the C collective bridge.
 public struct _MLXDistributedGroupRaw {
     public var ctx: UnsafeMutableRawPointer?
     public init(ctx: UnsafeMutableRawPointer? = nil) { self.ctx = ctx }
 }
-
-// MARK: - C symbol forward declarations
-//
-// mlx-swift doesn't export Cmlx as a public product so we can't
-// `import Cmlx`. These declarations bind to symbols pulled in via
-// our MLX dependency.
-
-@_silgen_name("mlx_distributed_init")
-private func _mlx_distributed_init(
-    _ strict: Bool, _ backend: UnsafePointer<CChar>?
-) -> _MLXDistributedGroupRaw
-
-@_silgen_name("mlx_distributed_group_rank")
-private func _mlx_distributed_group_rank(_ g: _MLXDistributedGroupRaw) -> Int32
-
-@_silgen_name("mlx_distributed_group_size")
-private func _mlx_distributed_group_size(_ g: _MLXDistributedGroupRaw) -> Int32
-
-@_silgen_name("mlx_distributed_group_split")
-private func _mlx_distributed_group_split(
-    _ g: _MLXDistributedGroupRaw, _ color: Int32, _ key: Int32
-) -> _MLXDistributedGroupRaw

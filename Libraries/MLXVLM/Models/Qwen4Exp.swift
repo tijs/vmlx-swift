@@ -246,6 +246,7 @@ private enum Qwen4ExpCompiledMHC {
 
     static func callDense(
         hyper: MLXArray,
+        normalizedInput: MLXArray? = nil,
         normWeight: MLXArray,
         downWeight: MLXArray,
         downOutputSize: Int,
@@ -261,9 +262,11 @@ private enum Qwen4ExpCompiledMHC {
             upWeight.dtype == .bfloat16
         else { return nil }
 
+        // Capture only the mode, never a generation-owned tensor in the cache.
+        let hasNormalizedInput = normalizedInput != nil
         let key = [
             "dense", String(hcCount), String(hiddenSize), String(eps),
-            String(downOutputSize), "S\(hyper.dim(-2))",
+            String(downOutputSize), "S\(hyper.dim(-2))", "normalized=\(hasNormalizedInput)",
         ].joined(separator: "|")
 
         lock.lock()
@@ -274,7 +277,7 @@ private enum Qwen4ExpCompiledMHC {
                 let original = hyper.shape
                 let grouped = hyper.reshaped(
                     Array(original.dropLast()) + [-1, hiddenSize])
-                let normalized = (
+                let normalized = hasNormalizedInput ? hyper : (
                     MLXFast.rmsNorm(grouped, weight: MLXArray.mlxNone, eps: eps)
                         .reshaped(original) * args[1]
                 )
@@ -297,13 +300,14 @@ private enum Qwen4ExpCompiledMHC {
         reportLocked()
         lock.unlock()
 
-        let outputs = region!([hyper, normWeight, downWeight, upWeight])
+        let outputs = region!([normalizedInput ?? hyper, normWeight, downWeight, upWeight])
         guard outputs.count == 2 else { return nil }
         return (outputs[0], outputs[1])
     }
 
     static func call(
         hyper: MLXArray,
+        normalizedInput: MLXArray? = nil,
         normWeight: MLXArray,
         downWeight: MLXArray,
         downScales: MLXArray,
@@ -329,11 +333,12 @@ private enum Qwen4ExpCompiledMHC {
             upScales.dtype == .bfloat16, upBiases.dtype == .bfloat16
         else { return nil }
 
+        let hasNormalizedInput = normalizedInput != nil
         let key = [
             String(hcCount), String(hiddenSize), String(eps),
             String(downGroupSize), String(downBits), String(describing: downMode),
             String(downOutputSize), String(upGroupSize), String(upBits),
-            String(describing: upMode), "S\(hyper.dim(-2))",
+            String(describing: upMode), "S\(hyper.dim(-2))", "normalized=\(hasNormalizedInput)",
         ].joined(separator: "|")
 
         lock.lock()
@@ -344,7 +349,7 @@ private enum Qwen4ExpCompiledMHC {
                 let original = hyper.shape
                 let grouped = hyper.reshaped(
                     Array(original.dropLast()) + [-1, hiddenSize])
-                let normalized = (
+                let normalized = hasNormalizedInput ? hyper : (
                     MLXFast.rmsNorm(grouped, weight: MLXArray.mlxNone, eps: eps)
                         .reshaped(original) * args[1]
                 )
@@ -374,7 +379,7 @@ private enum Qwen4ExpCompiledMHC {
         lock.unlock()
 
         let outputs = region!([
-            hyper, normWeight,
+            normalizedInput ?? hyper, normWeight,
             downWeight, downScales, downBiases,
             upWeight, upScales, upBiases,
         ])
@@ -396,6 +401,7 @@ private final class Qwen4ExpGatedResidual: Module {
         RuntimeEnvironment.value("VMLX_QWEN4_EXP_FUSE_DECODE_INPUTS") != "0"
     private static let fusionDiagnosticLock = NSLock()
     private nonisolated(unsafe) static var didReportInputFusion = false
+    private nonisolated(unsafe) static var didReportCombineNorm = false
 
     private enum FusedInputProjection {
         case dense(weight: MLXArray)
@@ -417,6 +423,8 @@ private final class Qwen4ExpGatedResidual: Module {
     @ModuleInfo(key: "block_inject_weight") var inject: Linear?
     private var attemptedInputFusion = false
     private var fusedInputProjection: FusedInputProjection?
+    private let combineNorm: Qwen4ExpHCCombineNorm
+    private(set) var combineNormCallCount = 0
 
     init(_ config: Qwen4ExpConfiguration, combines: Bool = true) {
         let text = config.base.textConfiguration
@@ -424,6 +432,7 @@ private final class Qwen4ExpGatedResidual: Module {
         hcCount = extras.hcCount
         hiddenSize = text.hiddenSize
         self.combines = combines
+        combineNorm = Qwen4ExpHCCombineNorm(hiddenSize: text.hiddenSize, eps: text.rmsNormEps)
         let width = hcCount * hiddenSize
         _norm.wrappedValue = Qwen4ExpGroupedRMSNorm(
             dimensions: width, groupSize: hiddenSize, eps: text.rmsNormEps)
@@ -433,7 +442,7 @@ private final class Qwen4ExpGatedResidual: Module {
         super.init()
     }
 
-    func mix(_ hyper: MLXArray) -> (MLXArray, MLXArray?) {
+    func mix(_ hyper: MLXArray, normalizedInput: MLXArray? = nil) -> (MLXArray, MLXArray?) {
         var fused: FusedInputProjection?
         if Self.fuseDecodeInputs, combines, Qwen4ExpCompiledMHC.supportsShape(hyper),
             !CompiledDecodeTrace.isActive
@@ -447,6 +456,7 @@ private final class Qwen4ExpGatedResidual: Module {
             let upBiases = up.biases,
             let compiled = Qwen4ExpCompiledMHC.call(
                 hyper: hyper,
+                normalizedInput: normalizedInput,
                 normWeight: norm.weight,
                 downWeight: downWeight,
                 downScales: downScales,
@@ -471,6 +481,7 @@ private final class Qwen4ExpGatedResidual: Module {
             !(mixUp is QuantizedLinear), mixUp.bias == nil,
             let compiled = Qwen4ExpCompiledMHC.callDense(
                 hyper: hyper,
+                normalizedInput: normalizedInput,
                 normWeight: norm.weight,
                 downWeight: downWeight,
                 downOutputSize: mixDown.shape.0,
@@ -482,7 +493,7 @@ private final class Qwen4ExpGatedResidual: Module {
             return compiled
         }
 
-        let normalized = norm(hyper)
+        let normalized = normalizedInput ?? norm(hyper)
         let mixedDown: MLXArray
         let injected: MLXArray?
         if let fused
@@ -562,7 +573,33 @@ private final class Qwen4ExpGatedResidual: Module {
         return fusedInputProjection
     }
 
+    /// The target mixer's norm owns the prepared value. It is passed directly
+    /// to its next call, never stored across tokens, models, or cache restores.
+    func combineAndNormalize(
+        _ hyper: MLXArray, block: MLXArray, injection: MLXArray
+    ) -> (residual: MLXArray, normalized: MLXArray)? {
+        guard let result = combineNorm(
+            residual: hyper, block: block, injection: injection, weight: norm.weight)
+        else { return nil }
+        if combineNormCallCount == 0 {
+            Self.fusionDiagnosticLock.lock()
+            if !Self.didReportCombineNorm {
+                Self.didReportCombineNorm = true
+                NSLog("[Qwen4Exp] hc_combine_next_norm=active streams=%d width=%d dtype=%@ intermediate_rounding=preserved ar_only=1",
+                      hcCount, hiddenSize, String(describing: hyper.dtype))
+            }
+            Self.fusionDiagnosticLock.unlock()
+        }
+        combineNormCallCount += 1
+        return result
+    }
+
     func combine(_ hyper: MLXArray, block: MLXArray, injection: MLXArray) -> MLXArray {
+        if let combined = Qwen4ExpHCCombine.call(
+            residual: hyper, block: block, injection: injection)
+        {
+            return combined
+        }
         let value = expandedDimensions(block, axis: -2) * expandedDimensions(injection, axis: -1)
         return (hyper + value.reshaped(hyper.shape)).asType(hyper.dtype)
     }
@@ -868,6 +905,11 @@ enum Qwen4ExpQSARuntime {
     nonisolated(unsafe) static var poolCache: Bool = {
         ProcessInfo.processInfo.environment["VMLX_QSA_POOL_CACHE"] != "0"
     }()
+
+    // Flash-Next-only qualification boundary. Other Qwen models keep their
+    // existing RotaryEmbedding default; explicit media positions are unchanged.
+    static let textPositionFastPath =
+        RuntimeEnvironment.value("VMLX_QWEN4_EXP_TEXT_ROPE_FAST_PATH") != "0"
 }
 
 private final class Qwen4ExpQSAIndexer: Module {
@@ -895,11 +937,15 @@ private final class Qwen4ExpQSAIndexer: Module {
         // runtime's mrope_section=[11, 11, 10] contract.
         rotary = Qwen35Language.RotaryEmbedding(
             dim: Int(Float(text.headDim ?? 256) * text.partialRotaryFactor),
-            base: text.ropeTheta, mropeSection: config.extras.mropeSection)
+            base: text.ropeTheta, mropeSection: config.extras.mropeSection,
+            textPositionFastPath: Qwen4ExpQSARuntime.textPositionFastPath)
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray, cache: QSAKVCache?) -> MLXArray? {
+    func callAsFunction(
+        _ x: MLXArray, cache: QSAKVCache?,
+        rotaryContext: Qwen4ExpRotaryContext? = nil
+    ) -> MLXArray? {
         let B = x.dim(0), S = x.dim(1)
         precondition(B == 1, "qwen4_exp QSA currently supports batch size 1")
         let past = cache?.offset ?? 0
@@ -932,11 +978,20 @@ private final class Qwen4ExpQSAIndexer: Module {
                 .reshaped(B, range.count, ratio, extras.indexerHeadDim)
                 .asType(.float32).mean(axis: 2).asType(allKeys.dtype)
             chunk = kNorm(chunk)
-            let positions = MLXArray(stride(
-                from: range.lowerBound * ratio, to: range.upperBound * ratio,
-                by: ratio)).asType(.int32).reshaped(1, range.count)
             let chunk4 = expandedDimensions(chunk, axis: 1)
-            let (kCos, kSin) = rotary(x: chunk4, positionIds: positions)
+            let factors: (MLXArray, MLXArray)
+            if let rotaryContext {
+                factors = rotaryContext.factors(
+                    rotary: rotary, like: chunk4,
+                    start: range.lowerBound * ratio, end: range.upperBound * ratio,
+                    step: ratio)
+            } else {
+                let positions = MLXArray(stride(
+                    from: range.lowerBound * ratio, to: range.upperBound * ratio,
+                    by: ratio)).asType(.int32).reshaped(1, range.count)
+                factors = rotary(x: chunk4, positionIds: positions)
+            }
+            let (kCos, kSin) = factors
             return Qwen35Language.applyMultimodalRotaryPosEmb(
                 q: chunk4, k: chunk4, cos: kCos, sin: kSin).0[0..., 0, 0..., 0...]
         }
@@ -965,8 +1020,15 @@ private final class Qwen4ExpQSAIndexer: Module {
             pooled = processBlocks(0 ..< blocks)
         }
 
-        let qPositions = MLXArray(past ..< (past + S)).asType(.int32).reshaped(1, S)
-        let (qCos, qSin) = rotary(x: query, positionIds: qPositions)
+        let queryFactors: (MLXArray, MLXArray)
+        if let rotaryContext {
+            queryFactors = rotaryContext.factors(
+                rotary: rotary, like: query, start: past, end: past + S)
+        } else {
+            let qPositions = MLXArray(past ..< (past + S)).asType(.int32).reshaped(1, S)
+            queryFactors = rotary(x: query, positionIds: qPositions)
+        }
+        let (qCos, qSin) = queryFactors
         query = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: query, k: query, cos: qCos, sin: qSin).0
         return Qwen4ExpQSA.selectedTokenMask(
@@ -1002,18 +1064,20 @@ private final class Qwen4ExpAttention: Module {
         _indexer.wrappedValue = Qwen4ExpQSAIndexer(config)
         rotary = Qwen35Language.RotaryEmbedding(
             dim: Int(Float(headDim) * text.partialRotaryFactor),
-            base: text.ropeTheta, mropeSection: config.extras.mropeSection)
+            base: text.ropeTheta, mropeSection: config.extras.mropeSection,
+            textPositionFastPath: Qwen4ExpQSARuntime.textPositionFastPath)
         super.init()
     }
 
     func callAsFunction(
         _ x: MLXArray, cache: QSAKVCache?,
         positionIds explicitPositions: MLXArray? = nil,
-        positionOffset: Int = 0
+        positionOffset: Int = 0,
+        rotaryContext: Qwen4ExpRotaryContext? = nil
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let past = cache?.offset ?? 0
-        let sparseMask = indexer(x, cache: cache)
+        let sparseMask = indexer(x, cache: cache, rotaryContext: rotaryContext)
         let headDim = text.headDim ?? (text.hiddenSize / text.attentionHeads)
         // Verify-tile (workplan W2a): the projections are row-independent
         // weight matmuls, so their M dimension may be padded to the NAX tile
@@ -1033,10 +1097,18 @@ private final class Qwen4ExpAttention: Module {
         // Media prefill passes explicit 3-channel M-RoPE positions from
         // getRopeIndex; decode after media continues from past + ropeDelta.
         // Text-only keeps the sequential cache-offset positions (offset 0).
-        let positions = explicitPositions
-            ?? MLXArray((past + positionOffset) ..< (past + positionOffset + S))
-                .asType(.int32).reshaped(1, S)
-        let (cos, sin) = rotary(x: value, positionIds: positions)
+        let factors: (MLXArray, MLXArray)
+        if explicitPositions == nil, let rotaryContext {
+            factors = rotaryContext.factors(
+                rotary: rotary, like: value,
+                start: past + positionOffset, end: past + positionOffset + S)
+        } else {
+            let positions = explicitPositions
+                ?? MLXArray((past + positionOffset) ..< (past + positionOffset + S))
+                    .asType(.int32).reshaped(1, S)
+            factors = rotary(x: value, positionIds: positions)
+        }
+        let (cos, sin) = factors
         (query, key) = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: query, k: key, cos: cos, sin: sin)
 
@@ -1067,6 +1139,10 @@ private final class Qwen4ExpAttention: Module {
 }
 
 private final class Qwen4ExpDecoderLayer: Module {
+    struct ForwardResult {
+        let hidden: MLXArray
+        let normalizedNext: MLXArray?
+    }
     private static let profiledLayer = RuntimeEnvironment.value("VMLX_QWEN4_EXP_PROFILE_LAYER").flatMap(Int.init)
     private static let profileLimit = Int(RuntimeEnvironment.value("VMLX_QWEN4_EXP_PROFILE_LIMIT") ?? "4") ?? 4
     private static let profileSequenceLength = Int(RuntimeEnvironment.value("VMLX_QWEN4_EXP_PROFILE_SEQUENCE") ?? "1") ?? 1
@@ -1119,8 +1195,13 @@ private final class Qwen4ExpDecoderLayer: Module {
         pleEmbedding: MLXArray? = nil,
         recordPrefixCommitStates: Bool = false,
         positionIds: MLXArray? = nil,
-        positionOffset: Int = 0
-    ) -> MLXArray {
+        positionOffset: Int = 0,
+        rotaryContext: Qwen4ExpRotaryContext? = nil,
+        fuseGDNQKNorm: Bool = false,
+        fuseHCCombineNorm: Bool = false,
+        normalizedInput: MLXArray? = nil,
+        nextMixer: Qwen4ExpGatedResidual? = nil
+    ) -> ForwardResult {
         if Self.profiledLayer == layerIndex,
             inputIds.size == Self.profileSequenceLength,
             profileCount < Self.profileLimit
@@ -1158,10 +1239,12 @@ private final class Qwen4ExpDecoderLayer: Module {
                 let result = isLinear
                     ? linearAttention!(
                         attentionMix.0, cache: cache as? MambaCache,
-                        recordPrefixCommitStates: recordPrefixCommitStates)
+                        recordPrefixCommitStates: recordPrefixCommitStates,
+                        fuseQKNormalization: fuseGDNQKNorm)
                     : attention!(
                         attentionMix.0, cache: cache as? QSAKVCache,
-                        positionIds: positionIds, positionOffset: positionOffset)
+                        positionIds: positionIds, positionOffset: positionOffset,
+                        rotaryContext: rotaryContext)
                 return (result, [result])
             }
             hyper = evaluated("attention_combine") {
@@ -1189,7 +1272,7 @@ private final class Qwen4ExpDecoderLayer: Module {
                 ("[Qwen4ExpProfile] layer=\(layerIndex)"
                     + " sequence_length=\(inputIds.size) sample=\(profileCount)"
                     + " \(fields)\n").utf8))
-            return result
+            return ForwardResult(hidden: result, normalizedNext: nil)
         }
 
         var hyper = input
@@ -1200,17 +1283,34 @@ private final class Qwen4ExpDecoderLayer: Module {
                 preloadedEmbedding: pleEmbedding,
                 recordPrefixCommitStates: recordPrefixCommitStates)
         }
-        let (attentionInput, inject) = attentionResidual.mix(hyper)
+        // PLE changes the residual before attention; a norm prepared before PLE
+        // would be stale. The caller also avoids preparing it for these layers.
+        let (attentionInput, inject) = attentionResidual.mix(
+            hyper, normalizedInput: ple == nil ? normalizedInput : nil)
         let attentionOutput = isLinear
             ? linearAttention!(
                 attentionInput, cache: cache as? MambaCache,
-                recordPrefixCommitStates: recordPrefixCommitStates)
+                recordPrefixCommitStates: recordPrefixCommitStates,
+                fuseQKNormalization: fuseGDNQKNorm)
             : attention!(
                 attentionInput, cache: cache as? QSAKVCache,
-                positionIds: positionIds, positionOffset: positionOffset)
-        hyper = attentionResidual.combine(hyper, block: attentionOutput, injection: inject!)
-        let (mlpInput, mlpInject) = mlpResidual.mix(hyper)
-        return mlpResidual.combine(hyper, block: mlp(mlpInput), injection: mlpInject!)
+                positionIds: positionIds, positionOffset: positionOffset,
+                rotaryContext: rotaryContext)
+        let preparedMLP = fuseHCCombineNorm
+            ? mlpResidual.combineAndNormalize(hyper, block: attentionOutput, injection: inject!)
+            : nil
+        hyper = preparedMLP?.residual
+            ?? attentionResidual.combine(hyper, block: attentionOutput, injection: inject!)
+        let (mlpInput, mlpInject) = mlpResidual.mix(hyper, normalizedInput: preparedMLP?.normalized)
+        let block = mlp(mlpInput)
+        if fuseHCCombineNorm,
+            let prepared = nextMixer?.combineAndNormalize(hyper, block: block, injection: mlpInject!)
+        {
+            return ForwardResult(hidden: prepared.residual, normalizedNext: prepared.normalized)
+        }
+        return ForwardResult(
+            hidden: mlpResidual.combine(hyper, block: block, injection: mlpInject!),
+            normalizedNext: nil)
     }
 }
 
@@ -1336,7 +1436,43 @@ private final class Qwen4ExpMTPModule: Module {
     }
 }
 
+/// Submission is scheduling, not a new arithmetic or quantization path. The
+/// qualified single-row AR path is enabled by default; explicit opt-outs remain.
+/// Larger layer groups are deliberately not admitted: a four-layer diagnostic
+/// improved short decode but regressed sparse-QSA decode at longer context.
+enum Qwen4ExpEarlySubmission {
+    static func parse(_ value: String?) -> Bool { value == nil || value == "1" }
+
+    static func allows(
+        enabled: Bool, shape: [Int], autoregressive: Bool,
+        recordingPrefix: Bool, externalPLE: Bool, compiledTrace: Bool
+    ) -> Bool {
+        enabled && shape == [1, 1] && autoregressive
+            && !recordingPrefix && !externalPLE && !compiledTrace
+    }
+}
+
 private final class Qwen4ExpTextModel: Module {
+    var hcCombineNormEnabled = RuntimeEnvironment.value("VMLX_QWEN4_HC_COMBINE_NORM") == "1"
+    var hcCombineNormCallCount: Int {
+        mixer.combineNormCallCount + layers.reduce(0) {
+            $0 + $1.attentionResidual.combineNormCallCount + $1.mlpResidual.combineNormCallCount
+        }
+    }
+    // Qualification-only opt-in; no production default change before live gates.
+    var gdnQKNormEnabled = RuntimeEnvironment.value("VMLX_QWEN4_GDN_QK_NORM") == "1"
+    var gdnQKNormCallCount: Int {
+        layers.reduce(0) { $0 + ($1.linearAttention?.qkNormalizationCallCount ?? 0) }
+    }
+    // Read once per instance, not from ProcessInfo on every layer/token.
+    var earlySubmissionEnabled = Qwen4ExpEarlySubmission.parse(
+        RuntimeEnvironment.value("VMLX_QWEN4_EXP_EARLY_SUBMIT"))
+    private var rotaryReuseEnabled = Qwen4ExpEarlySubmission.parse(
+        RuntimeEnvironment.value("VMLX_QWEN4_AR_ROTARY_REUSE"))
+    private var reportedRotaryReuseShapes: Set<String> = []
+    private(set) var earlySubmissionCount = 0
+    private var reportedEarlySubmit = false
+
     struct ForwardResult {
         let mixed: MLXArray
         let preMixer: MLXArray
@@ -1364,9 +1500,32 @@ private final class Qwen4ExpTextModel: Module {
         pleEmbeddings: [Int: MLXArray]? = nil,
         recordPrefixCommitStates: Bool = false,
         positionIds: MLXArray? = nil,
-        positionOffset: Int = 0
+        positionOffset: Int = 0,
+        autoregressive: Bool = false
     ) -> ForwardResult {
         let auditDTypes = Qwen4ExpDTypeTrace.claimTextAudit()
+        let fuseHCCombineNorm = Qwen4ExpEarlySubmission.allows(
+            enabled: hcCombineNormEnabled, shape: inputIds.shape,
+            autoregressive: autoregressive, recordingPrefix: recordPrefixCommitStates,
+            externalPLE: pleEmbeddings != nil, compiledTrace: CompiledDecodeTrace.isActive)
+        let fuseGDNQKNorm = Qwen4ExpEarlySubmission.allows(
+            enabled: gdnQKNormEnabled, shape: inputIds.shape,
+            autoregressive: autoregressive, recordingPrefix: recordPrefixCommitStates,
+            externalPLE: pleEmbeddings != nil, compiledTrace: CompiledDecodeTrace.isActive)
+        let earlySubmit = Qwen4ExpEarlySubmission.allows(
+            enabled: earlySubmissionEnabled, shape: inputIds.shape,
+            autoregressive: autoregressive, recordingPrefix: recordPrefixCommitStates,
+            externalPLE: pleEmbeddings != nil, compiledTrace: CompiledDecodeTrace.isActive)
+        let rotaryContext = Qwen4ExpEarlySubmission.allows(
+            enabled: rotaryReuseEnabled, shape: inputIds.shape,
+            autoregressive: autoregressive, recordingPrefix: recordPrefixCommitStates,
+            externalPLE: pleEmbeddings != nil, compiledTrace: CompiledDecodeTrace.isActive)
+            ? Qwen4ExpRotaryContext() : nil
+        if earlySubmit, !reportedEarlySubmit {
+            reportedEarlySubmit = true
+            NSLog("[Qwen4Exp] early-submit active stride=1 rows=1 layers=%d caller_stream=1 outer_compile=0 ar_only=1",
+                layers.count)
+        }
         var plePrefetches: [Int: Qwen4ExpPLE.Prefetch] = [:]
         for (index, layer) in layers.enumerated() {
             if pleEmbeddings?[index] == nil, let ple = layer.ple {
@@ -1385,25 +1544,44 @@ private final class Qwen4ExpTextModel: Module {
         var layerDTypes: [DType] = []
         if auditDTypes { layerDTypes.reserveCapacity(layers.count) }
         hidden = tiled(hidden, repetitions: [1, 1, config.extras.hcCount])
+        var normalizedNext: MLXArray?
         for (index, layer) in layers.enumerated() {
-            hidden = layer(
+            let nextMixer: Qwen4ExpGatedResidual? = index + 1 == layers.count
+                ? mixer : (layers[index + 1].ple == nil ? layers[index + 1].attentionResidual : nil)
+            let result = layer(
                 hidden, inputIds: inputIds, cache: cache?[index],
                 plePrefetch: plePrefetches[index],
                 pleEmbedding: pleEmbeddings?[index],
                 recordPrefixCommitStates: recordPrefixCommitStates,
                 positionIds: positionIds,
-                positionOffset: positionOffset)
-            if inputIds.dim(1) > 1, plePrefetches[index + 1] != nil {
+                positionOffset: positionOffset,
+                rotaryContext: rotaryContext, fuseGDNQKNorm: fuseGDNQKNorm,
+                fuseHCCombineNorm: fuseHCCombineNorm,
+                normalizedInput: normalizedNext,
+                nextMixer: fuseHCCombineNorm ? nextMixer : nil)
+            hidden = result.hidden
+            normalizedNext = result.normalizedNext
+            if earlySubmit {
+                if let normalizedNext { asyncEval(hidden, normalizedNext) }
+                else { asyncEval(hidden) }
+                earlySubmissionCount += 1
+            } else if inputIds.dim(1) > 1, plePrefetches[index + 1] != nil {
                 // Commit the resident layer immediately so its Metal work can
                 // overlap the already-running SSD row prefetch during prefill.
-                // Decode row reads finish before the PLE layer needs them; a
-                // one-token barrier here only splits every decode graph into a
-                // second command buffer and reduces steady-state throughput.
+                // Preserve the existing multi-token prefill schedule separately
+                // from opt-in, per-layer autoregressive submission above.
                 asyncEval(hidden)
             }
             if auditDTypes { layerDTypes.append(hidden.dtype) }
         }
-        let result = mixer.mix(hidden).0
+        let result = mixer.mix(hidden, normalizedInput: normalizedNext).0
+        if let rotaryContext {
+            let shape = "\(rotaryContext.factorCount)|\(rotaryContext.reuseCount)"
+            if reportedRotaryReuseShapes.insert(shape).inserted {
+                NSLog("[Qwen4Exp] ar_rotary_reuse=active unique_factors=%d reused=%d lifetime=forward original_math=1",
+                    rotaryContext.factorCount, rotaryContext.reuseCount)
+            }
+        }
         if auditDTypes {
             Qwen4ExpDTypeTrace.logTextAudit(
                 rawEmbedding: rawEmbeddingDType, computeEmbedding: computeEmbeddingDType,
@@ -1415,11 +1593,13 @@ private final class Qwen4ExpTextModel: Module {
 
     func callAsFunction(
         _ inputIds: MLXArray, embeddings: MLXArray? = nil, cache: [KVCache]?,
-        positionIds: MLXArray? = nil, positionOffset: Int = 0
+        positionIds: MLXArray? = nil, positionOffset: Int = 0,
+        autoregressive: Bool = false
     ) -> MLXArray {
         forward(
             inputIds, embeddings: embeddings, cache: cache,
-            positionIds: positionIds, positionOffset: positionOffset
+            positionIds: positionIds, positionOffset: positionOffset,
+            autoregressive: autoregressive
         ).mixed
     }
 }
@@ -1429,13 +1609,32 @@ protocol Qwen4ExpModelDirectoryConfigurable: AnyObject {
 }
 
 public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurable,
-    SafetensorsLoadKeyExcluding, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
+    SafetensorsLoadKeyExcluding, NativeMTPModel, NativeMTPAutoregressiveBackboneModel,
+    DFlash2StagedVerifyRollbackModel,
     CompiledDecodeExternalInputModel, ModalityBearing, ModelComponentMapping
 {
     /// QSA index selection and its path-dependent cache currently require a
     /// single sequence. Keep concurrent requests queued until a B-wide QSA
     /// cache/indexer contract is implemented and proven.
     public var maximumSupportedDecodeBatchSize: Int? { 1 }
+
+    // Internal qualification controls/counter. No process-global mutation and
+    // no claim that an enabled flag by itself proves the submission executed.
+    var earlySubmissionEnabled: Bool {
+        get { textModel.earlySubmissionEnabled }
+        set { textModel.earlySubmissionEnabled = newValue }
+    }
+    var earlySubmissionCount: Int { textModel.earlySubmissionCount }
+    var hcCombineNormEnabled: Bool {
+        get { textModel.hcCombineNormEnabled }
+        set { textModel.hcCombineNormEnabled = newValue }
+    }
+    var hcCombineNormCallCount: Int { textModel.hcCombineNormCallCount }
+    var gdnQKNormEnabled: Bool {
+        get { textModel.gdnQKNormEnabled }
+        set { textModel.gdnQKNormEnabled = newValue }
+    }
+    var gdnQKNormCallCount: Int { textModel.gdnQKNormCallCount }
 
     public let config: Qwen4ExpConfiguration
     @ModuleInfo(key: "language_model") private var textModel: Qwen4ExpTextModel
@@ -1562,7 +1761,9 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         textModel.layers.map { layer in
             if layer.isLinear {
-                return MambaCache(slots: layer.ple == nil ? 2 : 6) as KVCache
+                return MambaCache(
+                    slots: layer.ple == nil ? 2 : 6,
+                    persistentSlotCount: layer.ple == nil ? 2 : 4) as KVCache
             }
             return QSAKVCache() as KVCache
         }
@@ -1573,7 +1774,26 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
 
         guard input.image != nil || input.video != nil else {
             setRopeDelta(0, for: cache)
-            return .logits(LMOutput(logits: callAsFunction(inputIds, cache: cache)))
+            // Native MTP calls prepare directly, unlike the batch AR lane's
+            // outer segmentation. Honor the same prefill budget here so a
+            // cold or required-tool request cannot materialize a whole long
+            // prompt's expert activations and vocabulary logits at once.
+            let tokens = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
+            let step = windowSize ?? 512
+            let count = tokens.dim(1)
+            var offset = 0
+            if step > 0 {
+                while count - offset > step {
+                    try Task.checkCancellation()
+                    _ = forwardTokens(tokens[0..., offset..<(offset + step)], cache: cache)
+                    MLX.eval(cache)
+                    offset += step
+                    PrefillProgressReporter.reportCompletedUnits(offset)
+                    MLX.Memory.clearCache()
+                }
+            }
+            try Task.checkCancellation()
+            return .logits(LMOutput(logits: forwardTokens(tokens[0..., offset...], cache: cache)))
         }
 
         // Media arrived at a model that carries no vision tower. Refuse rather than embed the
@@ -1697,8 +1917,15 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        forwardTokens(inputs, cache: cache, autoregressive: true)
+    }
+
+    private func forwardTokens(
+        _ inputs: MLXArray, cache: [KVCache]?, autoregressive: Bool = false
+    ) -> MLXArray {
         let headInput = textModel(
-            inputs, cache: cache, positionOffset: ropeDelta(for: cache))
+            inputs, cache: cache, positionOffset: ropeDelta(for: cache),
+            autoregressive: autoregressive)
         return projectToLogits(headInput)
     }
 
@@ -1770,6 +1997,14 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         return NativeMTPForwardResult(
             logits: projectToLogits(forward.mixed),
             hiddenStates: forward.preMixer)
+    }
+
+    public func nativeAutoregressiveBackboneForward(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        let forward = textModel.forward(inputs, cache: cache, autoregressive: true)
+        return NativeMTPForwardResult(
+            logits: projectToLogits(forward.mixed), hiddenStates: forward.preMixer)
     }
 
     public func nativeBackboneMTPVerifyForward(

@@ -116,15 +116,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Index of the generation-suffix-stripped boundary in
     /// ``promptTokenIds`` — the last turn-start token, i.e. the end of the
     /// prompt with its trailing generation prompt removed. `nil` when it
-    /// does not apply (dense target, no turn-start token, tiers disabled).
+    /// does not apply (dense target, no turn-start token, tiers disabled, or
+    /// a topology that is neither hybrid nor a standalone rotating/SWA
+    /// cache).
     ///
-    /// For a hybrid target this is the ONLY reusable cross-turn
-    /// checkpoint: the next turn's prompt replaces the generation suffix,
-    /// so it never contains this turn's full prompt, and hybrid state is
-    /// path-dependent, so the full-prompt cache cannot be trimmed back.
-    /// Storing only the full prompt therefore stores a boundary no later
-    /// turn can match — measured as turn 2 re-prefilling all 14 of 14
-    /// tokens in `DFlash2PrefixCacheReuseTests` before this existed.
+    /// For hybrid and standalone rotating/SWA targets this is the reusable
+    /// cross-turn checkpoint: the next turn replaces the generation suffix,
+    /// so it never contains this turn's full prompt. The full-prompt cache
+    /// therefore cannot provide this growing-turn boundary.
     private var hybridStripBoundary: Int?
 
     /// Cache state at ``hybridStripBoundary``, captured DURING prefill as
@@ -428,14 +427,17 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let result = coordinator.fetch(
                 tokens: tokensToPrefill,
                 mediaSalt: mediaSalt,
-                preferredDiskBoundaries: input.cacheStablePrefixTokenCounts)
+                preferredDiskBoundaries: input.cacheStablePrefixTokenCounts,
+                chainId: parameters.cacheChainId)
             if case .hit(
-                let matchedTokens, let remainingTokens, _, let blocks, let ssmStates,
+                let matchedTokens, let remainingTokens, let detail, let blocks, let ssmStates,
                 let diskArrays) = result
             {
                 var restored = false
                 if !blocks.isEmpty {
-                    let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
+                    let restoredTokens = restoreLayerData(
+                        from: blocks, into: self.cache,
+                        preserveStandardKVStorageDType: coordinator.config.preserveStandardKVStorageDType)
                     coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
                         if let ssm = ssmStates {
@@ -444,13 +446,23 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         restored = true
                     }
                 }
+                // The target's cache is the one TokenIterator builds for this
+                // key (`newCache` over the same salted parameters; the
+                // drafter's cache is separate), so an entry that does not
+                // fit it fits neither, and is reported the same way.
                 if let diskArrays, !restored {
-                    if restoreFromDiskArrays(diskArrays, into: &self.cache) > 0 {
+                    if restoreFromDiskArrays(
+                                diskArrays, into: &self.cache, requirePromptBoundary: true) > 0 {
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: self.cache, boundary: matchedTokens)
                         }
                         MLX.eval(self.cache)
                         restored = true
+                    } else if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: tokensToPrefill, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "payload does not fit the runtime cache")
                     }
                 }
                 if restored, Self.traceEnabled {
@@ -499,7 +511,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             ? (config.slidingWindow.map { $0 - 1 })
             : nil
         // Same boundary rule as TokenIterator, so both iterators agree on
-        // what the canonical cross-turn checkpoint is.
+        // what the canonical cross-turn checkpoint is (hybrid SSM and
+        // standalone rotating/SWA topologies).
         self.hybridStripBoundary = TokenIterator.hybridStripBoundaryIndex(
             coordinator: cacheCoordinator,
             promptTokenIds: self.promptTokenIds,

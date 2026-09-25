@@ -519,7 +519,7 @@ private class VisionPatchEmbedder: Module {
         let patches = pixels.reshaped(B, C, H / p, p, W / p, p)
             .transposed(0, 2, 4, 3, 5, 1).reshaped(B, (H / p) * (W / p), C * p * p)
         let normalized = 2 * (patches - 0.5)
-        let embedded = inputProj(normalized.asType(inputProj.weight.dtype))
+        let embedded = inputProj(normalized.asType(inputProj.computeDType))
 
         let oh = oneHot(patchPos, numClasses: posEmbSize)
             .transposed(0, 2, 1, 3).asType(posTable.dtype)
@@ -653,7 +653,7 @@ private class UnifiedVisionEmbedder: Module {
             .transposed(0, 2, 4, 3, 5, 1)
             .reshaped(B, pH * pW, C * p * p)
         patches = patches[0..., ..<nReal, 0...]
-        var hidden = patchDense(patchNorm1(patches).asType(patchDense.weight.dtype))
+        var hidden = patchDense(patchNorm1(patches).asType(patchDense.computeDType))
         hidden = patchNorm2(hidden)
 
         var positions: [Int32] = []
@@ -1003,7 +1003,10 @@ private class TextModel: Module {
         if let ie = inputEmbedding {
             h = ie.ndim == 2 ? ie.expandedDimensions(axis: 0) : ie
         } else {
-            h = emb(inputs!) * MLXArray(sqrt(Float(cfg.hiddenSize)), dtype: emb.weight.dtype)
+            // In the rows' dtype, as `prepare` scales the prompt. `emb.weight.dtype` is the packed
+            // uint32 array once `embed_tokens` is quantized, which truncated the scale.
+            let rows = emb(inputs!)
+            h = rows * MLXArray(sqrt(Float(cfg.hiddenSize)), dtype: rows.dtype)
         }
 
         var pliList: [MLXArray?]
@@ -1639,10 +1642,9 @@ public struct Gemma4Processor: UserInputProcessor {
             throw VLMError.processing(
                 "Gemma4 processor currently supports image/audio inputs only; video is explicit unsupported until implemented and proven.")
         }
-        var messages = Gemma4MessageGenerator().generate(from: input)
-        if Self.requiresToolChoice(input.additionalContext) {
-            messages = Self.compactCompletedToolHistoryForRequiredChoice(messages)
-        }
+        // Tool selection does not change conversation history. In particular,
+        // every image part must stay aligned with input.images below.
+        let messages = Gemma4MessageGenerator().generate(from: input)
         let chatTemplateTools = MLXLMCommon.normalizedToolsForChatTemplate(input.tools)
         var tokens = try tokenizer.applyChatTemplate(
             messages: messages,
@@ -1925,125 +1927,6 @@ public struct Gemma4Processor: UserInputProcessor {
             padded = Array(padded.prefix(tokens * samplesPerToken))
         }
         return MLXArray(padded).reshaped(tokens, samplesPerToken)
-    }
-
-    private static func requiresToolChoice(_ context: [String: any Sendable]?) -> Bool {
-        guard let context else { return false }
-        if (context["tool_choice"] as? String) == "required" {
-            return true
-        }
-        if let name = context["tool_choice_name"] as? String,
-           !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            return true
-        }
-        return false
-    }
-
-    static func compactCompletedToolHistoryForRequiredChoice(_ messages: [MLXLMCommon.Message]) -> [MLXLMCommon.Message] {
-        guard let latestUserIndex = messages.lastIndex(where: {
-            let role = $0["role"] as? String
-            return role == "user" || role == "developer"
-        }) else {
-            return messages
-        }
-
-        let hasLaterAssistantAnswerBeforeLatestUser: (Int) -> Bool = { index in
-            guard index + 1 < latestUserIndex else { return false }
-            return messages[(index + 1)..<latestUserIndex].contains { message in
-                guard message["role"] as? String == "assistant" else { return false }
-                return !Self.messageContentString(message["content"])
-                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-        }
-
-        var compacted: [MLXLMCommon.Message] = []
-        compacted.reserveCapacity(messages.count)
-        var droppedToolNamesById: [String: String] = [:]
-        var summarizeDroppedToolResults = false
-
-        for (index, message) in messages.enumerated() {
-            if index >= latestUserIndex {
-                compacted.append(message)
-                continue
-            }
-
-            if message["role"] as? String == "user" {
-                continue
-            }
-
-            if message["role"] as? String == "assistant",
-               let toolCalls = message["tool_calls"] as? [[String: any Sendable]],
-               !toolCalls.isEmpty
-            {
-                droppedToolNamesById = Self.toolNamesById(from: toolCalls)
-                summarizeDroppedToolResults = !hasLaterAssistantAnswerBeforeLatestUser(index)
-
-                let content = Self.messageContentString(message["content"])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !content.isEmpty {
-                    var copy = message
-                    copy["tool_calls"] = nil
-                    compacted.append(copy)
-                }
-                continue
-            }
-
-            if message["role"] as? String == "tool",
-               let id = message["tool_call_id"] as? String,
-               let name = droppedToolNamesById[id]
-            {
-                if summarizeDroppedToolResults {
-                    compacted.append([
-                        "role": "assistant",
-                        "content": "Tool \(name) returned \(Self.messageContentString(message["content"])).",
-                    ])
-                }
-                continue
-            }
-
-            if message["role"] as? String != "tool" {
-                droppedToolNamesById.removeAll()
-                summarizeDroppedToolResults = false
-            }
-            compacted.append(message)
-        }
-
-        return compacted
-    }
-
-    private static func toolNamesById(from toolCalls: [[String: any Sendable]]) -> [String: String] {
-        var namesById: [String: String] = [:]
-        for call in toolCalls {
-            guard let id = call["id"] as? String else { continue }
-            if let name = call["name"] as? String {
-                namesById[id] = name
-            } else if let function = call["function"] as? [String: any Sendable],
-                      let name = function["name"] as? String
-            {
-                namesById[id] = name
-            }
-        }
-        return namesById
-    }
-
-    private static func messageContentString(_ content: Any?) -> String {
-        if let string = content as? String {
-            return string
-        }
-        if let parts = content as? [[String: any Sendable]] {
-            return parts.compactMap { part in
-                guard part["type"] as? String == "text" else { return nil }
-                return part["text"] as? String
-            }.joined(separator: "\n")
-        }
-        if let parts = content as? [[String: String]] {
-            return parts.compactMap { part in
-                guard part["type"] == "text" else { return nil }
-                return part["text"]
-            }.joined(separator: "\n")
-        }
-        return ""
     }
 }
 

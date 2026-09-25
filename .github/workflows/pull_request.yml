@@ -168,6 +168,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Linux Container CMake Swift Build - No Release
         run: |
@@ -190,6 +192,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Linux CUDA Setup
         run: |

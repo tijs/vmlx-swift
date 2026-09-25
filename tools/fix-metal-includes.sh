@@ -22,15 +22,19 @@ KERNELS_DIR="${CMLX_MLX_DIR}/${KERNELS_INCLUDE_PATH}"
 KERNEL_LIST=" \
 arg_reduce.metal \
 conv.metal \
-gemv.metal \
+dot.metal \
 layer_norm.metal \
 random.metal \
 rms_norm.metal \
 rope.metal \
+searchsorted.metal \
 scaled_dot_product_attention.metal \
 steel/attn/kernels/steel_attention.metal"
 
 # We fixup all the header files AND the listed kernel files
+# The optional MLX_METAL_FAST_SYNCH fence shader requires Metal 3.2; the
+# package still targets macOS14/iOS17. Keep the normal event synchronization
+# path and do not enable that experimental knob with this AOT library.
 HEADERS=$(find "${KERNELS_DIR}" -name "*.h")
 KERNELS=$(for file in ${KERNEL_LIST}; do  echo "${KERNELS_DIR}/${file}"; done)
 
@@ -73,15 +77,10 @@ for src in ${HEADERS} ${KERNELS}; do
     relative_path=${src#"$KERNELS_DIR"/}
     dest=${OUTPUT_DIR}/${relative_path}
 
-    # If destination file doesn't exist or if it's older than the source
-    # copy from source and replace the #include directives
-    if [ ! -e "$dest" ] || [ "$src" -nt "$dest" ]; then
-        echo "${src} -> ${dest}"
-        mkdir -p "$(dirname "${dest}")"
-        cp -p "${src}" "${dest}"
-    else
-        echo "Skipping $src (more recent destination)"
-    fi
+    # Git checkout timestamps are not source identities. Always regenerate
+    # from the pinned core so a newer destination cannot hide an old shader.
+    mkdir -p "$(dirname "${dest}")"
+    cp -p "${src}" "${dest}"
 
 done
 

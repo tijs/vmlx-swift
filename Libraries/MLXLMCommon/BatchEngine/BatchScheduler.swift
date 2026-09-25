@@ -19,6 +19,22 @@ enum SlotPhase {
 
 // MARK: - Active Slot
 
+/// Actor-confined ownership shared by BatchSlot value copies. Taking or
+/// discarding the state clears every alias, so a replaced replay seed cannot
+/// remain retained by the scheduler's older copy of the slot.
+final class BatchPrefillReplaySeed {
+    typealias State = (tokens: [Int], cache: [KVCache], canonicalChunkSize: Int?)
+    private var state: State?
+    init(tokens: [Int], cache: [KVCache], canonicalChunkSize: Int? = nil) {
+        state = (tokens, cache, canonicalChunkSize)
+    }
+    func takeSnapshot() -> State? {
+        defer { state = nil }
+        return state
+    }
+    func discard() { state = nil }
+}
+
 /// An active generation slot managed by ``BatchEngine``.
 ///
 /// Each slot represents one in-flight request. It owns its KV cache, sampler,
@@ -67,6 +83,10 @@ struct BatchSlot {
     /// disk-only topologies (currently DSV4 SWA + compressor/indexer pools)
     /// that cannot be losslessly trimmed after their rotating window wraps.
     var diskSeedSnapshot: [KVCache]?
+
+    /// Sealed, already-computed chunk boundary for this request's rotating
+    /// finalization replay. Bounded to one snapshot and cleared at completion.
+    var prefillReplaySeed: BatchPrefillReplaySeed?
 
     /// Token IDs that describe the cache snapshot at the prompt boundary.
     ///
@@ -208,6 +228,7 @@ extension BatchSlot {
         self.cache = cache
         self.promptCacheSnapshot = nil
         self.diskSeedSnapshot = nil
+        self.prefillReplaySeed = nil
         self.cachePromptTokenIds = request.input.text.tokens.reshaped(-1).asArray(Int.self)
         self.cachePromptUsesPostPrepareKey = false
         self.originalInput = request.input

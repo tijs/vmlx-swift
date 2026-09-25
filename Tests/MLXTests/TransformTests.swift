@@ -232,19 +232,43 @@ class TransformTests: XCTestCase {
 
         let bias = MLXArray(0)
 
-        // without capturing state this won't mutate the random state
-        let c1 = compile(f)
+        // Exercise actual compilation without enabling the process-wide unsafe
+        // policy. Public compile() is intentionally eager by default in this fork.
+        // Without captured state, the compiled random values stay constant.
+        let c1 = vmlxTrustedCompile { [f($0[0])] }
 
-        let c1a = c1(bias)
-        let c1b = c1(bias)
+        let c1a = c1([bias])[0]
+        let c1b = c1([bias])[0]
         XCTAssertTrue(allClose(c1a, c1b).item())
 
-        // now cature the random state and the random numbers should change per call
-        let c2 = compile(inputs: [MLXRandom.globalState], outputs: [MLXRandom.globalState], f)
+        // Captured random state must still advance on each compiled call.
+        let c2 = vmlxTrustedCompile(
+            inputs: [MLXRandom.globalState], outputs: [MLXRandom.globalState]
+        ) { [f($0[0])] }
 
-        let c2a = c2(bias)
-        let c2b = c2(bias)
+        let c2a = c2([bias])[0]
+        let c2b = c2([bias])[0]
         XCTAssertFalse(allClose(c2a, c2b).item())
+    }
+
+    func testPublicCompileHonorsOptInPolicy() {
+        let environment = ProcessInfo.processInfo.environment
+        let optIn = environment["VMLX_ENABLE_UNSAFE_COMPILE"]
+            ?? environment["MLXPRESS_ENABLE_UNSAFE_COMPILE"]
+            ?? environment["MLX_ENABLE_UNSAFE_COMPILE"]
+            ?? ""
+        let shouldCompile = environment["MLX_DISABLE_COMPILE"] == nil
+            && (optIn == "1" || optIn.lowercased() == "true")
+        var bodyCalls = 0
+        let function = compile { (x: MLXArray) -> MLXArray in
+            bodyCalls += 1
+            return x + 1
+        }
+        let input = MLXArray([Float(2), 3])
+        XCTAssertEqual(function(input).asArray(Float.self), [3, 4])
+        XCTAssertEqual(function(input).asArray(Float.self), [3, 4])
+        // One native trace when opted in; an ordinary call each time otherwise.
+        XCTAssertEqual(bodyCalls, shouldCompile ? 1 : 2)
     }
 
     func testCompilePerformance() {

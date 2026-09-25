@@ -40,12 +40,23 @@ int vmlx_group_size(VMLXGroup g) {
     return mlx_distributed_group_size(vmlx_grp(g));
 }
 VMLXGroup vmlx_group_init(bool strict, const char* backend) {
-    mlx_distributed_group g = mlx_distributed_init(strict, backend);
+    mlx_distributed_group g = {NULL};
+    if (mlx_distributed_init(&g, strict, backend) != 0) {
+        mlx_distributed_group_free(g);
+        return NULL;
+    }
     return g.ctx;
 }
 VMLXGroup vmlx_group_split(VMLXGroup g, int color, int key) {
-    mlx_distributed_group out = mlx_distributed_group_split(vmlx_grp(g), color, key);
+    mlx_distributed_group out = {NULL};
+    if (mlx_distributed_group_split(&out, vmlx_grp(g), color, key) != 0) {
+        mlx_distributed_group_free(out);
+        return NULL;
+    }
     return out.ctx;
+}
+void vmlx_group_free(VMLXGroup g) {
+    mlx_distributed_group_free(vmlx_grp(g));
 }
 bool vmlx_distributed_is_available(const char* backend) {
     return mlx_distributed_is_available(backend);

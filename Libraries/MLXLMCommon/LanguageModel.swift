@@ -213,13 +213,20 @@ public struct LMInput {
         /// re-encode cost on every turn.
         public let preEncodedEmbedding: MLXArray?
 
+        /// Lengths of independently encoded clips packed into `waveform`.
+        /// Nil represents one clip. Keeping boundaries is necessary for audio
+        /// tokenizers that reset positions and pad code groups per clip.
+        public let clipSampleCounts: [Int]?
+
         public init(
             waveform: MLXArray, sampleRate: Int = 16_000,
-            preEncodedEmbedding: MLXArray? = nil
+            preEncodedEmbedding: MLXArray? = nil,
+            clipSampleCounts: [Int]? = nil
         ) {
             self.waveform = waveform
             self.sampleRate = sampleRate
             self.preEncodedEmbedding = preEncodedEmbedding
+            self.clipSampleCounts = clipSampleCounts
         }
     }
 
@@ -451,6 +458,16 @@ public protocol VisionLanguageModelProtocol: LanguageModel {}
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
 public protocol LanguageModel: Module {
 
+    /// Whether the checkpoint's floating-point parameter dtypes are part of
+    /// this runtime's numerical contract. Such models own their activation
+    /// casts and must not receive the loader's blanket BF16 materialization.
+    var preservesCheckpointParameterDTypes: Bool { get }
+
+    /// Whether the entire forward can be traced by the generic MLX compiler.
+    /// Host routing or file-backed row selection may require eager scheduling
+    /// even when individual device kernels support compilation.
+    var supportsWholeForwardCompilation: Bool { get }
+
     /// Maximum number of sequences this architecture can decode in one
     /// model forward. `nil` means the architecture supports the batch
     /// engine's configured width. Models with path-dependent cache state that
@@ -472,6 +489,20 @@ public protocol LanguageModel: Module {
 
     /// Models may implement this simplified interface if they do not produce any ``LMOutput/State``
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
+
+    /// Token-only forward used OUTSIDE generation to rebuild recurrent (SSM / linear-attention)
+    /// state by replaying prompt tokens into a fresh cache — the SSD-cache store's boundary
+    /// re-derivation (`reDeriveSSMStatesAtBoundaries`).
+    ///
+    /// Unlike the generation forwards this one may throw. A replay that fails must abort the
+    /// store so nothing built from a partial or substituted forward is published as a
+    /// legitimate snapshot. The default forwards to the generation path, which is exact for
+    /// every model whose forward cannot fail; a model whose forward CAN fail and currently
+    /// substitutes an output on the generation path (GLM-5.3: stderr + zero logits) must
+    /// override this and throw instead. That substitution itself, and the validity of an inline
+    /// live-cache capture taken after a substituted generation, remain UNRESOLVED — this
+    /// contract only keeps such a forward out of the replay store.
+    func replayForward(_ tokens: MLXArray, cache: [KVCache]?) throws -> MLXArray
 
     /// create a new array of ``KVCache`` -- automatic implementation if self
     /// implements ``KVCacheDimensionProvider``
@@ -496,6 +527,9 @@ public protocol LanguageModel: Module {
 }
 
 extension LanguageModel {
+    public var preservesCheckpointParameterDTypes: Bool { false }
+    public var supportsWholeForwardCompilation: Bool { true }
+
     /// Most standard-attention and wrapped recurrent-cache architectures use
     /// the batch engine's configured width.
     public var maximumSupportedDecodeBatchSize: Int? { nil }
@@ -509,6 +543,14 @@ extension LanguageModel {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         fatalError("callAsFunction(inputs:cache:) not implemented for \(Self.self)")
+    }
+
+    /// Default replay = the generation contract. Vision-language models implement the
+    /// `LMInput.Text` overload and plain LLMs the token overload; either way this reaches the
+    /// model's own forward and never the trapping default above unless the model implements
+    /// neither — which is a programming error the type system cannot express here.
+    public func replayForward(_ tokens: MLXArray, cache: [KVCache]?) throws -> MLXArray {
+        callAsFunction(LMInput.Text(tokens: tokens), cache: cache, state: nil).logits
     }
 }
 

@@ -162,19 +162,33 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             switch coordinator.fetch(
                 tokens: promptTokenIds,
                 mediaSalt: mediaSalt,
-                preferredDiskBoundaries: input.cacheStablePrefixTokenCounts
+                preferredDiskBoundaries: input.cacheStablePrefixTokenCounts,
+                chainId: parameters.cacheChainId
             ) {
-            case .hit(let matchedTokens, let remainingTokens, _, let blocks, _, let diskArrays):
+            case .hit(
+                let matchedTokens, let remainingTokens, let detail, let blocks, _,
+                let diskArrays):
                 var restored = false
                 if !blocks.isEmpty {
-                    let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
+                    let restoredTokens = restoreLayerData(
+                        from: blocks, into: self.cache,
+                        preserveStandardKVStorageDType: coordinator.config.preserveStandardKVStorageDType)
                     coordinator.release(blocks: blocks)
                     restored = restoredTokens > 0
                 }
+                // The cache is `newCache` over the same salted parameters as
+                // for any other consumer of this key: an entry that does not
+                // fit it fits none of them, and is reported the same way.
                 if !restored, let diskArrays {
-                    restored = restoreFromDiskArrays(diskArrays, into: &self.cache) > 0
+                    restored = restoreFromDiskArrays(
+                                diskArrays, into: &self.cache, requirePromptBoundary: true) > 0
                     if restored {
                         MLX.eval(self.cache)
+                    } else if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: promptTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "payload does not fit the runtime cache")
                     }
                 }
                 // Validate the restore: every layer must sit exactly at the
@@ -206,6 +220,15 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                                 detail: "diffusion"))
                     }
                 } else if restored {
+                    // This path applies no recurrent companion state, so for
+                    // a cache that has such layers the refusal may be this
+                    // path's and not the entry's: said only when it has none.
+                    if detail == .disk, !cacheContainsPathDependentState(self.cache) {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: promptTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "restored offsets do not match the boundary")
+                    }
                     self.cache = model.newCache(parameters: parameters)
                     tokensToEncode = promptTokenIds
                 }

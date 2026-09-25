@@ -26,11 +26,18 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
 endif()
 
-# mlx-c
+# Use the same checked-out core/C ABI as SwiftPM. A stock mlx-c release
+# omits the fork's mmap and compiler-cache lifetime entry points.
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx/CMakeLists.txt" OR
+   NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx-c/CMakeLists.txt")
+  message(FATAL_ERROR "Initialize the pinned dependencies with git submodule update --init --recursive")
+endif()
+FetchContent_Declare(
+  mlx
+  SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx")
 FetchContent_Declare(
   mlx-c
-  GIT_REPOSITORY "https://github.com/ml-explore/mlx-c.git"
-  GIT_TAG "v0.6.0")
+  SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx-c")
 FetchContent_MakeAvailable(mlx-c)
 
 # swift-numerics
@@ -70,6 +77,10 @@ target_include_directories(MLX
 # Note: mlxc is target name exported by mlx-c
 target_link_libraries(MLX PUBLIC mlxc Numerics)
 target_compile_options(MLX PRIVATE -package-name MLX)
+if(NOT MLX_BUILD_METAL)
+  # The macOS SDK can import Metal even when this target excludes GPU+Metal.
+  target_compile_options(MLX PRIVATE -DMLX_SWIFT_NO_METAL)
+endif()
 
 # MLXRandom package
 file(GLOB MLXRandom-src ${CMAKE_CURRENT_LIST_DIR}/Source/MLXRandom/*.swift)

@@ -34,6 +34,18 @@ mlx_stream mlx_stream_new(void);
  */
 mlx_stream mlx_stream_new_device(mlx_device dev);
 /**
+ * Returns a new stream on a device that can be used from any thread.
+ *
+ * Streams are otherwise thread affine: a stream's GPU command encoder is
+ * registered per thread, so evaluating on a stream from a thread other than
+ * the one that created it fails. Streams returned here are registered
+ * globally instead.
+ *
+ * MLX applies no synchronization to these streams -- it is the caller's
+ * responsibility to ensure there are no data races on them.
+ */
+mlx_stream mlx_stream_new_thread_unsafe(mlx_device dev);
+/**
  * Set stream to provided src stream.
  */
 int mlx_stream_set(mlx_stream* stream, const mlx_stream src);
@@ -69,16 +81,9 @@ int mlx_get_default_stream(mlx_stream* stream, mlx_device dev);
  * Set default stream.
  */
 int mlx_set_default_stream(mlx_stream stream);
-/**
- * Run a callback with a dedicated stream as the default.
- * Sets the given stream as default, calls callback(context),
- * then restores the original default stream.
- * All MLX ops inside the callback use the given stream.
- */
-int mlx_stream_run_with(
-    mlx_stream stream,
-    void (*callback)(void* context),
-    void* context);
+/* Run synchronously with this stream as the default for its device on the
+ * current thread, restoring that device's prior stream even on exceptions. */
+int mlx_stream_run_with(mlx_stream stream, void (*callback)(void*), void* context);
 /**
  * Returns the current default CPU stream.
  */

@@ -718,7 +718,7 @@ public actor WiredMemoryManager {
         }
         if !WiredMemoryBackend.isSupported && configuration.useRecommendedWorkingSetWhenUnsupported
         {
-            #if canImport(Metal)
+            #if canImport(Metal) && !MLX_SWIFT_NO_METAL
                 if let recommended = GPU.maxRecommendedWorkingSetBytes() {
                     return recommended
                 }

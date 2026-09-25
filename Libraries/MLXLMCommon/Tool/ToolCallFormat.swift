@@ -36,6 +36,15 @@ public protocol ToolCallParser: Sendable {
     /// Prefixes for dynamic end tags matching ``startTagPrefixes``.
     var endTagPrefixes: [String] { get }
 
+    /// Opt-in boundary scanning for formats whose values can contain literal
+    /// closing tags (for example XML CDATA). Other formats keep tag matching.
+    var usesCustomEndBoundary: Bool { get }
+    func completeToolCallEnd(in content: String) -> String.Index?
+
+    /// Inline text/tool dialects retain even a whitespace-only chunk before
+    /// a call; otherwise detokenizer chunk boundaries change the answer text.
+    var preservesWhitespaceBeforeToolCalls: Bool { get }
+
     /// Exact protocol CLOSER tags that must be stripped from the visible
     /// stream even when they appear WITHOUT a matching opener ("orphan
     /// closers"). Live rows of some families (ZAYA / Gemma-4 AppleScript
@@ -102,6 +111,10 @@ extension ToolCallParser {
 
     public var endTagPrefixes: [String] { [] }
 
+    public var usesCustomEndBoundary: Bool { false }
+    public func completeToolCallEnd(in content: String) -> String.Index? { nil }
+    public var preservesWhitespaceBeforeToolCalls: Bool { false }
+
     public var orphanStripTags: [String] { [] }
 
     public func isValidPartialContent(_ toolCallBuffer: String) -> Bool {
@@ -153,6 +166,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case xmlFunction = "xml_function"
 
+    /// MiMo XML transport preserves literal parameter string bytes.
+    case mimo
+
     /// StepFun Step 3.5 / 3.7 XML-function format plus the observed
     /// schema-gated bare `name({"arg": ...})` live fallback.
     case step
@@ -181,6 +197,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// MiniMax M2 format with invoke/parameter tags.
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
+
+    /// MiniCPM5: `<function name="f"><param name="x">v</param></function>`.
+    case minicpm5 = "minicpm5_xml_function"
 
     /// Mistral V11+ format with [TOOL_CALLS] and [ARGS] delimiters.
     /// Example: `[TOOL_CALLS]get_weather [ARGS]{"location": "Tokyo"}`
@@ -233,6 +252,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return LFM2ToolCallParser()
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .mimo:
+            return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>",
+                                     preservesLiteralStringValues: true)
         case .step:
             return StepToolCallParser()
         case .nemotron:
@@ -247,6 +269,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return KimiK2ToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
+        case .minicpm5:
+            return MiniCPM5ToolCallParser()
         case .mistral:
             return MistralToolCallParser()
         case .llama3:
@@ -272,8 +296,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// formats because the parser only accepts explicit protocol envelopes.
     public var parsesToolCallsFromReasoningChannel: Bool {
         switch self {
-        case .dsml:
-            // The official DSV4 contract places complete reasoning inside
+        case .dsml, .minicpm5:
+            // These contracts place complete reasoning inside
             // <think>...</think> before any tool call. Tool-shaped examples or
             // malformed protocol text inside reasoning_content are therefore
             // reasoning, never executable transport.
@@ -354,6 +378,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         }
 
         // GLM/GLM-style families (glm4, glm4_moe, glm5, glm47, GPT-OSS).
+        if compact == "spark25" {
+            return .glm4
+        }
         if compact.hasPrefix("glm4")
             || compact.hasPrefix("glm5")
             || compact.hasPrefix("glm47")
@@ -398,7 +425,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             || normalized.hasPrefix("mimo_v2_")
             || compact.hasPrefix("mimov2")
         {
-            return .xmlFunction
+            return .mimo
         }
 
         // Nemotron family (nemotron_h, etc.)
@@ -526,16 +553,24 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     ///
     /// Returns `nil` when the name is unknown or empty — callers should
     /// fall back to `infer(from: model_type)`.
-    public static func fromCapabilityName(_ name: String?) -> ToolCallFormat? {
+    public static func fromCapabilityName(_ name: String?, modelType: String? = nil) -> ToolCallFormat? {
         guard let name, !name.isEmpty else { return nil }
         let n = name.lowercased()
         let normalized = normalizedAlias(n)
         let compact = compactAlias(n)
 
+        // Spark2.5 declares the GLM arg_key/arg_value wire grammar by this name.
+        if compact == "spark25" { return .glm4 }
+
         // Direct rawValue match first (e.g. "xml_function", "minimax_m2").
         if let direct = ToolCallFormat(rawValue: n)
             ?? ToolCallFormat(rawValue: normalized)
         {
+            // Older MiMo bundles stamp the shared XML envelope name. Resolve
+            // its string dialect from the declared architecture, not its filename.
+            if direct == .xmlFunction, let modelType, infer(from: modelType) == .mimo {
+                return .mimo
+            }
             return direct
         }
 
@@ -605,7 +640,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             || normalized.hasPrefix("mimo_v2_")
             || compact.hasPrefix("mimov2")
         {
-            return .xmlFunction
+            return .mimo
         }
 
         if compact.hasPrefix("nemotron") {
@@ -627,7 +662,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // Qwen 3.5 / 3.6 family — XML-style <tool_call>…</tool_call>
         // (vLLM ecosystem names `qwen3_coder` / `qwen3_coder_xml` aliased here).
         case "qwen", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
-            "qwen3_coder", "qwen3_coder_xml", "mimo", "mimo_v2", "mimo_v2_flash":
+            "qwen3_coder", "qwen3_coder_xml":
             return .xmlFunction
         // StepFun Step 3.5 / 3.7 parser aliases. JANG
         // Step 3.7 VLM bundles stamp `tool_parser = "step3p5"` because the
@@ -639,6 +674,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // `minimax_m2_5` per the converter.
         case "minimax", "minimax_m2_5":
             return .minimaxM2
+        case "minicpm5":
+            return .minicpm5
         // GLM 4.x / 5 / DeepSeek tool format (arg_key / arg_value tags).
         // `glm4` is also the canonical rawValue and already matches via
         // the direct lookup above, but is listed here for parity with

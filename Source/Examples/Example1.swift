@@ -31,14 +31,18 @@ struct Example1 {
 
         let specifiedDevice = getDeviceFromArgs()
 
-        let defaultDevice: Device
-        #if os(Linux)
-            defaultDevice = .cpu
-        #else
-            defaultDevice = .gpu
-        #endif
-
-        let selectedDevice = specifiedDevice ?? defaultDevice
+        // Do not initialize the GPU device when --device cpu was supplied:
+        // creating its default stream requires an actual GPU backend.
+        let selectedDevice: Device
+        if let specifiedDevice {
+            selectedDevice = specifiedDevice
+        } else {
+            #if os(Linux)
+                selectedDevice = .cpu
+            #else
+                selectedDevice = .gpu
+            #endif
+        }
 
         print("Using device: \(selectedDevice).")
 

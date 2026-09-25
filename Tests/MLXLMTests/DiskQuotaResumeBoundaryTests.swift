@@ -1,0 +1,188 @@
+import Foundation
+import Testing
+
+@testable import MLXLMCommon
+
+/// Which row of a conversation survives pressure decides whether its next
+/// turn is warm. On templates that re-render the assistant turn (Qwen,
+/// Nanbeige, Ling) only the history boundary — the prompt cut just before
+/// the last user message — ever matches the next prompt; the exact-prompt and
+/// post-answer rows never do. Measured live: a chat kept its two useless rows
+/// and lost the one useful one, and reused 3 308 of 6 258 tokens instead of
+/// 4 164. These numbers are that run's.
+@Suite("Disk quota planner: resume boundaries")
+struct DiskQuotaResumeBoundaryTests {
+
+    private func row(
+        _ id: String, tokens: Int, bytes: Int64? = nil, recency: Double, chain: String? = "A",
+        stable: Bool = false, resume: Bool = false, post: Bool = false
+    ) -> QuotaRow {
+        QuotaRow(
+            id: id, tokenCount: tokens, bytes: bytes ?? Int64(tokens), recency: recency,
+            isStableRoot: stable, isResumeBoundary: resume, isPostAnswer: post, chainId: chain,
+            isLegacyCompanion: false)
+    }
+
+    /// The live turn: roots 2 074 and 3 308, history boundary 4 164, exact
+    /// prompt 4 171, post-answer 4 191; the cap holds four of the five.
+    @Test
+    func theHistoryBoundaryOutlivesTheExactPromptAndThePostAnswerRow() throws {
+        let rows = [
+            row("root-a", tokens: 2_074, recency: 1, chain: nil, stable: true),
+            row("root-b", tokens: 3_308, recency: 2, chain: nil, stable: true),
+            row("history", tokens: 4_164, recency: 3, resume: true),
+            row("exact", tokens: 4_171, recency: 4),
+            row("post", tokens: 4_191, recency: 5),
+        ]
+        let total = rows.reduce(Int64(0)) { $0 + $1.bytes }
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: total - 1, activeChain: "A")
+        try #require(!plan.evict.isEmpty, "the cap must have forced an eviction")
+        #expect(!plan.evict.contains("history"), "the one row the next turn hits survived")
+        #expect(plan.evict.first == "exact", "the smallest row with no future goes first")
+        #expect(plan.event == nil, "spending rows the next turn never reads is not pressure")
+    }
+
+    /// Under harder pressure the order within the chat is: rows with no
+    /// future (shortest first), then older history boundaries, and the newest
+    /// history boundary last — it is the chat's resume point, not the largest row.
+    @Test
+    func theNewestHistoryBoundaryIsTheResumePointNotTheLargestRow() throws {
+        let rows = [
+            row("h1", tokens: 4_164, recency: 1, resume: true),
+            row("exact1", tokens: 4_171, recency: 2),
+            row("h2", tokens: 6_251, recency: 3, resume: true),
+            row("exact2", tokens: 6_258, recency: 4),
+            row("post2", tokens: 6_277, recency: 5),
+        ]
+        // Room for the resume point and nothing else.
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 6_300, activeChain: "A")
+        try #require(plan.evict.count == 4)
+        #expect(plan.evict == ["exact1", "exact2", "post2", "h1"])
+        #expect(!plan.evict.contains("h2"))
+        #expect(plan.event?.kind == .activeChainTrimmed)
+    }
+
+    /// A cold conversation keeps its history boundary as the row that goes
+    /// last too, so coming back to it is warm.
+    @Test
+    func aColdChatsResumePointIsItsHistoryBoundary() throws {
+        let rows = [
+            row("cold-h", tokens: 4_164, recency: 1, chain: "C", resume: true),
+            row("cold-post", tokens: 4_191, recency: 2, chain: "C"),
+            row("active-h", tokens: 8_001, recency: 9, chain: "A", resume: true),
+        ]
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 12_500, activeChain: "A")
+        try #require(plan.evict == ["cold-post"], "\(plan.evict)")
+    }
+
+    /// Without any resume boundary marked, nothing changes: the largest row is
+    /// still the tip and the order is what it was.
+    @Test
+    func chainsWithoutResumeBoundariesOrderExactlyAsBefore() throws {
+        let rows = [
+            row("a1", tokens: 37, recency: 1),
+            row("a2", tokens: 101, recency: 2),
+            row("a3", tokens: 149, recency: 3),
+        ]
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 200, activeChain: "A")
+        #expect(plan.evict == ["a1", "a2"])
+    }
+
+    /// The row the plan protects and the row the confirmed event is judged by
+    /// must be the same one. A chain's resume point is its newest resume
+    /// boundary even when a larger unmarked row exists; if the larger row's
+    /// delete is the one that failed, no progress was lost, and if the resume
+    /// point's delete succeeded, it was — whatever happened to the larger row.
+    @Test
+    func theConfirmedEventJudgesTheResumePointNotTheLargestRow() throws {
+        let rows = [
+            row("history", tokens: 4_164, bytes: 4_164, recency: 3, resume: true),
+            row("post", tokens: 4_191, bytes: 4_191, recency: 5),
+        ]
+        #expect(DiskQuotaPlanner.resumePoint(of: rows)?.id == "history")
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 4_000, activeChain: "A")
+        try #require(plan.event?.kind == .activeTipDropped)
+        #expect(plan.event?.tipBytes == 4_164, "the dropped tip is the resume point")
+        #expect(
+            plan.confirmedEvent(rows: rows, lostRows: ["post"]) == nil,
+            "the larger row going is not the resume point going")
+        #expect(plan.confirmedEvent(rows: rows, lostRows: ["history"])?.kind == .activeTipDropped)
+    }
+
+    /// Once a model has been seen to resume from post-answer rows, the
+    /// newest one is the tip — but whether it matches the next prompt is a
+    /// property of each answer's tokenization (seen live: MiniCPM turn 4 and
+    /// Gemma turn 2 fell through to the history boundary). The boundary of the
+    /// same turn is therefore kept beside it: the exact-prompt row and the
+    /// older boundaries go first, and both rows of the last turn survive.
+    @Test
+    func theHistoryBoundaryStaysBesideALearnedPostAnswerTip() throws {
+        let rows = [
+            row("root", tokens: 3_576, recency: 1, chain: nil, stable: true),
+            row("h1", tokens: 6_401, recency: 2, resume: true),
+            row("post1", tokens: 6_485, recency: 3, resume: true, post: true),
+            row("h2", tokens: 8_061, recency: 4, resume: true),
+            row("exact2", tokens: 8_064, recency: 5),
+            row("post2", tokens: 8_145, recency: 6, resume: true, post: true),
+        ]
+        // Room for the root and the last turn's two rows, and for nothing else.
+        let plan = DiskQuotaPlanner.plan(
+            rows: rows, capBytes: 3_576 + 8_061 + 8_145 + 10, activeChain: "A")
+        #expect(Set(plan.evict) == ["exact2", "h1", "post1"])
+        #expect(!plan.evict.contains("h2"), "the boundary that always matches survives")
+        #expect(!plan.evict.contains("post2"), "so does the likely resume point")
+        #expect(
+            plan.event?.kind == .activeChainTrimmed,
+            "older boundaries of the active chat are restore points; losing them is a trim, as before"
+        )
+    }
+
+    /// With room for one row of the conversation, the post-answer tip yields
+    /// to the history boundary: the certain row is the last to go. That is a
+    /// trim of the active chain, and reported as one.
+    @Test
+    func withRoomForOneRowTheCertainBoundaryOutlivesThePostAnswerTip() throws {
+        let rows = [
+            row("root", tokens: 3_576, recency: 1, chain: nil, stable: true),
+            row("h2", tokens: 8_061, recency: 4, resume: true),
+            row("post2", tokens: 8_145, recency: 6, resume: true, post: true),
+        ]
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 8_145 + 10, activeChain: "A")
+        #expect(
+            plan.evict == ["root", "post2"], "the shared root and then the tip, never the boundary")
+        #expect(plan.event?.kind == .activeChainTrimmed)
+        #expect(plan.event?.tipBytes == 8_145, "judged against the resume point that was lost")
+    }
+
+    /// Before the lesson a post-answer row is disposable, and nothing above
+    /// changes: it is the first row spent, and the boundary is the tip.
+    @Test
+    func anUnlearnedPostAnswerRowIsStillSpentFirst() throws {
+        let rows = [
+            row("h2", tokens: 8_061, recency: 4, resume: true),
+            row("exact2", tokens: 8_064, recency: 5),
+            row("post2", tokens: 8_145, recency: 6, post: true),
+        ]
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 8_061 + 8_064 + 10, activeChain: "A")
+        #expect(plan.evict == ["exact2", "post2"] || plan.evict == ["post2"])
+        #expect(!plan.evict.contains("h2"))
+        #expect(plan.event == nil)
+    }
+
+    /// A cold conversation's fallback boundary is ordinary superseded weight:
+    /// it pays for the low watermark before any active row does.
+    @Test
+    func aColdChainsFallbackIsSpentBeforeTheActiveChainsRows() throws {
+        let rows = [
+            row("cold-h", tokens: 5_000, recency: 1, chain: "B", resume: true),
+            row("cold-post", tokens: 5_050, recency: 2, chain: "B", resume: true, post: true),
+            row("h", tokens: 8_061, recency: 4, resume: true),
+            row("post", tokens: 8_145, recency: 6, resume: true, post: true),
+        ]
+        let plan = DiskQuotaPlanner.plan(
+            rows: rows, capBytes: 5_050 + 8_061 + 8_145 + 10, activeChain: "A")
+        #expect(plan.evict.first == "cold-h")
+        #expect(!plan.evict.contains("h"))
+        #expect(!plan.evict.contains("post"))
+    }
+}

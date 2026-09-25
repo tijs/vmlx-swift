@@ -64,8 +64,6 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/cpu/gemms/bnns.cpp",  // macOS Accelerate version
         "mlx-conditional",
         "mlx-c/mlx/c/metal.cpp",
-
-        "mlx-c/mlx/c/fast.cpp",  // Exclude on Linux - calls metal_kernel unconditionally
     ]
 
     let cxxSettings: [CXXSetting] = []
@@ -80,12 +78,11 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
     let mlxSwiftExcludes: [String] = [
         "GPU+Metal.swift",
         "MLXArray+Metal.swift",
-        "MLXFast.swift",
-        "MLXFastKernel.swift",
     ]
 #else
     let platformExcludes: [String] = [
         "mlx/mlx/backend/cpu/compiled.cpp",
+        "mlx/mlx/backend/cpu/jit_compiler.cpp",
 
         // opt-out of these backends (using metal)
         "mlx/mlx/backend/no_gpu",
@@ -236,8 +233,10 @@ let cmlx = Target.target(
         "mlx/mlx/backend/cuda/delayload.cpp",
         "mlx/mlx/backend/cuda/device_info.cpp",
         "mlx/mlx/backend/cuda/device.cpp",
+        "mlx/mlx/backend/cuda/dirs.cpp",
         "mlx/mlx/backend/cuda/eval.cpp",
         "mlx/mlx/backend/cuda/fence.cpp",
+        "mlx/mlx/backend/cuda/fft.cu",
         "mlx/mlx/backend/cuda/indexing.cpp",
         "mlx/mlx/backend/cuda/jit_module.cpp",
         "mlx/mlx/backend/cuda/load.cpp",
@@ -271,11 +270,8 @@ let cmlx = Target.target(
         "mlx/mlx/distributed/mpi/mpi.cpp",
         "mlx/mlx/distributed/ring/ring.cpp",
         "mlx/mlx/distributed/nccl/nccl.cpp",
-        "mlx/mlx/distributed/nccl/nccl_stub",
         "mlx/mlx/distributed/jaccl/jaccl.cpp",
-        "mlx/mlx/distributed/jaccl/mesh.cpp",
-        "mlx/mlx/distributed/jaccl/ring.cpp",
-        "mlx/mlx/distributed/jaccl/utils.cpp",
+        "mlx/mlx/distributed/jaccl/lib",
     ],
     cSettings: [
         .headerSearchPath("mlx"),
@@ -286,7 +282,7 @@ let cmlx = Target.target(
         .headerSearchPath("mlx-c"),
         .headerSearchPath("json/single_include/nlohmann"),
         .headerSearchPath("fmt/include"),
-        .define("MLX_VERSION", to: "\"0.31.1\""),
+        .define("MLX_VERSION", to: "\"0.32.2\""),
     ],
     linkerSettings: linkerSettings
 )
@@ -506,7 +502,7 @@ let package = Package(
         ),
         .target(
             name: "MLXLLM",
-            dependencies: ["MLXLMCommon", "MLX", "MLXNN", "MLXOptimizers"],
+            dependencies: ["MLXLMCommon", "MLX", "MLXNN", "MLXOptimizers", "CmlxGraphShim"],
             path: "Libraries/MLXLLM",
             exclude: ["README.md", "Models/DSV4-PORT-STATUS.md"]
         ),
@@ -830,6 +826,8 @@ let package = Package(
             resources: [
                 .process("Resources/1080p_30.mov"),
                 .process("Resources/audio_only.mov"),
+                .copy("Resources/modernbert-tiny.safetensors"),
+                .copy("Resources/modernbert-tiny.json"),
             ]
         ),
         .testTarget(
@@ -849,6 +847,8 @@ let package = Package(
             sources: [
                 "ProposalHeadStampTests.swift",
                 "NativeMTPARSafetyTests.swift",
+                "NativeMTPDepthPolicyTests.swift",
+                "NativeMTPDepthExecutionTests.swift",
                 "RaptorTopLevelStampTests.swift",
                 "HybridRestoreBoundaryInvariantTests.swift",
                 "DualPathFamiliesTests.swift",
@@ -868,6 +868,8 @@ let package = Package(
                 "DeepseekV4DropThinkingCacheTests.swift",
                 "DeepseekV4AgentLoopBoundaryTests.swift",
                 "EarlyCompletionBeforeCachePersistTests.swift",
+                "AuxiliaryPrefillSeedTests.swift",
+                "GenerationActivityTests.swift",
                 "ToolCallProgressRoutingTests.swift",
                 "ModelConstructionPlanTests.swift",
                 "FocusedMLXTestSupport.swift",
@@ -887,6 +889,7 @@ let package = Package(
                 "BatchEngineGrowingChatCacheSourceTests.swift",
                 "ProcessorPatchSizeShapeTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
+                "NativeDiskDurabilityTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",
                 "ExpertDownProjectionQuantOrderTests.swift",
                 "VMLXUmbrellaProductTests.swift",

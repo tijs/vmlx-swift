@@ -9,6 +9,18 @@ import os
 /// the cross-store snapshot/eviction decision.
 private enum CombinedDiskCacheQuotaLock {
     static let shared = OSAllocatedUnfairLock()
+
+    /// Cache roots whose companion directory this process has imported into
+    /// the index with a COMMITTED import. A root whose import was skipped is
+    /// not in here, so the next coordinator on it — and the quota pass of
+    /// every coordinator already on it — tries again. Read and written only
+    /// while `shared` is held.
+    nonisolated(unsafe) static var importedRoots = Set<String>()
+
+    /// When an import of a root last failed to commit. Only roots that are
+    /// not in `importedRoots` have an entry. Paces the quota pass's retry;
+    /// same lock.
+    nonisolated(unsafe) static var lastUncommittedImport: [String: Date] = [:]
 }
 
 // MARK: - CacheDetail
@@ -82,8 +94,26 @@ public final class CacheCoordinator: @unchecked Sendable {
 
     // MARK: - Properties
 
-    /// The configuration used to create this coordinator.
-    public let config: CacheCoordinatorConfig
+    private let initialConfig: CacheCoordinatorConfig
+
+    /// Creation settings with the current shared disk quota. A live size
+    /// change must be visible to callers reporting the active runtime policy.
+    public var config: CacheCoordinatorConfig {
+        var current = initialConfig
+        if let diskCache {
+            current.diskCacheMaxGB = Float(Double(diskCache.maxSizeBytes) / 1_073_741_824)
+        }
+        return current
+    }
+
+    /// Applies to every resident coordinator on this root without unloading
+    /// models. Raises take effect immediately; decreases are enforced on the
+    /// next serialized store, so a settings edit never deletes synchronously.
+    public func updateDiskCap(bytes: Int) {
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+        diskCache?.updateMaxSizeBytes(bytes)
+    }
 
     /// The in-memory paged KV cache, or `nil` if disabled.
     public let pagedCache: PagedCacheManager?
@@ -152,6 +182,14 @@ public final class CacheCoordinator: @unchecked Sendable {
     private var postPrepareAliases: [PostPrepareCacheKeyAlias: [Int]] = [:]
     private var postPrepareAliasCountsBySalt: [String: Set<Int>] = [:]
 
+    /// Pacing of the import retry; see ``retryCompanionImportIfDueLocked``.
+    private let importRetryInterval: TimeInterval
+    private let now: @Sendable () -> Date
+
+    /// The disk cache root as `importedRoots` keys it, computed once: the
+    /// quota pass looks it up on every store.
+    private let diskRootKey: String?
+
     // MARK: - Initialization
 
     /// Creates a new cache coordinator.
@@ -159,8 +197,29 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// Sub-caches are instantiated based on the configuration flags.
     ///
     /// - Parameter config: The cache configuration to use.
-    public init(config: CacheCoordinatorConfig = CacheCoordinatorConfig()) {
-        self.config = config
+    public convenience init(config: CacheCoordinatorConfig = CacheCoordinatorConfig()) {
+        self.init(config: config, diskIndexBusyTimeoutMs: DiskCache.defaultIndexBusyTimeoutMs)
+    }
+
+    /// How long a quota pass waits before it tries an import that did not
+    /// commit again. See ``retryCompanionImportIfDueLocked``.
+    static let defaultImportRetryInterval: TimeInterval = 60
+
+    /// `diskIndexBusyTimeoutMs` is how long the disk index waits for another
+    /// connection's write lock, and `diskIndexMigrationBusyTimeoutMs` how
+    /// long its migration does. Production always uses the defaults; a test
+    /// that holds the lock on purpose passes short ones. `importRetryInterval`
+    /// and `now` pace the retry of an import that did not commit; a test
+    /// passes its own clock instead of sleeping.
+    init(
+        config: CacheCoordinatorConfig, diskIndexBusyTimeoutMs: Int32,
+        diskIndexMigrationBusyTimeoutMs: Int32 = DiskCacheIndexSchema.defaultBusyTimeoutMs,
+        importRetryInterval: TimeInterval = CacheCoordinator.defaultImportRetryInterval,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.initialConfig = config
+        self.importRetryInterval = importRetryInterval
+        self.now = now
 
         if config.usePagedCache {
             self.pagedCache = PagedCacheManager(
@@ -176,10 +235,17 @@ public final class CacheCoordinator: @unchecked Sendable {
             let dir = config.diskCacheDir
                 ?? FileManager.default.temporaryDirectory
                     .appendingPathComponent("vmlx_disk_cache")
-            self.diskCache = DiskCache(cacheDir: dir, maxSizeGB: config.diskCacheMaxGB, modelKey: config.modelKey)
+            self.diskCache = DiskCache(
+                cacheDir: dir,
+                maxSizeBytes: DiskCacheCapPolicy.byteLimit(gigabytes: config.diskCacheMaxGB),
+                modelKey: config.modelKey,
+                indexMigrationBusyTimeoutMs: diskIndexMigrationBusyTimeoutMs,
+                indexBusyTimeoutMs: diskIndexBusyTimeoutMs,
+                now: now)
         } else {
             self.diskCache = nil
         }
+        self.diskRootKey = self.diskCache?.cacheDir.standardizedFileURL.path
 
         self.ssmStateCache = SSMStateCache(
             maxEntries: config.ssmMaxEntries,
@@ -189,17 +255,207 @@ public final class CacheCoordinator: @unchecked Sendable {
             let baseDir = config.diskCacheDir
                 ?? FileManager.default.temporaryDirectory
                     .appendingPathComponent("vmlx_disk_cache")
-            let ssmDir = baseDir.appendingPathComponent("ssm_companion")
+            let ssmDir = baseDir.appendingPathComponent(DiskCache.companionDirectoryName)
             let ssmMaxBytes = max(
                 1,
-                Int(config.diskCacheMaxGB * 1_073_741_824))
+                DiskCacheCapPolicy.byteLimit(gigabytes: config.diskCacheMaxGB))
             self.ssmStateCache.diskStore = try? SSMCompanionDiskStore(
                 cacheDir: ssmDir,
                 modelKey: config.modelKey,
-                maxBytes: ssmMaxBytes)
+                maxBytes: ssmMaxBytes,
+                sweepUnpublishedAtOpen: !(self.diskCache?.indexIsFromANewerBuild ?? false),
+                rootIndexIsFromANewerBuild: self.diskCache?.indexIsFromANewerBuild ?? false,
+                sharedQuotaRoot: baseDir)
         }
 
+        importCompanionAccountingOncePerRoot()
         enforceCombinedDiskQuota()
+    }
+
+    /// Whether quota and stats read companion bytes from the index. False on
+    /// an index without the v2 columns, where both keep walking the directory.
+    private var companionBytesAreIndexed: Bool {
+        diskCache?.indexHasV2Columns == true && ssmStateCache.diskStore != nil
+    }
+
+    /// Companions are files outside the index, so the first coordinator to
+    /// open a root in this process walks the companion directory once and
+    /// writes what it finds into the index; after that the index is kept in
+    /// step by the stores themselves and nothing walks the directory again.
+    /// The same pass repairs an index an older build has written to since.
+    ///
+    /// "Once" means once COMMITTED. An import that could not take the index
+    /// write lock (another connection held it past the busy timeout) leaves
+    /// the root unmarked. The next coordinator to open it tries again, and so
+    /// does the quota pass of this one (``retryCompanionImportIfDueLocked``);
+    /// until one of them commits, an upgraded directory's companions are not
+    /// counted.
+    private func importCompanionAccountingOncePerRoot() {
+        guard let diskCache, diskCache.indexHasV2Columns,
+              let companionStore = ssmStateCache.diskStore, let root = diskRootKey
+        else { return }
+        companionStore.attachLedger(diskCache)
+
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+        guard !CombinedDiskCacheQuotaLock.importedRoots.contains(root) else { return }
+        attemptCompanionImportLocked(
+            root: root, diskCache: diskCache, companionStore: companionStore, reason: "open")
+    }
+
+    /// One import attempt and its bookkeeping: a committed import marks the
+    /// root done; one that did not commit unmarks it and notes when, so the
+    /// quota pass knows how long to leave it. Returns whether it committed.
+    /// Caller holds ``CombinedDiskCacheQuotaLock``.
+    @discardableResult
+    private func attemptCompanionImportLocked(
+        root: String, diskCache: DiskCache, companionStore: SSMCompanionDiskStore,
+        reason: String
+    ) -> Bool {
+        let committed = importCompanionAccountingLocked(
+            diskCache: diskCache, companionStore: companionStore, reason: reason)
+        if committed {
+            CombinedDiskCacheQuotaLock.importedRoots.insert(root)
+            CombinedDiskCacheQuotaLock.lastUncommittedImport[root] = nil
+        } else {
+            CombinedDiskCacheQuotaLock.importedRoots.remove(root)
+            CombinedDiskCacheQuotaLock.lastUncommittedImport[root] = now()
+        }
+        return committed
+    }
+
+    /// An import that did not commit leaves this root's pre-existing
+    /// companions uncounted, and in a session with one model no other
+    /// coordinator will ever open the root to try again. So the quota pass —
+    /// which runs on every store, already under the combined lock — retries
+    /// it, at most once per `importRetryInterval` per root: an index that
+    /// stays locked costs one directory walk and one busy wait per interval,
+    /// not per store. For an imported root this is one set lookup.
+    /// Caller holds ``CombinedDiskCacheQuotaLock``.
+    private func retryCompanionImportIfDueLocked(
+        diskCache: DiskCache, companionStore: SSMCompanionDiskStore
+    ) {
+        guard let root = diskRootKey,
+              !CombinedDiskCacheQuotaLock.importedRoots.contains(root)
+        else { return }
+        if let last = CombinedDiskCacheQuotaLock.lastUncommittedImport[root] {
+            let elapsed = now().timeIntervalSince(last)
+            // A clock that went backwards must not postpone the retry.
+            guard elapsed < 0 || elapsed >= importRetryInterval else { return }
+        }
+        attemptCompanionImportLocked(
+            root: root, diskCache: diskCache, companionStore: companionStore, reason: "retry")
+    }
+
+    /// One walk of the companion directory, reconciled into the index.
+    /// Returns whether it committed. Caller holds
+    /// ``CombinedDiskCacheQuotaLock``.
+    private func importCompanionAccountingLocked(
+        diskCache: DiskCache, companionStore: SSMCompanionDiskStore, reason: String
+    ) -> Bool {
+        // A directory that cannot be listed is not an empty one: importing
+        // "no companions" would commit, mark the root done, and leave every
+        // companion in it uncounted for good. Not committed; retried later.
+        guard let companions = companionStore.listedQuotaEntries() else {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk-index] companion import reason=\(reason) committed=false "
+                    + "companion directory could not be listed or examined\n").utf8))
+            return false
+        }
+        // The directory goes in with the entries that were listed from it:
+        // `ssmStateCache.diskStore` is a public var, and the re-check inside
+        // the transaction must look where this walk looked.
+        let summary = diskCache.reconcileCompanionAccounting(
+            companions: companions, companionDirectory: companionStore.directory)
+        // A skipped import is always reported; a committed one only under
+        // the trace flag, and only when it changed something.
+        let traced = ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+        if summary == nil || (traced && summary?.changedAnything == true) {
+            let counts = summary ?? DiskCacheCompanionImportSummary()
+            // One array joined once, not a chain of `+`: ten concatenated
+            // interpolations is an expression some toolchains refuse to
+            // type-check ("unable to type-check this expression in
+            // reasonable time"), which broke the build for part of the team.
+            let fields = [
+                "reason=\(reason)",
+                "committed=\(summary != nil)",
+                "rowsDeletedForMissingPayload=\(counts.rowsDeletedForMissingPayload)",
+                "linksWritten=\(counts.linksWritten)",
+                "linksCleared=\(counts.linksCleared)",
+                "legacyUpserted=\(counts.legacyUpserted)",
+                "legacyDeleted=\(counts.legacyDeleted)",
+                "rowsDroppedForInvalidHash=\(counts.rowsDroppedForInvalidHash)",
+                "legacyDroppedForInvalidKey=\(counts.legacyDroppedForInvalidKey)",
+                "unindexedPayloadsRemoved=\(counts.unindexedPayloadsRemoved)",
+            ]
+            let line = "[vmlx][cache/disk-index] companion import " + fields.joined(separator: " ") + "\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+        return summary != nil
+    }
+
+    /// Bring the disk accounting back in line with the directory after
+    /// something outside this package changed it — the host's "Clear SSD
+    /// Cache", which deletes payloads, companion files and `cache_entries`
+    /// rows with its own SQL and knows nothing about `legacy_companions`.
+    /// Without this the index keeps counting companions whose files are gone,
+    /// and does not count companion files that lost their row, until the
+    /// next launch.
+    ///
+    /// Walks the companion directory once (the same import that runs at
+    /// open), drops rows whose payload is gone, removes payloads that have
+    /// no row and were last modified at least ten minutes ago, and forgets
+    /// which files this process had validated. The ten minutes are the
+    /// file's age, not how long it has been without a row: a week-old
+    /// payload whose row was deleted a second ago goes at once. Only regular
+    /// files named like this cache's payloads are ever removed, and none at
+    /// all in a root that holds `config.json` / `jang_config.json` or under
+    /// an index a newer build has claimed.
+    ///
+    /// Deleting `cache_index.db` by hand therefore does not keep the
+    /// payloads: every one of them is then without a row — not served, and
+    /// removed by the next import once it is old enough.
+    ///
+    /// Returns false when the index write lock could not be taken, or when
+    /// a directory or a file the import has to look at could not be examined
+    /// (which is never read as "not there"). The index
+    /// is then unchanged — the validated sets HAVE been cleared, which only
+    /// costs a re-validation — and the call can be repeated. It does not
+    /// have to be: the root stops counting as imported, so this
+    /// coordinator's quota pass retries within a minute of its next store.
+    /// On an index without the companion columns there is nothing to
+    /// reconcile — quota and stats walk the directory there — and the result
+    /// is true.
+    ///
+    /// Call it off the main thread, and once per resident coordinator: it
+    /// takes the lock every store holds for its whole write, so it waits
+    /// behind an in-flight store; it lists the companion directory and the
+    /// payload directory and reads every sidecar; and it can wait out the
+    /// index busy timeout.
+    @discardableResult
+    public func reconcileDiskAccounting() -> Bool {
+        guard let diskCache else { return true }
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+
+        diskCache.forgetValidatedFiles()
+        ssmStateCache.diskStore?.forgetValidatedEntries()
+        guard diskCache.indexHasV2Columns, let companionStore = ssmStateCache.diskStore,
+              let root = diskRootKey
+        else { return true }
+
+        return attemptCompanionImportLocked(
+            root: root, diskCache: diskCache, companionStore: companionStore,
+            reason: "on-demand")
+    }
+
+    /// Forget which roots were imported, so a test can stand in for a new
+    /// process opening the same directory.
+    static func resetImportedRootsForTesting() {
+        CombinedDiskCacheQuotaLock.shared.lock()
+        CombinedDiskCacheQuotaLock.importedRoots.removeAll()
+        CombinedDiskCacheQuotaLock.lastUncommittedImport.removeAll()
+        CombinedDiskCacheQuotaLock.shared.unlock()
     }
 
     // MARK: - Hybrid Flag
@@ -239,8 +495,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         lock.withLock { _isHybrid }
     }
 
-    /// Whether disk admission requires a separately persisted recurrent
-    /// SSM/GDN snapshot at the exact matched prompt boundary.
+    /// Whether exact-boundary persistence must preserve recurrent SSM/GDN
+    /// state. Native disk payloads may carry it without a separate sidecar.
     public var requiresRecurrentSSMCompanion: Bool {
         lock.withLock { _requiresRecurrentSSMCompanion }
     }
@@ -253,6 +509,38 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// `ModelCacheTopologySnapshot.requiresSeparateRecurrentPayloadState`.
     public var requiresSeparateRecurrentPayload: Bool {
         lock.withLock { _requiresSeparateRecurrentPayload }
+    }
+
+    /// Persist a sealed canonical prefill chunk only after normal resume rows
+    /// have been written. This optional acceleration must fit beside the
+    /// active resume point; do not write a large row merely to evict it again.
+    func storeCanonicalCheckpoint(
+        tokens: [Int], cache: [KVCache], chunkSize: Int,
+        requestSalt: String?, chainId: String?
+    ) {
+        guard config.enableDiskCache, let diskCache,
+            diskCache.indexHasReplayChunkColumn, ssmStateCache.diskStore != nil,
+            let chainId, !chainId.isEmpty,
+            let contract = CanonicalPrefillCheckpoint(chunkSize: chunkSize),
+            !tokens.isEmpty, tokens.count % chunkSize == 0,
+            !cache.isEmpty,
+            cache.allSatisfy({ ($0 is KVCacheSimple || $0 is RotatingKVCache) && $0.offset == tokens.count }),
+            CacheStoreBudget.canStore(cache)
+        else { return }
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+        let arrays = TQDiskSerializer.serialize(cache: cache, preserveStandardKVStorageDType: true)
+        let bytes = IndexedBytes.total(arrays.values.map { Int64($0.nbytes) })
+        let cap = Int64(max(1, diskCache.maxSizeBytes))
+        // A conservative header allowance avoids writing right at the cap.
+        let resumeBytes = diskCache.quotaEntries(retiringInvalidRecords: false)
+            .filter { $0.chainId == chainId && !$0.isCanonicalCheckpoint }
+            .map { IndexedBytes.sum($0.bytes, $0.companionBytes) }.max() ?? 0
+        guard IndexedBytes.sum(IndexedBytes.sum(bytes, resumeBytes), 131_072) <= cap else { return }
+        diskCache.storeCanonicalCheckpoint(
+            tokens: tokens, arrays: arrays, contract: contract,
+            requestSalt: requestSalt, chainId: chainId, enforceQuota: false)
+        enforceCombinedDiskQuotaLocked(activeChain: chainId)
     }
 
     /// Whether a prompt-boundary store has any tier to land in. With both tiers
@@ -330,35 +618,40 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// into byte usage and treats each KV + companion group as one logical
     /// entry. Holding the combined lock keeps this view coherent with atomic
     /// linked stores and evictions.
+    ///
+    /// Hosts poll this every few seconds per idle window, under the lock every
+    /// store needs. With companion bytes in the index it is two SQL
+    /// aggregates; only an index without the v2 columns still walks the
+    /// companion directory.
     private func combinedDiskStatsSnapshot() -> DiskCacheStats? {
         guard let diskCache else { return nil }
 
         CombinedDiskCacheQuotaLock.shared.lock()
         defer { CombinedDiskCacheQuotaLock.shared.unlock() }
 
+        if companionBytesAreIndexed {
+            return diskCache.snapshotStatsIncludingCompanions()
+        }
+
         let base = diskCache.snapshotStats()
         guard let companionStore = ssmStateCache.diskStore else { return base }
 
-        let kvHashes = Set(diskCache.quotaEntries().map(\.hash))
+        // A poll is a read: it retires nothing, so with a record that names
+        // nothing in the index it opens no write transaction — every few
+        // seconds, per window, under the lock every store needs.
+        let kvHashes = Set(diskCache.quotaEntries(retiringInvalidRecords: false).map(\.hash))
         let companionEntries = companionStore.quotaEntries()
-        let companionBytes = companionEntries.reduce(Int64(0)) {
-            $0 + max(0, $1.bytes)
-        }
+        let companionBytes = IndexedBytes.total(companionEntries.lazy.map(\.bytes))
         let unlinkedCompanionCount = companionEntries.reduce(into: 0) { count, entry in
             if entry.kvHash.map({ !kvHashes.contains($0) }) ?? true {
                 count += 1
             }
         }
 
-        return DiskCacheStats(
-            hits: base.hits,
-            misses: base.misses,
-            stores: base.stores,
-            storeSkips: base.storeSkips,
-            currentPayloadBytes: base.currentPayloadBytes + Int(companionBytes),
-            currentEntryCount: base.currentEntryCount + unlinkedCompanionCount,
-            evictions: base.evictions,
-            maxSizeBytes: base.maxSizeBytes)
+        return base.replacingUsage(
+            currentPayloadBytes: IndexedBytes.asInt(
+                IndexedBytes.sum(Int64(base.currentPayloadBytes), companionBytes)),
+            currentEntryCount: base.currentEntryCount + unlinkedCompanionCount)
     }
 
     /// Release paged-cache blocks returned by ``fetch(tokens:mediaSalt:)``.
@@ -469,16 +762,21 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///   - tokens: The full token sequence to look up.
     ///   - mediaSalt: Optional VLM media fingerprint; `nil` for text-only.
     /// - Returns: A ``CacheFetchResult`` describing the outcome.
+    /// `chainId` is the conversation asking (see
+    /// ``GenerateParameters/cacheChainId``): a disk hit on an unowned history
+    /// row hands that row to it. The id never affects which entry is chosen.
     public func fetch(
         tokens: [Int],
         mediaSalt: String? = nil,
         skipExactDiskBoundary: Bool = false,
-        preferredDiskBoundaries: [Int] = []
+        preferredDiskBoundaries: [Int] = [],
+        chainId: String? = nil
     ) -> CacheFetchResult {
         func ftrace(_ msg: String) {
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 FileHandle.standardError.write(Data(
-                    "[vmlx][cache/fetch] \(msg) tokens=\(tokens.count) skipExactDisk=\(skipExactDiskBoundary)\n".utf8))
+                    ("[vmlx][cache/fetch] \(msg) tokens=\(tokens.count) skipExactDisk=\(skipExactDiskBoundary) "
+                        + "salt=\(mediaSalt.map { String($0.prefix(12)) } ?? "none")\n").utf8))
             }
         }
         func hasRequiredHybridSSM(
@@ -582,13 +880,13 @@ public final class CacheCoordinator: @unchecked Sendable {
                 let prefix = boundary == tokens.count ? tokens : Array(tokens.prefix(boundary))
                 // A deserializable KV payload is only a candidate until
                 // architecture-specific companion state is validated below.
-                // Do not make rejected hybrid candidates hot.
-                guard let arrays = diskCache.fetch(
-                    tokens: prefix,
-                    mediaSalt: mediaSalt,
-                    touchRecency: false,
-                    countHit: false
-                ) else {
+                // Do not make rejected hybrid candidates hot: no recency
+                // touch and no hit until one is accepted.
+                let arrays: [String: MLXArray]
+                switch diskCache.fetchCandidate(tokens: prefix, mediaSalt: mediaSalt) {
+                case .arrays(let found):
+                    arrays = found
+                case .miss:
                     // A miss here means the content-addressed key over this
                     // prefix found no row; a rejection below means the row
                     // existed but its companion state was refused. Only the
@@ -597,17 +895,25 @@ public final class CacheCoordinator: @unchecked Sendable {
                     // already cost a whole family (LFM2.5) its cache once.
                     ftrace("probe boundary=\(boundary) noRow")
                     return nil
+                case .restoreRejectedEarlier:
+                    // See `reportDiskRestoreRejected`: serving it again would
+                    // end in the same full prefill, with a shorter entry that
+                    // does restore still waiting behind it.
+                    ftrace("probe boundary=\(boundary) skipped: restore was rejected earlier")
+                    return nil
                 }
                 let ssmStates = resolveSSMStates(
                     forTokens: prefix,
                     boundary: boundary,
                     diskArrays: arrays,
-                    mediaSalt: mediaSalt)
+                    mediaSalt: mediaSalt,
+                    chainId: chainId)
                 if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
                     touchSuccessfulDiskRestore(
                         matchedTokens: prefix,
                         matchedBoundary: boundary,
-                        mediaSalt: mediaSalt)
+                        mediaSalt: mediaSalt,
+                        chainId: chainId)
                     ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))")
                     return .hit(
                         matchedTokens: boundary,
@@ -702,18 +1008,87 @@ public final class CacheCoordinator: @unchecked Sendable {
         return .miss
     }
 
+    /// Tell the coordinator that a disk hit it served could not be restored.
+    ///
+    /// `fetch` accepts a disk candidate as soon as its payload deserializes
+    /// and its companion state is present: that is the moment the hit is
+    /// counted and the entry's recency refreshed. Whether the payload FITS
+    /// the running model's cache is only known to the engine, afterwards —
+    /// `restoreFromDiskArrays` restores 0 tokens for a payload whose layers
+    /// do not match the cache, and `validateRestoredCacheBoundary` refuses
+    /// offsets that disagree with the boundary. The engine then prefills the
+    /// whole prompt. Left untold, the coordinator serves the same entry on
+    /// every later turn, ahead of every shorter entry that would restore,
+    /// and — the fetch having validated the file — treats the boundary as
+    /// durable, so nothing ever writes it again.
+    ///
+    /// Call this for a STRUCTURAL rejection of a `.disk` hit only: the entry
+    /// cannot be used by this model as it runs now. Do not call it when the
+    /// entry was fine and the request could not use it (a missing seed state
+    /// for an exact hit, media placeholders left in the suffix).
+    ///
+    /// Everything it does is in memory, for this coordinator, until the
+    /// process ends; nothing is deleted and recency is left as it is:
+    ///
+    /// - `fetch` passes over the entry, so the longest entry that does
+    ///   restore wins — from the NEXT fetch on: nothing is fetched again in
+    ///   the turn that found out, which prefills the whole prompt;
+    /// - the entry counts as neither validated nor durable, so a store of
+    ///   that boundary writes it again, and that store lifts the mark (as
+    ///   does a payload another process has replaced). Whether such a store
+    ///   comes depends on the turn: only a boundary in this turn's store set
+    ///   is written — the prompt itself (an exact re-send), a stable prefix,
+    ///   a ladder rung. A refused boundary from earlier in the history is in
+    ///   no later turn's set, and just stays passed over until the process
+    ///   ends;
+    /// - that rewrite happens once per entry per process. If what was
+    ///   written is refused as well, the entry stays passed over and counts
+    ///   as durable, so it is not written again
+    ///   (``DiskCacheStats/rejectedRewritesSuppressed``);
+    /// - the hit is taken back out of ``DiskCacheStats/hits`` and counted in
+    ///   ``DiskCacheStats/rejectedDiskRestores``.
+    ///
+    /// A report for an entry that is not there, or whose payload is no
+    /// longer the one `fetch` served, changes nothing.
+    ///
+    /// - Parameters:
+    ///   - tokens: The token sequence that was fetched.
+    ///   - boundary: `matchedTokens` of the hit: the entry is keyed by
+    ///     `tokens.prefix(boundary)`.
+    ///   - mediaSalt: The media salt of the fetch.
+    ///   - reason: What the engine found; traced, not interpreted.
+    public func reportDiskRestoreRejected(
+        tokens: [Int],
+        boundary: Int,
+        mediaSalt: String?,
+        reason: String
+    ) {
+        guard let diskCache, boundary > 0, boundary <= tokens.count else { return }
+        let prefix = boundary == tokens.count ? tokens : Array(tokens.prefix(boundary))
+        let marked = diskCache.markRestoreRejected(tokens: prefix, mediaSalt: mediaSalt)
+        if marked || ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            // Said once per payload: it explains a full prefill after a hit.
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/restore] disk restore rejected boundary=\(boundary) "
+                    + "tokens=\(tokens.count) marked=\(marked) reason=\(reason)\n").utf8))
+        }
+    }
+
     /// True only after the current process has deserialized or written the
     /// exact L2 entry and its on-disk fingerprint still matches the index.
     public func hasValidatedDiskEntry(
         tokens: [Int],
         mediaSalt: String? = nil
     ) -> Bool {
+        let needsSeparate = isHybrid && requiresSeparateRecurrentPayload
+        let needsNative = isHybrid && requiresRecurrentSSMCompanion && !needsSeparate
         guard diskCache?.hasValidatedEntry(
-            tokens: tokens, mediaSalt: mediaSalt) == true
+            tokens: tokens, mediaSalt: mediaSalt,
+            requireNativeRecurrent: needsNative) == true
         else {
             return false
         }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        if needsSeparate {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,
@@ -730,9 +1105,17 @@ public final class CacheCoordinator: @unchecked Sendable {
         tokens: [Int],
         mediaSalt: String? = nil
     ) -> Bool {
-        guard diskCache?.hasDurableEntry(tokens: tokens, mediaSalt: mediaSalt) == true
+        // Match the disk writer's ownership contract. Mamba state is already
+        // native in-file; ArraysCache and unknown topologies still need their
+        // complete sidecar. A paged hit has its own companion admission gate:
+        // these predicates certify only the durable disk boundary.
+        let needsSeparate = isHybrid && requiresSeparateRecurrentPayload
+        let needsNative = isHybrid && requiresRecurrentSSMCompanion && !needsSeparate
+        guard diskCache?.hasDurableEntry(
+            tokens: tokens, mediaSalt: mediaSalt,
+            requireNativeRecurrent: needsNative) == true
         else { return false }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        if needsSeparate {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,
@@ -750,7 +1133,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         forTokens tokens: [Int],
         boundary: Int,
         diskArrays: [String: MLXArray],
-        mediaSalt: String? = nil
+        mediaSalt: String? = nil,
+        chainId: String? = nil
     ) -> [MLXArray]? {
         guard isHybrid else { return nil }
         if let l1 = fetchCompleteSSMStates(
@@ -764,11 +1148,17 @@ public final class CacheCoordinator: @unchecked Sendable {
         guard let folded = TQDiskSerializer.ssmStates(from: diskArrays) else {
             return nil
         }
+        // A read is not the moment to spend the reader's own boundaries. This
+        // write-back runs a quota pass like any store, and without the reading
+        // conversation named it would spend the COLDEST chain's superseded
+        // rows — which is the chat being read precisely when the user has just
+        // returned to an older one.
         storePersistentBoundary(
             tokens: tokens,
             diskArrays: nil,
             ssmStates: folded,
-            mediaSalt: mediaSalt)
+            mediaSalt: mediaSalt,
+            chainId: chainId)
         return folded
     }
 
@@ -805,7 +1195,8 @@ public final class CacheCoordinator: @unchecked Sendable {
     private func touchSuccessfulDiskRestore(
         matchedTokens: [Int],
         matchedBoundary: Int,
-        mediaSalt: String?
+        mediaSalt: String?,
+        chainId: String? = nil
     ) {
         guard let diskCache else { return }
         let recency = Date()
@@ -816,6 +1207,9 @@ public final class CacheCoordinator: @unchecked Sendable {
             tokens: matchedTokens,
             mediaSalt: mediaSalt,
             at: recency)
+        if let chainId {
+            diskCache.assignChain(tokens: matchedTokens, mediaSalt: mediaSalt, chainId: chainId)
+        }
         diskCache.recordAcceptedHit()
         if isHybrid {
             _ = ssmStateCache.diskStore?.touchRecency(
@@ -901,13 +1295,22 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///     and any layer is a TurboQuant cache in compressed phase, the disk tier
     ///     stores the compressed representation. Pass `nil` (default) to use the
     ///     standard float16 disk path.
+    /// `chainId` / `isStableRoot` are the row's owner and kind for the quota
+    /// planner (see ``GenerateParameters/cacheChainId``); they never enter
+    /// the content key.
     public func storeAfterGeneration(
         promptTokens: [Int],
         perLayerData: [(keys: MLXArray, values: MLXArray)?],
         ssmStates: [MLXArray]?,
         cache: [any KVCache]? = nil,
-        mediaSalt: String? = nil
+        mediaSalt: String? = nil,
+        chainId: String? = nil,
+        isStableRoot: Bool = false,
+        isResumeBoundary: Bool = false,
+        isPostAnswer: Bool = false
     ) {
+        var trace = CacheFinalizationTrace("coordinator-store", tokens: promptTokens.count)
+        defer { trace.mark("return") }
         let totalTokens = promptTokens.count
         let blockSize = config.pagedBlockSize
         let traceCacheStore =
@@ -994,6 +1397,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             FileHandle.standardError.write(Data(message.utf8))
         }
 
+        trace.mark("geometry-and-paged-companion")
         // Store in paged cache (skip when the model is paged-incompatible —
         // see `isPagedIncompatible` above). Recurrent-only/state-only caches
         // must not publish token hashes without any restorable KV payload;
@@ -1012,6 +1416,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             publishedPagedPayload = true
         }
 
+        trace.mark("paged-store")
         // Build the disk payload before entering the linked-store transaction.
         //
         // SLIDING-1: when the raw cache is available, use the v2
@@ -1043,7 +1448,8 @@ public final class CacheCoordinator: @unchecked Sendable {
             if let cache {
                 let arrays = TQDiskSerializer.serialize(
                     cache: cache,
-                    ssmStates: persistSeparateRecurrentPayload ? ssmStates : nil)
+                    ssmStates: persistSeparateRecurrentPayload ? ssmStates : nil,
+                    preserveStandardKVStorageDType: config.preserveStandardKVStorageDType)
                 if !arrays.isEmpty {
                     diskArrays = arrays
                 }
@@ -1066,11 +1472,16 @@ public final class CacheCoordinator: @unchecked Sendable {
             }
         }
 
+        trace.mark("disk-serialization")
         storePersistentBoundary(
             tokens: promptTokens,
             diskArrays: diskArrays,
             ssmStates: persistSeparateRecurrentPayload ? ssmStates : nil,
-            mediaSalt: mediaSalt)
+            mediaSalt: mediaSalt,
+            chainId: chainId,
+            isStableRoot: isStableRoot,
+            isResumeBoundary: isResumeBoundary,
+            isPostAnswer: isPostAnswer)
     }
 
     /// Persist one reusable prompt boundary as a linked transaction.
@@ -1085,7 +1496,11 @@ public final class CacheCoordinator: @unchecked Sendable {
         tokens: [Int],
         diskArrays: [String: MLXArray]?,
         ssmStates: [MLXArray]?,
-        mediaSalt: String? = nil
+        mediaSalt: String? = nil,
+        chainId: String? = nil,
+        isStableRoot: Bool = false,
+        isResumeBoundary: Bool = false,
+        isPostAnswer: Bool = false
     ) {
         let usesCombinedQuota = config.enableDiskCache
             && diskCache != nil
@@ -1099,15 +1514,57 @@ public final class CacheCoordinator: @unchecked Sendable {
             }
         }
 
+        let storesCompanion = isHybrid && !(ssmStates?.isEmpty ?? true)
+        // A snapshot larger than the whole cap can never be kept: the pass
+        // that follows its own store removes it first (oversized rows go
+        // before anything else). Writing it anyway costs a full payload write
+        // and delete on every turn — on a small SSD that is exactly the churn
+        // the quota exists to stop (seen live: 1.5–2 GB written and deleted
+        // per turn once a 0.6B chat's snapshot outgrew a 1.2 GB cap). Skip
+        // the write and report what the pass would have confirmed, so the
+        // chat's pressure record and the stats stay truthful.
+        if usesCombinedQuota, let diskCache, let diskArrays, !diskArrays.isEmpty {
+            let cap = Int64(max(1, diskCache.maxSizeBytes))
+            let kvBytes = diskArrays.values.reduce(Int64(0)) { $0 + Int64($1.nbytes) }
+            let companionBytes = (storesCompanion ? ssmStates : nil)?
+                .reduce(Int64(0)) { $0 + Int64($1.nbytes) } ?? 0
+            let payload = IndexedBytes.sum(kvBytes, companionBytes)
+            if payload > cap {
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][cache/disk-store] SKIP oversized count=\(tokens.count) "
+                            + "bytes=\(payload) cap=\(cap) chain=\(chainId ?? "nil")\n").utf8))
+                }
+                diskCache.recordQuotaPass(
+                    evictedGroups: 0, evictedBytes: 0, milliseconds: 0,
+                    event: DiskCachePressureEvent(
+                        kind: .activeTipDropped, chainId: chainId, tipBytes: payload,
+                        capBytes: cap),
+                    tipTokenCount: tokens.count)
+                return
+            }
+        }
         if let diskArrays, !diskArrays.isEmpty {
             diskCache?.store(
                 tokens: tokens,
                 arrays: diskArrays,
                 mediaSalt: mediaSalt,
-                enforceQuota: !usesCombinedQuota)
+                enforceQuota: !usesCombinedQuota,
+                chainId: chainId,
+                isStableRoot: isStableRoot,
+                isResumeBoundary: isResumeBoundary,
+                isPostAnswer: isPostAnswer)
+            if !storesCompanion {
+                adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
+            }
         }
 
-        if isHybrid, let ssmStates, !ssmStates.isEmpty {
+        // KV first: the companion store reports what it wrote to the index
+        // before it returns (still inside this critical section), and links
+        // onto the row the KV store just wrote. With no row to link to —
+        // `resolveSSMStates` passes no KV payload, and its row normally exists
+        // already — the companion is counted as unlinked instead.
+        if storesCompanion, let ssmStates {
             ssmStateCache.store(
                 ssmStates: ssmStates,
                 tokens: tokens,
@@ -1116,11 +1573,36 @@ public final class CacheCoordinator: @unchecked Sendable {
                 enforceDiskQuota: !usesCombinedQuota)
         }
 
+        // The storing conversation is the one in progress: the pass that its
+        // own store triggers must not take its rows while cold ones remain.
         if usesCombinedQuota {
-            enforceCombinedDiskQuotaLocked()
+            enforceCombinedDiskQuotaLocked(activeChain: chainId)
         } else {
-            enforceCombinedDiskQuota()
+            enforceCombinedDiskQuota(activeChain: chainId)
         }
+        diskCache?.reconcileCapacityPressure(chainId: chainId, requiresCompanion: isHybrid)
+    }
+
+    /// The direct companion writers (`maybeReDeriveSSMState`, and
+    /// `SSMStateCache.store` with its default `persistToDisk`) can put a
+    /// companion on disk before its KV row exists; it is then counted as
+    /// unlinked, and unlinked companions are evicted FIRST. This call has
+    /// just written the row and writes no companion of its own, so nothing
+    /// else would ever join the two: the hottest companion would be retired
+    /// ahead of every older group, leaving its KV payload unusable.
+    ///
+    /// One `LIMIT 1` SELECT when no companion is counted as unlinked; the
+    /// companion key is only hashed when there is something it could match.
+    private func adoptEarlyCompanion(tokens: [Int], mediaSalt: String?) {
+        guard companionBytesAreIndexed, isHybrid, let diskCache,
+              diskCache.hasLegacyCompanions()
+        else { return }
+        diskCache.adoptLegacyCompanion(
+            kvHash: DiskCache.hashTokens(
+                tokens, modelKey: diskCache.modelKey, mediaSalt: mediaSalt),
+            companionKey: SSMCompanionDiskStore.keyFor(
+                tokens: tokens, boundary: tokens.count,
+                mediaSalt: mediaSalt, modelKey: config.modelKey))
     }
 
     /// Enforce `diskCacheMaxGB` across the whole persistent cache root, not
@@ -1129,9 +1611,19 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// New companion sidecars record their matching KV hash, allowing an old
     /// hybrid entry to be evicted as a unit. Legacy sidecars remain readable;
     /// under quota pressure they retire before indexed KV because they cannot
-    /// prove which durable KV payload can still reach them. Companions whose
-    /// recorded KV payload is already gone are removed immediately.
-    func enforceCombinedDiskQuota() {
+    /// prove which durable KV payload can still reach them.
+    ///
+    /// A companion whose recorded KV payload is already gone is treated
+    /// differently by the two passes. The directory-walk pass (v1 index)
+    /// removes it immediately, on every call. The index pass does not: such a
+    /// companion is counted as unlinked, so it stays on disk while the total
+    /// fits and is the first thing evicted once it does not.
+    ///
+    /// `activeChain` is the conversation in progress, which the index pass
+    /// protects (see ``DiskQuotaPlanner``). Nothing assigns chain ids yet, so
+    /// every production call passes nil; the parameter is how a test stands
+    /// in for the store path that will.
+    func enforceCombinedDiskQuota(activeChain: String? = nil) {
         guard config.enableDiskCache,
               diskCache != nil,
               ssmStateCache.diskStore != nil
@@ -1139,24 +1631,302 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         CombinedDiskCacheQuotaLock.shared.lock()
         defer { CombinedDiskCacheQuotaLock.shared.unlock() }
-        enforceCombinedDiskQuotaLocked()
+        enforceCombinedDiskQuotaLocked(activeChain: activeChain)
+    }
+
+    /// One unit of combined-quota eviction: a KV payload with its linked
+    /// companion, or a companion on its own.
+    private struct EvictionGroup {
+        let sortKey: String
+        let kvHashes: Set<String>
+        let companionHashes: Set<String>
+        let bytes: Int64
+        let createdAt: Date
+        /// Legacy companions predate the KV-link sidecar. They cannot
+        /// prove that an indexed KV payload can still reach them, so quota
+        /// pressure retires them before directly addressable KV groups.
+        let priority: Int
+    }
+
+    /// The directory-walk pass's eviction policy (an index without the v2
+    /// columns; the index pass selects with ``DiskQuotaPlanner``): none when
+    /// the total fits; otherwise every group that can never fit, then
+    /// unlinked companions, then oldest recency, until the total fits.
+    private static func groupsToEvict(
+        from groups: [EvictionGroup], maxBytes: Int64
+    ) -> (evicted: [EvictionGroup], totalBefore: Int64, remaining: Int64) {
+        let totalBefore = IndexedBytes.total(groups.lazy.map(\.bytes))
+        guard totalBefore > maxBytes else { return ([], totalBefore, totalBefore) }
+
+        var remaining = totalBefore
+        var evicted: [EvictionGroup] = []
+
+        // Reject any group that can never fit before applying LRU. Stable
+        // boundaries are normally written shortest-to-longest; evicting the
+        // older fitting boundary first and only then discovering that the
+        // newest group is individually oversized leaves the cache empty.
+        // Pre-eviction preserves the best prior prefix that actually fits.
+        let oversized = groups.filter { $0.bytes > maxBytes }
+        for group in oversized {
+            evicted.append(group)
+            remaining = IndexedBytes.difference(remaining, group.bytes)
+        }
+        if totalBefore == .max {
+            // Saturated on the way up (a `file_size` from the index can be
+            // anything): what is left is counted, not subtracted.
+            remaining = IndexedBytes.total(
+                groups.lazy.filter { $0.bytes <= maxBytes }.map(\.bytes))
+        }
+        let oversizedKeys = Set(oversized.map(\.sortKey))
+
+        for group in groups.sorted(by: {
+            if $0.priority != $1.priority { return $0.priority < $1.priority }
+            if $0.createdAt == $1.createdAt { return $0.sortKey < $1.sortKey }
+            return $0.createdAt < $1.createdAt
+        }) where remaining > maxBytes && !oversizedKeys.contains(group.sortKey) {
+            evicted.append(group)
+            remaining = IndexedBytes.difference(remaining, group.bytes)
+        }
+        return (evicted, totalBefore, remaining)
     }
 
     /// Reconcile the linked KV + recurrent quota. Caller must hold
     /// ``CombinedDiskCacheQuotaLock``.
-    private func enforceCombinedDiskQuotaLocked() {
+    private func enforceCombinedDiskQuotaLocked(activeChain: String? = nil) {
         guard config.enableDiskCache,
               let diskCache,
               let companionStore = ssmStateCache.diskStore
         else { return }
 
-        let maxBytes = Int64(max(1, Int(config.diskCacheMaxGB * 1_073_741_824)))
+        let maxBytes = Int64(max(1, diskCache.maxSizeBytes))
 
+        if companionBytesAreIndexed {
+            retryCompanionImportIfDueLocked(diskCache: diskCache, companionStore: companionStore)
+            enforceIndexedQuotaLocked(
+                diskCache: diskCache, companionStore: companionStore, maxBytes: maxBytes,
+                activeChain: activeChain)
+        } else {
+            enforceDirectoryWalkQuotaLocked(
+                diskCache: diskCache, companionStore: companionStore, maxBytes: maxBytes)
+        }
+    }
+
+    /// Where the last over-cap index pass spent its time. For the cost probe;
+    /// read and written only while ``CombinedDiskCacheQuotaLock`` is held.
+    struct QuotaPassTiming: Sendable, Equatable {
+        /// Reading the rows out of the index and building the planner's input.
+        var rowsMs = 0.0
+        /// ``DiskQuotaPlanner/plan(rows:capBytes:activeChain:)`` alone.
+        var selectMs = 0.0
+        /// Deleting the victims' files and then their rows.
+        var deleteMs = 0.0
+        /// The whole pass, the usage aggregate included.
+        var totalMs = 0.0
+        var evictedGroups = 0
+    }
+    private var _lastQuotaPassTiming = QuotaPassTiming()
+
+    var lastQuotaPassTimingForTesting: QuotaPassTiming {
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+        return _lastQuotaPassTiming
+    }
+
+    /// Rows come from the index alone: no directory listing, no file stat, no
+    /// sidecar read. Below the cap this is one SQL aggregate — no row is read
+    /// and nothing is built for the planner.
+    ///
+    /// Over the cap the victims are chosen by ``DiskQuotaPlanner``: one row per
+    /// KV boundary (its linked companion's bytes included — they are evicted
+    /// as a unit) and one per unlinked companion. While every `chain_id` is
+    /// NULL and no row is a stable root that is the old order (oversized,
+    /// unlinked companions, oldest recency), except that unlinked companions
+    /// are taken down to the low watermark rather than to the cap.
+    private func enforceIndexedQuotaLocked(
+        diskCache: DiskCache, companionStore: SSMCompanionDiskStore, maxBytes: Int64,
+        activeChain: String?
+    ) {
+        let passStart = DispatchTime.now().uptimeNanoseconds
+        guard diskCache.usageBytes() > maxBytes else { return }
+        func msSince(_ start: UInt64) -> Double {
+            Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        }
+
+        let kvEntries = diskCache.quotaEntries()
+        let legacy = diskCache.legacyCompanions()
+        var rows: [QuotaRow] = []
+        rows.reserveCapacity(kvEntries.count + legacy.count)
+        var kvByID: [String: DiskCacheQuotaEntry] = [:]
+        kvByID.reserveCapacity(kvEntries.count)
+        for kv in kvEntries {
+            kvByID[kv.hash] = kv
+            rows.append(QuotaRow(
+                id: kv.hash,
+                tokenCount: kv.tokenCount,
+                bytes: IndexedBytes.sum(kv.bytes, kv.companionBytes),
+                // A hit refreshes the row and its companion's files with one
+                // timestamp, so the row's recency is the group's — with one
+                // exception. The directory walk uses min(row, companion file
+                // mtimes). A KV row that is re-stored or skip-touched in a
+                // call that writes no companion moves `created_at` forward
+                // and leaves the companion's files alone, so here the group
+                // is as recent as its row, where the walk would have kept it
+                // as old as its companion. The group is evicted later than
+                // before, never earlier.
+                recency: kv.createdAt.timeIntervalSince1970,
+                isStableRoot: kv.isStableRoot,
+                // A post-answer row counts as a resume boundary once this
+                // model has been seen to resume from one.
+                isResumeBoundary: kv.isResumeBoundary
+                    || (kv.isPostAnswer && diskCache.postAnswerRowsResume),
+                isPostAnswer: kv.isPostAnswer,
+                isCanonicalCheckpoint: kv.isCanonicalCheckpoint,
+                chainId: kv.chainId,
+                isLegacyCompanion: false))
+        }
+        // A KV hash is hex, so the prefix keeps the two id spaces apart.
+        let legacyPrefix = "legacy:"
+        for companion in legacy {
+            rows.append(QuotaRow(
+                id: legacyPrefix + companion.key,
+                tokenCount: 0,
+                bytes: companion.bytes,
+                recency: companion.modifiedAt.timeIntervalSince1970,
+                isStableRoot: false,
+                chainId: nil,
+                isLegacyCompanion: true))
+        }
+        let rowsMs = msSince(passStart)
+
+        // The planner sees the rows this build understands. Under a newer
+        // build's index the others are opaque — counted, never offered — so
+        // what they hold comes off the cap the understood rows share. (Under
+        // the current schema a record that names nothing has just been
+        // retired; if that could not be written, nothing real pays for it.)
+        //
+        // Once the opaque bytes reach the cap, `planCap` is 0: every row is
+        // oversized, and each store is evicted by the pass that follows it.
+        // That is the decision, and it stands; it is said once per root and
+        // reported in ``DiskCacheStats/opaqueBytes``.
+        var planCap = maxBytes
+        if diskCache.indexIsFromANewerBuild {
+            let understood = IndexedBytes.total(rows.lazy.map(\.bytes))
+            let opaque = IndexedBytes.difference(diskCache.usageBytes(), understood)
+            planCap = IndexedBytes.difference(maxBytes, opaque)
+            diskCache.noteOpaqueBytes(opaque, capBytes: maxBytes)
+        }
+
+        let selectStart = DispatchTime.now().uptimeNanoseconds
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: planCap, activeChain: activeChain)
+        let selectMs = msSince(selectStart)
+        guard !plan.evict.isEmpty else { return }
+
+        var evictKV = Set<String>()
+        var evictCompanion = Set<String>()
+        for id in plan.evict {
+            if let kv = kvByID[id] {
+                evictKV.insert(kv.hash)
+                if let key = kv.companionKey { evictCompanion.insert(key) }
+            } else {
+                evictCompanion.insert(String(id.dropFirst(legacyPrefix.count)))
+            }
+        }
+        let legacyBytes = Dictionary(
+            legacy.map { ($0.key, $0.bytes) }, uniquingKeysWith: { first, _ in first })
+
+        // Order: every FILE goes before the ROW that counts it. If the
+        // process dies part-way, what is left is a row naming files that are
+        // gone — an over-count, which the next import (or the next fetch of
+        // that row) clears. The other order leaves files the index has
+        // stopped counting, which nothing would ever evict. So: companion
+        // files first, since the KV call below drops a row together with its
+        // companion bytes; then each KV payload followed by its row; then the
+        // unlinked companions' rows.
+        //
+        // The same rule covers a file that could not be deleted: it keeps
+        // its record, for the bytes that are left, and the next pass selects
+        // it again. Each file is tried once per pass, and the plan is not
+        // redone to make up for it, so one undeletable file costs at most its
+        // own bytes over the cap and never takes the rest of the cache.
+        let deleteStart = DispatchTime.now().uptimeNanoseconds
+        let companionsStillOnDisk = companionStore.removeQuotaEntries(hashes: evictCompanion)
+        let removedCompanions = evictCompanion.subtracting(companionsStillOnDisk)
+        let removedKV = diskCache.removeQuotaEntries(
+            hashes: evictKV, removedCompanions: removedCompanions)
+        let removedLegacy = removedCompanions.intersection(legacyBytes.keys)
+        diskCache.forgetLegacyCompanions(keys: removedLegacy)
+        for key in companionsStillOnDisk {
+            if let current = SSMCompanionDiskStore.publishedEntry(
+                key: key, in: companionStore.directory)
+            {
+                diskCache.correctCompanionBytes(key: key, bytes: current.bytes)
+            }
+        }
+        let deleteMs = msSince(deleteStart)
+
+        // A group is evicted once every file of it is gone.
+        var evictedGroups = 0
+        var evictedBytes: Int64 = 0
+        for id in plan.evict {
+            if let kv = kvByID[id] {
+                guard removedKV.contains(kv.hash),
+                      kv.companionKey.map(removedCompanions.contains) ?? true
+                else { continue }
+                evictedGroups += 1
+                evictedBytes = IndexedBytes.sum(
+                    evictedBytes, IndexedBytes.sum(kv.bytes, kv.companionBytes))
+            } else {
+                let key = String(id.dropFirst(legacyPrefix.count))
+                guard removedLegacy.contains(key) else { continue }
+                evictedGroups += 1
+                evictedBytes = IndexedBytes.sum(evictedBytes, legacyBytes[key] ?? 0)
+            }
+        }
+        let totalMs = msSince(passStart)
+        let lostRows = removedKV.union(kvEntries.compactMap { kv in
+            kv.companionKey.map(removedCompanions.contains) == true ? kv.hash : nil
+        })
+        let confirmedEvent = plan.confirmedEvent(rows: rows, lostRows: lostRows)
+        diskCache.recordQuotaPass(
+            evictedGroups: evictedGroups, evictedBytes: evictedBytes, milliseconds: totalMs,
+            event: confirmedEvent,
+            tipTokenCount: DiskQuotaPlanner.resumePoint(
+                of: rows.filter { $0.chainId == activeChain })?.tokenCount ?? 0)
+        _lastQuotaPassTiming = QuotaPassTiming(
+            rowsMs: rowsMs, selectMs: selectMs, deleteMs: deleteMs, totalMs: totalMs,
+            evictedGroups: evictedGroups)
+
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            // Same leading keys as the directory-walk line; `ms` and `event`
+            // are appended. An index pass never removes an orphan on sight, so
+            // that count is always 0 here.
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.totalAfter)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(removedLegacy.count) orphanCompanionEvicted=0 deleteFailures=\(evictKV.count - removedKV.count + companionsStillOnDisk.count) source=index ms=\(String(format: "%.3f", totalMs)) rowsMs=\(String(format: "%.3f", rowsMs)) selectMs=\(String(format: "%.3f", selectMs)) deleteMs=\(String(format: "%.3f", deleteMs)) event=\(confirmedEvent?.kind.rawValue ?? "none") chain=\(activeChain ?? "none")\n".utf8))
+        }
+    }
+
+    /// The pre-v2 pass, kept for an index without the companion columns:
+    /// lists the companion directory and reads every sidecar on every call.
+    private func enforceDirectoryWalkQuotaLocked(
+        diskCache: DiskCache, companionStore: SSMCompanionDiskStore, maxBytes: Int64
+    ) {
+        let passStart = DispatchTime.now().uptimeNanoseconds
         let kvEntries = diskCache.quotaEntries()
         let kvHashes = Set(kvEntries.map(\.hash))
         var companionEntries = companionStore.quotaEntries()
 
-        let orphaned = companionEntries.filter {
+        // Under a newer build's index a row this build cannot read is not
+        // in `kvEntries`, so "no such row" proves nothing about a companion:
+        // none is removed on sight, and the opaque rows' payload bytes come
+        // off the cap the understood groups share.
+        let rowsAreOpaque = diskCache.indexIsFromANewerBuild
+        let opaqueBytes = rowsAreOpaque
+            ? IndexedBytes.difference(
+                Int64(diskCache.snapshotStats().currentPayloadBytes),
+                IndexedBytes.total(kvEntries.lazy.map(\.bytes)))
+            : 0
+        if rowsAreOpaque { diskCache.noteOpaqueBytes(opaqueBytes, capBytes: maxBytes) }
+        let orphaned = rowsAreOpaque ? [] : companionEntries.filter {
             guard let kvHash = $0.kvHash else { return false }
             return !kvHashes.contains(kvHash)
         }
@@ -1164,18 +1934,6 @@ public final class CacheCoordinator: @unchecked Sendable {
             companionStore.removeQuotaEntries(hashes: Set(orphaned.map(\.hash)))
             let orphanHashes = Set(orphaned.map(\.hash))
             companionEntries.removeAll { orphanHashes.contains($0.hash) }
-        }
-
-        struct EvictionGroup {
-            let sortKey: String
-            let kvHashes: Set<String>
-            let companionHashes: Set<String>
-            let bytes: Int64
-            let createdAt: Date
-            /// Legacy companions predate the KV-link sidecar. They cannot
-            /// prove that an indexed KV payload can still reach them, so quota
-            /// pressure retires them before directly addressable KV groups.
-            let priority: Int
         }
 
         let companionsByKVHash = Dictionary(grouping: companionEntries.compactMap { entry in
@@ -1191,7 +1949,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                 sortKey: "kv:\(kv.hash)",
                 kvHashes: [kv.hash],
                 companionHashes: Set(companions.map(\.hash)),
-                bytes: kv.bytes + companions.reduce(0) { $0 + $1.bytes },
+                bytes: IndexedBytes.sum(
+                    kv.bytes, IndexedBytes.total(companions.lazy.map(\.bytes))),
                 createdAt: companions.reduce(kv.createdAt) {
                     min($0, $1.modifiedAt)
                 },
@@ -1210,52 +1969,39 @@ public final class CacheCoordinator: @unchecked Sendable {
                 priority: companion.kvHash == nil ? 0 : 1))
         }
 
-        let totalBefore = groups.reduce(Int64(0)) { $0 + $1.bytes }
-        guard totalBefore > maxBytes else { return }
+        let plan = Self.groupsToEvict(
+            from: groups, maxBytes: IndexedBytes.difference(maxBytes, opaqueBytes))
+        guard !plan.evicted.isEmpty else { return }
 
-        var remaining = totalBefore
-        var evictKV = Set<String>()
-        var evictCompanion = Set<String>()
-        var evictedGroupKeys = Set<String>()
-
-        // Reject any group that can never fit before applying LRU. Stable
-        // boundaries are normally written shortest-to-longest; evicting the
-        // older fitting boundary first and only then discovering that the
-        // newest group is individually oversized leaves the cache empty.
-        // Pre-eviction preserves the best prior prefix that actually fits.
-        let oversized = groups.filter { $0.bytes > maxBytes }
-        for group in oversized {
-            evictedGroupKeys.insert(group.sortKey)
-            evictKV.formUnion(group.kvHashes)
-            evictCompanion.formUnion(group.companionHashes)
-            remaining -= group.bytes
-        }
-        let oversizedKeys = Set(oversized.map(\.sortKey))
-
-        for group in groups.sorted(by: {
-            if $0.priority != $1.priority { return $0.priority < $1.priority }
-            if $0.createdAt == $1.createdAt { return $0.sortKey < $1.sortKey }
-            return $0.createdAt < $1.createdAt
-        }) where remaining > maxBytes && !oversizedKeys.contains(group.sortKey) {
-            evictedGroupKeys.insert(group.sortKey)
-            evictKV.formUnion(group.kvHashes)
-            evictCompanion.formUnion(group.companionHashes)
-            remaining -= group.bytes
+        let evictKV = plan.evicted.reduce(into: Set<String>()) { $0.formUnion($1.kvHashes) }
+        let evictCompanion = plan.evicted.reduce(into: Set<String>()) {
+            $0.formUnion($1.companionHashes)
         }
 
-        diskCache.removeQuotaEntries(hashes: evictKV)
-        companionStore.removeQuotaEntries(hashes: evictCompanion)
-        diskCache.recordQuotaEvictions(evictedGroupKeys.count)
+        let removedKV = diskCache.removeQuotaEntries(hashes: evictKV)
+        let removedCompanions = evictCompanion.subtracting(
+            companionStore.removeQuotaEntries(hashes: evictCompanion))
+        // A group is evicted once every file of it is gone.
+        let evicted = plan.evicted.filter {
+            $0.kvHashes.isSubset(of: removedKV) && $0.companionHashes.isSubset(of: removedCompanions)
+        }
+        let evictedGroups = evicted.count
+        // No chain ids on this index, so no conversation to raise an event for.
+        diskCache.recordQuotaPass(
+            evictedGroups: evictedGroups,
+            evictedBytes: IndexedBytes.total(evicted.lazy.map(\.bytes)),
+            milliseconds: Double(DispatchTime.now().uptimeNanoseconds - passStart) / 1_000_000,
+            event: nil)
 
         let legacyCompanionEvicted = companionEntries.reduce(into: 0) { count, entry in
-            if entry.kvHash == nil, evictCompanion.contains(entry.hash) {
+            if entry.kvHash == nil, removedCompanions.contains(entry.hash) {
                 count += 1
             }
         }
 
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
-                "[vmlx][cache/disk-quota] before=\(totalBefore) after=\(max(0, remaining)) max=\(maxBytes) logicalEvictions=\(evictedGroupKeys.count) kvEvicted=\(evictKV.count) companionEvicted=\(evictCompanion.count) legacyCompanionEvicted=\(legacyCompanionEvicted) orphanCompanionEvicted=\(orphaned.count)\n".utf8))
+                "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.remaining)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(legacyCompanionEvicted) orphanCompanionEvicted=\(orphaned.count) deleteFailures=\(evictKV.count - removedKV.count + evictCompanion.count - removedCompanions.count) source=walk\n".utf8))
         }
     }
 

@@ -7,8 +7,9 @@ import Testing
 
 /// Numerical parity coverage for `Qwen4ExpFusedAffineMoE`.
 ///
-/// Every combination below ships in a real JANG bundle (source:
-/// /Users/eric/models/Logs/q38fn-maps). The fused kernel and the eager
+/// The shipped combinations come from real JANG bundles (source:
+/// /Users/eric/models/Logs/q38fn-maps); explicitly labeled qualification cases
+/// also exercise group-128 support at Qwen geometry. The fused kernel and the eager
 /// gather-QMM fallback are both compared against the exact f32 result computed
 /// from dequantized weights. A packing/unpack defect produces O(1) relative
 /// error; legitimate accumulation-order drift stays at bf16 rounding scale in
@@ -30,7 +31,7 @@ struct Qwen4ExpFusedAffineMoETests {
 
     /// Shipped layouts: 4M uniform, the three 4S mixes incl. the layer-44
     /// g32 outlier, the 2L down g32 outlier, and the two 6S q6 mixes.
-    private static let shippedCombos: [Combo] = [
+    private static let qualifiedCombos: [Combo] = [
         Combo(label: "4M_uniform_q4g64", gate: (4, 64), up: (4, 64), down: (4, 64)),
         Combo(label: "4S_common_q2q3q3", gate: (2, 64), up: (3, 64), down: (3, 64)),
         Combo(label: "4S_upper_q3q3q4", gate: (3, 64), up: (3, 64), down: (4, 64)),
@@ -40,6 +41,11 @@ struct Qwen4ExpFusedAffineMoETests {
         Combo(label: "6S_up_down_q6", gate: (4, 64), up: (6, 64), down: (6, 64)),
         Combo(label: "Ornith_late_gate_up_q5", gate: (5, 64), up: (5, 64), down: (4, 64)),
         Combo(label: "q5_all_projections", gate: (5, 64), up: (5, 64), down: (5, 64)),
+        // Group 128 was admitted by the GLM shape extension. Exercise its
+        // packing and independent-row behavior here without claiming these
+        // extra Qwen-shaped fixtures are shipped Qwen quantization layouts.
+        Combo(label: "qualification_q2g128_q2g128_q3g64", gate: (2, 128), up: (2, 128), down: (3, 64)),
+        Combo(label: "qualification_q4g128_uniform", gate: (4, 128), up: (4, 128), down: (4, 128)),
     ]
 
     private static func makeProjection(
@@ -75,9 +81,9 @@ struct Qwen4ExpFusedAffineMoETests {
         return (num / den).item(Float.self)
     }
 
-    @Test("fused kernel matches exact math for every shipped bit/group layout")
+    @Test("fused kernel matches exact math for shipped and group-128 qualification layouts")
     func shippedLayoutParity() throws {
-        for (comboIndex, combo) in Self.shippedCombos.enumerated() {
+        for (comboIndex, combo) in Self.qualifiedCombos.enumerated() {
             let seedBase = UInt64(1000 + comboIndex * 17)
             let (gate, gateExact) = Self.makeProjection(
                 inputDims: Self.inputDims, outputDims: Self.expertDims,
@@ -164,9 +170,9 @@ struct Qwen4ExpFusedAffineMoETests {
         }
     }
 
-    @Test("native-MTP rows 2 through 4 match independent row-1 decode for every shipped layout")
+    @Test("native-MTP rows 2 through 4 match independent row-1 decode for every qualified layout")
     func smallRowIsolationParity() throws {
-        for (comboIndex, combo) in Self.shippedCombos.enumerated() {
+        for (comboIndex, combo) in Self.qualifiedCombos.enumerated() {
             let seed = UInt64(7001 + comboIndex * 101)
             let (gate, _) = Self.makeProjection(
                 inputDims: Self.inputDims, outputDims: Self.expertDims,
@@ -228,7 +234,7 @@ struct Qwen4ExpFusedAffineMoETests {
     @Test("native-MTP accepts production-shaped non-contiguous row views")
     func smallNonContiguousRowParity() throws {
         let seed: UInt64 = 7501
-        let combo = Self.shippedCombos[4] // Qwen3.8 Flash-Next 2L q2/q2/q2-g32.
+        let combo = Self.qualifiedCombos[4] // Qwen3.8 Flash-Next 2L q2/q2/q2-g32.
         let (gate, _) = Self.makeProjection(
             inputDims: Self.inputDims, outputDims: Self.expertDims,
             bits: combo.gate.bits, groupSize: combo.gate.group, seed: seed)
@@ -374,19 +380,20 @@ struct Qwen4ExpFusedAffineMoETests {
             Qwen4ExpFusedAffineMoE.makeReducer(
                 gate: f32Projection, up: good, down: goodDown) == nil)
 
-        // Group size 128 is outside the supported set.
-        let g128Source = MLXRandom.uniform(
-            low: -0.5, high: 0.5, [Self.experts, Self.expertDims, Self.inputDims],
-            key: MLXRandom.key(8)
-        ).asType(.float16)
-        let (w128, s128, b128) = MLX.quantized(g128Source, groupSize: 128, bits: 4, mode: .affine)
-        let g128Projection = QuantizedSwitchLinear(
+        // Group 128 is supported. Group 256 remains outside the qualified
+        // set. Construct checkpoint-shaped metadata directly: the upstream
+        // quantizer itself rejects group 256, before our admission guard.
+        let metadataShape = [Self.experts, Self.expertDims, Self.inputDims / 256]
+        let g256Projection = QuantizedSwitchLinear(
             inputDims: Self.inputDims, outputDims: Self.expertDims,
             numExperts: Self.experts,
-            weight: w128, scales: s128, biases: b128, groupSize: 128, bits: 4, mode: .affine)
+            weight: good.weight,
+            scales: MLXArray.ones(metadataShape, dtype: .float16),
+            biases: MLXArray.zeros(metadataShape, dtype: .float16),
+            groupSize: 256, bits: 4, mode: .affine)
 
         #expect(
             Qwen4ExpFusedAffineMoE.makeReducer(
-                gate: g128Projection, up: good, down: goodDown) == nil)
+                gate: g256Projection, up: good, down: goodDown) == nil)
     }
 }

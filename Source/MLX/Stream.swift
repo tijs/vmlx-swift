@@ -89,8 +89,20 @@ public final class Stream: @unchecked Sendable, Equatable {
 
     let ctx: mlx_stream
 
-    public static let gpu = Stream(mlx_default_gpu_stream_new())
-    public static let cpu = Stream(mlx_default_cpu_stream_new())
+    // Swift tasks can resume on another OS thread. These streams use the
+    // core's cross-thread encoder registry; evalLock serializes their use.
+    private static func newStreamThreadUnsafe(_ type: mlx_device_type) -> mlx_stream {
+        // Do not initialize Device.gpu/cpu here: Device owns these default
+        // streams, so doing so would recursively initialize the static value.
+        evalLock.withLock {
+            let device = mlx_device_new_type(type, 0)
+            defer { mlx_device_free(device) }
+            return mlx_stream_new_thread_unsafe(device)
+        }
+    }
+
+    public static let gpu = Stream(newStreamThreadUnsafe(MLX_GPU))
+    public static let cpu = Stream(newStreamThreadUnsafe(MLX_CPU))
 
     @TaskLocal static var defaultStream: Stream?
 
@@ -110,63 +122,73 @@ public final class Stream: @unchecked Sendable, Equatable {
         return try await $defaultStream.withValue(Stream(device), operation: body)
     }
 
-    /// Set the C++ process-wide default stream (zero overhead, no @TaskLocal).
+    /// Set the C++ default stream on the current OS thread.
     ///
-    /// This calls `mlx_set_default_stream()` directly — the C++ scheduler's
-    /// `default_streams_` map is updated immediately. All subsequent MLX ops
-    /// that use the default stream will dispatch to this stream's thread/queue.
+    /// Core 0.32 uses thread-local defaults. This affects native operations
+    /// on this thread only, not Swift's explicit StreamOrDevice defaults.
+    /// Do not span an async suspension; use withNewDefaultStream for Tasks.
     ///
-    /// Use with `restoreDefault()` to bracket generation loops:
+    /// For native calls that omit their stream, bracket a synchronous scope
+    /// with ``runWith(_:)``. For Swift model operations use
+    /// ``withNewDefaultStream(device:_:)-5bwc3`` instead:
     /// ```swift
-    /// let genStream = Stream(Device.defaultDevice())
-    /// Stream.setDefault(genStream)  // model ops → generation stream
-    /// asyncEval(token)              // submitted to generation stream
-    /// Stream.restoreDefault()       // item() → default stream (no contention)
-    /// let value = token.item(Int.self)
+    /// Stream.withNewDefaultStream {
+    ///     let result = model(input)  // Swift defaults select this Task's stream
+    ///     asyncEval(result)
+    ///     StreamOrDevice.default.stream.synchronize()
+    /// }
     /// ```
     public static func setDefault(_ stream: Stream) {
-        mlx_set_default_stream(stream.ctx)
+        _ = evalLock.withLock { mlx_set_default_stream(stream.ctx) }
     }
 
     /// Restore the original default stream for the device.
     public static func restoreDefault(device: Device = Device.defaultDevice()) {
         let defaultStream = Stream.defaultStream(device)
-        mlx_set_default_stream(defaultStream.ctx)
+        _ = evalLock.withLock { mlx_set_default_stream(defaultStream.ctx) }
     }
 
-    /// Run a closure with this stream as the C++ default. Zero per-call overhead.
+    /// Run a synchronous closure with this stream as the C++ thread-local default.
     ///
     /// Sets the C++ scheduler's default stream, runs the closure, restores the
-    /// original — all in one C++ call. No Swift `@TaskLocal`, no per-iteration
-    /// stream switching overhead. Matches Python's `with mx.stream(s): ...`
+    /// original in one C++ call, under the shared recursive evaluation lock.
+    /// This does not override Swift's explicit `StreamOrDevice` parameters.
     ///
     /// - Parameter body: Closure to run with this stream as default.
     public func runWith(_ body: @escaping () -> Void) {
         // Use Unmanaged to pass the closure as a void* context to C
         let box = ClosureBox(body)
         let unmanaged = Unmanaged.passRetained(box)
-        mlx_stream_run_with(ctx, { context in
-            let box = Unmanaged<ClosureBox>.fromOpaque(context!).takeRetainedValue()
-            box.closure()
-        }, unmanaged.toOpaque())
+        defer { unmanaged.release() }
+        _ = evalLock.withLock {
+            mlx_stream_run_with(ctx, { context in
+                let box = Unmanaged<ClosureBox>.fromOpaque(context!).takeUnretainedValue()
+                box.closure()
+            }, unmanaged.toOpaque())
+        }
     }
 
     init(_ ctx: mlx_stream) {
         self.ctx = ctx
     }
 
-    /// Default stream on the default device.
+    /// The effective Swift default stream, including a scoped Task default.
+    ///
+    /// This shares the existing stream; it does not allocate a new queue.
+    /// Use `Stream(device)` to create a new stream on a specified device.
     public init() {
-        let device = Device.defaultDevice()
-        var ctx = mlx_stream_new()
-        mlx_get_default_stream(&ctx, device.ctx)
-        self.ctx = ctx
+        let selected = StreamOrDevice.default.stream
+        self.ctx = evalLock.withLock {
+            var ctx = mlx_stream_new()
+            _ = mlx_stream_set(&ctx, selected.ctx)
+            return ctx
+        }
     }
 
     @available(*, deprecated, message: "use init(Device) -- index not supported")
     public init(index: Int32, _ device: Device) {
         self.ctx = evalLock.withLock {
-            mlx_stream_new_device(device.ctx)
+            mlx_stream_new_thread_unsafe(device.ctx)
         }
     }
 
@@ -175,7 +197,7 @@ public final class Stream: @unchecked Sendable, Equatable {
     /// See also ``withNewDefaultStream(device:_:)-5bwc3``
     public init(_ device: Device) {
         self.ctx = evalLock.withLock {
-            mlx_stream_new_device(device.ctx)
+            mlx_stream_new_thread_unsafe(device.ctx)
         }
     }
 

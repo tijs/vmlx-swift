@@ -3,9 +3,10 @@
 
 #pragma once
 
-#include <unordered_map>
-#include <variant>
 #include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
+#include <variant>
 
 #include <Cmlx/mlx-api.h>
 #include <Cmlx/mlx-array.h>
@@ -51,17 +52,14 @@ MLX_API SafetensorsLoad load_safetensors_excluding(
     bool exact_tensor_buffers,
     StreamOrDevice s = {});
 
-MLX_API int64_t safetensors_mmap_advise_routed(
-    int32_t advice,
-    int32_t cold_pct);
+MLX_API int64_t
+safetensors_mmap_advise_routed(int32_t advice, int32_t cold_pct);
 MLX_API int64_t safetensors_mmap_advise_experts(
     int32_t advice,
     const int32_t* layers,
     const int32_t* experts,
     int64_t count);
-MLX_API int64_t safetensors_mmap_advise_layer(
-    int32_t advice,
-    int32_t layer);
+MLX_API int64_t safetensors_mmap_advise_layer(int32_t advice, int32_t layer);
 MLX_API int64_t safetensors_mmap_tracked_buffer_bytes();
 MLX_API array mmap_file_region(
     const std::string& file,

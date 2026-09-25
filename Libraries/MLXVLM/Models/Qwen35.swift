@@ -349,8 +349,16 @@ enum Qwen4ExpCompiledGDNInputs {
     }
 }
 
-private enum Qwen4ExpCompiledMoE {
+enum Qwen4ExpCompiledMoE {
     typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
+
+    private struct DenseRouterKey: Hashable {
+        let hiddenSize: Int
+        let experts: Int
+        let topK: Int
+        let normTopK: Bool
+        let weightDType: DType
+    }
 
     static let enabled: Bool = {
         let value = RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_MOE") ?? "1"
@@ -358,6 +366,7 @@ private enum Qwen4ExpCompiledMoE {
     }()
     private static let lock = NSLock()
     nonisolated(unsafe) private static var routerRegions: [String: Region] = [:]
+    nonisolated(unsafe) private static var denseRouterRegions: [DenseRouterKey: Region] = [:]
     nonisolated(unsafe) private static var sharedRegions: [String: Region] = [:]
     nonisolated(unsafe) private static var didReportRouter = false
     nonisolated(unsafe) private static var didReportShared = false
@@ -409,13 +418,24 @@ private enum Qwen4ExpCompiledMoE {
     static func denseRouter(
         _ x: MLXArray, weight: MLXArray, topK: Int, normTopK: Bool
     ) -> (indices: MLXArray, scores: MLXArray)? {
-        guard enabled, !CompiledDecodeTrace.isActive, x.dim(1) == 1,
-            x.dtype == .bfloat16, weight.dtype == .bfloat16
+        // JANG's loader materializes routing weights in F32. Preserve those
+        // weights and matmul promotion instead of rounding them to fit the
+        // BF16 trunk. Keep prefill/verify and outer compiled traces unchanged.
+        guard enabled, !CompiledDecodeTrace.isActive,
+            x.ndim == 3, x.dim(0) > 0, x.dim(1) == 1,
+            x.dtype == .bfloat16, weight.ndim == 2,
+            weight.dtype == .bfloat16 || weight.dtype == .float32,
+            x.dim(2) > 0, weight.dim(1) == x.dim(2),
+            topK > 0, topK <= weight.dim(0)
         else { return nil }
         let experts = weight.dim(0)
-        let key = "dense|\(experts)|\(topK)|\(normTopK)"
+        // This lookup runs once per MoE layer per decoded token. Avoid
+        // formatting geometry/dtype strings on the very path being shortened.
+        let key = DenseRouterKey(
+            hiddenSize: x.dim(2), experts: experts, topK: topK,
+            normTopK: normTopK, weightDType: weight.dtype)
         lock.lock()
-        var region = routerRegions[key]
+        var region = denseRouterRegions[key]
         if region == nil {
             region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
                 let gates = MLX.softmax(
@@ -429,13 +449,13 @@ private enum Qwen4ExpCompiledMoE {
                 }
                 return [indices, scores]
             }
-            routerRegions[key] = region
+            denseRouterRegions[key] = region
         }
         if !didReportRouter {
             didReportRouter = true
             FileHandle.standardError.write(
                 Data(
-                    "[Qwen4Exp] compiled_moe_router=active kind=dense shared_weight_inputs=true dtype=bfloat16\n"
+                    "[Qwen4Exp] compiled_moe_router=active kind=dense shared_weight_inputs=true input_dtype=\(x.dtype) weight_dtype=\(weight.dtype)\n"
                         .utf8))
         }
         lock.unlock()
@@ -1120,35 +1140,53 @@ enum Qwen35Language {
         _ args: Qwen35Configuration.TextConfiguration,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
-        if let override = RuntimeEnvironment.value(
-            "VMLX_QWEN35_COMPILE_DECODE_REGIONS", in: environment)
-        {
-            return override != "0" && override.lowercased() != "false"
-        }
-        return args.modelType == "qwen3_5_moe_text"
-            && args.hiddenSize == 2048
-            && args.hiddenLayers == 40
-            && args.fullAttentionInterval == 4
-            && args.numExperts == 256
-            && args.numExpertsPerTok == 8
-            && args.moeIntermediateSize == 512
-            && args.linearNumKeyHeads == 16
-            && args.linearNumValueHeads == 32
-            && args.linearKeyHeadDim == 128
-            && args.linearValueHeadDim == 128
+        // Shared with the text-only path (Qwen35CompiledDecodePolicy lives in
+        // MLXLMCommon next to the compiled region it gates), so the two Qwen 3.5
+        // constructions cannot drift apart.
+        Qwen35CompiledDecodePolicy.shouldCompileDecodeRegions(
+            modelType: args.modelType,
+            hiddenSize: args.hiddenSize,
+            hiddenLayers: args.hiddenLayers,
+            fullAttentionInterval: args.fullAttentionInterval,
+            numExperts: args.numExperts,
+            numExpertsPerTok: args.numExpertsPerTok,
+            moeIntermediateSize: args.moeIntermediateSize,
+            linearNumKeyHeads: args.linearNumKeyHeads,
+            linearNumValueHeads: args.linearNumValueHeads,
+            linearKeyHeadDim: args.linearKeyHeadDim,
+            linearValueHeadDim: args.linearValueHeadDim,
+            environment: environment)
     }
 
     final class RotaryEmbedding {
+        /// Everything that determines the position factors, excluding the
+        /// output dtype and positions themselves. No model/layer name is used.
+        struct FactorSignature: Hashable {
+            let dimension: Int
+            let baseBits: UInt32
+            let sections: [Int]
+            let textFastPath: Bool
+        }
+
+        let factorSignature: FactorSignature
         private let invFreq: MLXArray
         private let mropeSection: [Int]
+        private let textPositionFastPath: Bool
 
-        init(dim: Int, base: Float, mropeSection: [Int]) {
+        init(
+            dim: Int, base: Float, mropeSection: [Int],
+            textPositionFastPath: Bool = false
+        ) {
             let safeDim = max(1, dim)
             var freq = MLXArray(stride(from: 0, to: safeDim, by: 2)).asType(.float32)
             freq = freq / Float(safeDim)
             self.invFreq = 1.0 / pow(MLXArray(base), freq)
             self.mropeSection =
                 mropeSection.count >= 3 ? mropeSection : [11, 11, 10]
+            self.textPositionFastPath = textPositionFastPath
+            self.factorSignature = FactorSignature(
+                dimension: safeDim, baseBits: base.bitPattern,
+                sections: self.mropeSection, textFastPath: textPositionFastPath)
         }
 
         private func applyInterleavedMRope(_ freqs: MLXArray) -> MLXArray {
@@ -1173,6 +1211,18 @@ enum Qwen35Language {
         }
 
         func callAsFunction(x: MLXArray, positionIds: MLXArray) -> (MLXArray, MLXArray) {
+            if textPositionFastPath, positionIds.ndim == 2 {
+                // A [B,S] text position is broadcast identically to all three
+                // M-RoPE channels. Selecting a channel for each frequency is
+                // therefore redundant. Preserve the original FP32 elementwise
+                // product, trig operations and final dtype; no K=1 matmul or
+                // collapsed media positions. Explicit [3,B,S] positions below
+                // retain the full interleaved path, including after media.
+                let freqs = positionIds.asType(.float32)[0..., 0..., .newAxis]
+                    * invFreq.asType(.float32)[.newAxis, .newAxis, 0...]
+                let emb = concatenated([freqs, freqs], axis: -1)
+                return (cos(emb).asType(x.dtype), sin(emb).asType(x.dtype))
+            }
             var positionIds = positionIds
             if positionIds.ndim == 2 {
                 positionIds = broadcast(
@@ -1383,13 +1433,14 @@ enum Qwen35Language {
                 attentionMask = .none
             }
 
-            let output = attentionWithCacheUpdate(
+            let output = JangHadamardAttention.attention(
                 queries: queries,
                 keys: keys,
                 values: values,
                 cache: cache,
                 scale: scale,
-                mask: attentionMask
+                mask: attentionMask,
+                enabled: JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
             )
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
@@ -1420,6 +1471,8 @@ enum Qwen35Language {
     }
 
     final class GatedDeltaNet: Module {
+        private var qkNormalization: Qwen4ExpGDNQKNorm?
+        private(set) var qkNormalizationCallCount = 0
         private static let fusionDiagnosticLock = NSLock()
         private nonisolated(unsafe) static var didReportDecodeInputFusion = false
 
@@ -1540,6 +1593,7 @@ enum Qwen35Language {
             if !attemptedDecodeInputFusion {
                 attemptedDecodeInputFusion = true
                 let modules = [inProjQKV, inProjZ, inProjB, inProjA]
+                guard modules.allSatisfy(jangAllowsRawQuantizedProjection) else { return nil }
                 guard let first = modules[0] as? QuantizedLinear,
                     let firstBiases = first.biases,
                     first.bias == nil,
@@ -1659,6 +1713,7 @@ enum Qwen35Language {
             let modules = [inProjQKV, inProjZ, inProjB, inProjA]
             let quantizedModules = modules.map { $0 as? QuantizedLinear }
             guard
+                modules.allSatisfy(jangAllowsRawQuantizedProjection),
                 quantizedModules.allSatisfy({
                     $0 != nil && $0?.bias == nil && $0?.biases != nil
                 })
@@ -1768,6 +1823,7 @@ enum Qwen35Language {
 
         private func compiledDecodeTail(_ output: MLXArray, gate: MLXArray) -> MLXArray? {
             guard fuseDecodeInputProjections,
+                jangAllowsRawQuantizedProjection(outProj),
                 let quantized = outProj as? QuantizedLinear,
                 let biases = quantized.biases,
                 quantized.bias == nil
@@ -1801,7 +1857,8 @@ enum Qwen35Language {
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
             cache: MambaCache? = nil,
-            recordPrefixCommitStates: Bool = false
+            recordPrefixCommitStates: Bool = false,
+            fuseQKNormalization: Bool = false
         ) -> MLXArray {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
@@ -1884,13 +1941,33 @@ enum Qwen35Language {
                 let q = split[0].reshaped(B, S, numKHeads, headKDim)
                 let k = split[1].reshaped(B, S, numKHeads, headKDim)
                 v = split[2].reshaped(B, S, numVHeads, headVDim)
-                let invScale = pow(Float(headKDim), -0.5)
-                qNormed =
-                    MLXArray(pow(invScale, 2), dtype: q.dtype)
-                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-                kNormed =
-                    MLXArray(invScale, dtype: k.dtype)
-                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                var groupedNorm: MLXArray?
+                if fuseQKNormalization, mask == nil, !recordPrefixCommitStates,
+                    Qwen4ExpGDNQKNorm.eligible(shape: convOut.shape, dtype: convOut.dtype,
+                                             heads: numKHeads, headDimension: headKDim)
+                {
+                    if qkNormalization == nil {
+                        qkNormalization = Qwen4ExpGDNQKNorm(heads: numKHeads, headDimension: headKDim)
+                    }
+                    groupedNorm = qkNormalization?(convOut)
+                }
+                if let groupedNorm {
+                    qNormed = groupedNorm[0..., 0..., ..<numKHeads, 0...]
+                    kNormed = groupedNorm[0..., 0..., numKHeads..., 0...]
+                    if qkNormalizationCallCount == 0 {
+                        NSLog("[Qwen4Exp] gdn_qk_norm=active heads=%d width=%d dtype=%@ ar_only=1 intermediate_rounding=preserved",
+                              numKHeads, headKDim, String(describing: convOut.dtype))
+                    }
+                    qkNormalizationCallCount += 1
+                } else {
+                    let invScale = pow(Float(headKDim), -0.5)
+                    qNormed =
+                        MLXArray(pow(invScale, 2), dtype: q.dtype)
+                        * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                    kNormed =
+                        MLXArray(invScale, dtype: k.dtype)
+                        * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                }
             }
 
             // Same defense as the conv slot: a mis-restored recurrent state
@@ -2808,7 +2885,7 @@ enum Qwen35Language {
             ropeDeltas = nil
         }
 
-        private func resolvedPositionIds(
+        fileprivate func resolvedPositionIds(
             inputs: MLXArray,
             cache: [KVCache?]?,
             mask: MLXArray?,
@@ -3328,6 +3405,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         cache: [any KVCache],
         windowSize: Int?
     ) throws -> PrepareResult {
+        try Task.checkCancellation()
         let inputIds = input.text.tokens
 
         var pixelValues: MLXArray?
@@ -3383,13 +3461,59 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
         let typedCache = castCache(cache)
 
+        let prefillStepSize = windowSize ?? 512
+        let promptTokenCount = inputIds.dim(1)
+        if let inputEmbeddings, pixelValues != nil, !cache.isEmpty,
+            prefillStepSize > 0, promptTokenCount > prefillStepSize,
+            input.text.mask == nil || input.text.mask?.ndim == 2,
+            let positions = languageModel.resolvedPositionIds(
+                inputs: inputIds,
+                cache: typedCache,
+                mask: input.text.mask,
+                providedPositionIds: nil,
+                imageGridTHW: imageFrames,
+                videoGridTHW: videoFrames,
+                resetForMedia: true)
+        {
+            // M-RoPE depends on the complete media grid. Resolve it once,
+            // retaining the full-prompt decode delta, then slice positions
+            // together with embeddings. Recomputing per chunk would restart
+            // image coordinates and corrupt subsequent text/decode positions.
+            // Evaluate vision/scatter once so prefix chunks do not retain the
+            // encoder's lazy intermediates alongside the language trunk.
+            try Task.checkCancellation()
+            MLX.eval(inputEmbeddings, positions)
+            var offset = 0
+            while offset + prefillStepSize < promptTokenCount {
+                try Task.checkCancellation()
+                let end = offset + prefillStepSize
+                _ = languageModel(
+                    inputIds[0..., offset ..< end],
+                    inputsEmbeds: inputEmbeddings[0..., offset ..< end, 0...],
+                    cache: typedCache,
+                    positionIds: positions[0..., 0..., offset ..< end])
+                // Both attention KV and GDN convolution/recurrent state must
+                // complete before transient buffers can be released.
+                MLX.eval(cache)
+                PrefillProgressReporter.reportCompletedUnits(end)
+                offset = end
+                MLX.Memory.clearCache()
+            }
+            try Task.checkCancellation()
+            return .logits(languageModel(
+                inputIds[0..., offset...],
+                inputsEmbeds: inputEmbeddings[0..., offset..., 0...],
+                cache: typedCache,
+                positionIds: positions[0..., 0..., offset...]))
+        }
+
         // Chunked text-only prefill so the UI prefill counter advances instead
         // of freezing at "0/N". The single-shot forward below emits no
         // `PrefillProgress` frames, so a long hybrid (Ornith / qwen3_5) prompt
         // showed a frozen counter until first token. Only the pure-text,
-        // causal-mask path is chunked: image/video prefill and custom masks keep
-        // the single-shot path because mrope position ids are derived from the
-        // full image grid. Chunking is numerically identical to single-shot —
+        // causal-mask path is handled here. Media with resolved full-prompt
+        // positions uses the separate chunk path above; unsupported custom
+        // masks keep the single-shot fallback. Chunking carries state —
         // the hybrid cache (GatedDeltaNet conv+recurrent state + KV) carries
         // state across forwards, and the language model derives position ids and
         // the causal mask from `cache.offset` (the same invariant that makes
@@ -3399,8 +3523,6 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         // how token-by-token decode runs), so a causal/padding prefill mask is
         // reconstructed correctly per chunk — same as Gemma4's chunked VLM
         // prefill, which also drops the incoming mask.
-        let prefillStepSize = windowSize ?? 512
-        let promptTokenCount = inputIds.dim(1)
         if inputEmbeddings == nil, pixelValues == nil,
             prefillStepSize > 0, promptTokenCount > prefillStepSize
         {
@@ -3795,5 +3917,17 @@ extension Qwen35: NativeMTPProposalHeadInstalling {
             ("[ProposalHead] qwen3_5 head is stamp-eligible (q\(bits)) but draft "
                 + "routing is not implemented for this family yet; drafting stays "
                 + "on the full head\n").utf8))
+    }
+}
+
+extension Qwen35: JangHadamardRuntimeModel {
+    public func validateJangHadamardRuntime() throws {
+        let text = config.textConfiguration
+        guard !text.tieWordEmbeddings, text.numExperts == 0,
+            text.mtpNumHiddenLayers == 0
+        else {
+            throw JangLoaderError.loadFailed(
+                "Hadamard Qwen3.5 requires an untied dense model without MTP")
+        }
     }
 }

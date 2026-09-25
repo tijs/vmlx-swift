@@ -255,6 +255,9 @@ final class Qwen35GatedDeltaNet: Module {
         else { return nil }
 
         let modules: [Linear] = [inProjQKV, inProjZ, inProjB, inProjA]
+        // Raw weight concatenation bypasses module.callAsFunction. Rotated
+        // matrices require their per-module activation transform first.
+        guard modules.allSatisfy(jangAllowsRawQuantizedProjection) else { return nil }
         // Affine-quantized, bias-free projections only: fusing a float
         // Linear is a plain concat too, but every shipped bundle this class
         // serves is quantized and the float case would need its own kernel
@@ -831,13 +834,14 @@ final class Qwen35Attention: Module {
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
-        let output = attentionWithCacheUpdate(
+        let output = JangHadamardAttention.attention(
             queries: queries,
             keys: keys,
             values: values,
             cache: cache,
             scale: scale,
-            mask: mask
+            mask: mask,
+            enabled: JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
@@ -853,6 +857,12 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     let normTopkProb: Bool
     let numExperts: Int
     let topK: Int
+    /// Whether exact-shape single-token decode may reach the trusted compiled
+    /// routed-MoE region in `SwitchGLU` (see `Qwen35CompiledDecodePolicy`).
+    /// Mirrors the VLM construction: the main decoder stack consults the
+    /// shared architecture/environment policy; MTP layers keep the eager
+    /// default, matching the VLM's MTP path.
+    let compileDecodeRegions: Bool
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -860,17 +870,23 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
-    init(_ args: Qwen35TextConfiguration, layerIdx: Int) {
+    init(
+        _ args: Qwen35TextConfiguration,
+        layerIdx: Int,
+        compileDecodeRegions: Bool = false
+    ) {
         self.layerIdx = layerIdx
         self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerTok
+        self.compileDecodeRegions = compileDecodeRegions
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
-            numExperts: args.numExperts
+            numExperts: args.numExperts,
+            compileSeparatedDecode: compileDecodeRegions
         )
 
         _sharedExpert.wrappedValue = Qwen3NextMLP(
@@ -918,6 +934,21 @@ final class Qwen35DecoderLayer: Module {
 
     init(_ args: Qwen35TextConfiguration, layerIdx: Int) {
         self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
+        // Same architecture/environment policy as the VLM path: only the
+        // validated Qwen 3.5 MoE text topology may reach the trusted
+        // compiled routed-MoE decode region; every other shape stays eager.
+        let compiledDecodeRegions = Qwen35CompiledDecodePolicy.shouldCompileDecodeRegions(
+            modelType: args.modelType,
+            hiddenSize: args.hiddenSize,
+            hiddenLayers: args.hiddenLayers,
+            fullAttentionInterval: args.fullAttentionInterval,
+            numExperts: args.numExperts,
+            numExpertsPerTok: args.numExpertsPerTok,
+            moeIntermediateSize: args.moeIntermediateSize,
+            linearNumKeyHeads: args.linearNumKeyHeads,
+            linearNumValueHeads: args.linearNumValueHeads,
+            linearKeyHeadDim: args.linearKeyHeadDim,
+            linearValueHeadDim: args.linearValueHeadDim)
 
         if isLinear {
             _linearAttn.wrappedValue = Qwen35GatedDeltaNet(args)
@@ -926,7 +957,10 @@ final class Qwen35DecoderLayer: Module {
         }
 
         if args.numExperts > 0 {
-            _mlp.wrappedValue = Qwen35SparseMoeBlock(args, layerIdx: layerIdx)
+            _mlp.wrappedValue = Qwen35SparseMoeBlock(
+                args,
+                layerIdx: layerIdx,
+                compileDecodeRegions: compiledDecodeRegions)
         } else {
             _mlp.wrappedValue = Qwen3NextMLP(
                 dimensions: args.hiddenSize,
@@ -1657,5 +1691,17 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider, HiddenStat
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
+    }
+}
+
+extension Qwen35Model: JangHadamardRuntimeModel {
+    public func validateJangHadamardRuntime() throws {
+        let config = languageModel.configuration
+        guard !config.tieWordEmbeddings, config.numExperts == 0,
+            config.mtpNumHiddenLayers == 0
+        else {
+            throw JangLoaderError.loadFailed(
+                "Hadamard Qwen3.5 requires an untied dense model without MTP")
+        }
     }
 }

@@ -268,6 +268,22 @@ public func loadWeights(
     // Resolve symlinks (mlxstudio uses symlinked model directories)
     let modelDirectory = modelDirectory.resolvingSymlinksInPath()
 
+    // Rotated matrices must never fall through to the ordinary affine route.
+    // Parse/validate before reading large shards or running shape inference.
+    let hadamardContract = try JangLoader.loadHadamardRuntimeContract(at: modelDirectory)
+    let ternaryPackedContract = try JangLoader.loadTernaryPackedRuntimeContract(at: modelDirectory)
+    if let hadamardContract {
+        try hadamardContract.validateRoute(model: model)
+    }
+    if let ternaryPackedContract {
+        guard let hadamardContract,
+            ternaryPackedContract.modulePaths == hadamardContract.modulePaths
+        else {
+            throw JangLoaderError.invalidConfig(
+                "packed ternary and Hadamard module coverage must match")
+        }
+    }
+
     // JANGTQ-native detection: `weight_format: "mxtq"` means the bundle
     // ships tq_packed/tq_norms tensors that should be consumed RAW by
     // TurboQuantSwitchGLU. The sidecar is preferred, but newer runtime-cache
@@ -537,6 +553,16 @@ public func loadWeights(
             JANGTQStreamingExperts.configureModelDirectory(modelDirectory)
         }
         let modelKeyExcluder = model as? any SafetensorsLoadKeyExcluding
+        // A model requesting owned compute weights must not also retain a
+        // complete filesystem-backed copy while loading them. Model-owned
+        // auxiliary tensors remain excluded by the existing key contract.
+        let uncachedResidentRead = ResidentSafetensorsReader.shouldUse(
+            requiresOwnedCompute: modelKeyExcluder?.requiresResidentSafetensorsWeights == true,
+            readerOverride: RuntimeEnvironment.value("VMLX_FLASH_RESIDENT_READER"))
+        if uncachedResidentRead {
+            FileHandle.standardError.write(Data(
+                "[loadWeights] resident_reader=uncached_owned source_files_unchanged=true\n".utf8))
+        }
         for url in allShardURLs {
             let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
             let headerNames = (try? loadSafetensorsHeaderNamesForBaseLoad(url)) ?? []
@@ -577,10 +603,12 @@ public func loadWeights(
                     continue
                 }
             }
-            let (w, m) = try loadArraysAndMetadata(
-                url: url,
-                excludingKeys: excludedKeys,
-                exactTensorBuffers: modelKeyExcluder?.requiresExactTensorMmapBuffers == true)
+            let (w, m) = try uncachedResidentRead
+                ? ResidentSafetensorsReader.load(url: url, excludingKeys: excludedKeys)
+                : loadArraysAndMetadata(
+                    url: url,
+                    excludingKeys: excludedKeys,
+                    exactTensorBuffers: modelKeyExcluder?.requiresExactTensorMmapBuffers == true)
             var shardWeights: [String: MLXArray] = [:]
             for (key, value) in w {
                 if shouldFilterPreservedMTP, isPreservedMTPWeightKey(key) {
@@ -612,7 +640,7 @@ public func loadWeights(
                 // excluded above, so this materializes compute tensors only.
                 // `* 1` creates owned MLX storage even for already-contiguous
                 // mmap inputs (unlike `contiguous()`, which may return them as-is).
-                let resident = shardWeights.mapValues { $0 * 1 }
+                let resident = uncachedResidentRead ? shardWeights : shardWeights.mapValues { $0 * 1 }
                 MLX.eval(Array(resident.values))
                 residentSafetensorsBytes += resident.values.reduce(0) { $0 + $1.nbytes }
                 for (key, value) in resident { weights[key] = value }
@@ -654,6 +682,11 @@ public func loadWeights(
         }
     }
 
+    // Expansion precedes every packed-shape inference and model sanitize.
+    // Native affine-1 storage is a separate contract and stays untouched.
+    try ternaryPackedContract?.expand(weights: &weights)
+    try hadamardContract?.validateWeights(weights, model: model)
+
     let jangTensorManifest = try JangLoader.loadTensorQuantizationManifest(
         at: modelDirectory)
     if let jangTensorManifest {
@@ -691,7 +724,8 @@ public func loadWeights(
     // Restored to the prior limit after sanitize so steady-state
     // inference performance is unaffected.
     let priorCacheLimit = MLX.Memory.cacheLimit
-    MLX.Memory.cacheLimit = 1 * 1024 * 1024 * 1024  // 1 GB during load
+    // Sanitization may reduce a large pool, never raise a caller's ceiling.
+    MLX.Memory.cacheLimit = min(priorCacheLimit, 1 * 1024 * 1024 * 1024)
     defer {
         MLX.Memory.cacheLimit = priorCacheLimit
     }
@@ -1166,6 +1200,10 @@ public func loadWeights(
         }
     }
 
+    // Wrap the exact quantized destinations, reusing their loaded arrays.
+    // Placeholder signs are zero, so missing parameter updates cannot pass.
+    try hadamardContract?.install(model: model)
+
     // apply the loaded weights
     // Use .noUnusedKeys instead of .all — MXFP4/MXFP8 quantized layers don't have .biases
     // in the weight files, but QuantizedLinear's optional .biases property gets initialized
@@ -1174,6 +1212,7 @@ public func loadWeights(
         let parameters = ModuleParameters.unflattened(weights)
         try model.update(parameters: parameters, verify: [.noUnusedKeys])
     }
+    try hadamardContract?.verifyLoaded(model: model)
 
     // `weights` is only a load/update staging dictionary. Drop it before
     // any post-load dtype materialization so quantized bundles do not keep
@@ -1255,14 +1294,25 @@ public func loadWeights(
                 modelDirectory: modelDirectory)
             || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
                 modelDirectory: modelDirectory))
+    // Prism's ternary QAT contract stores exact F16 scales and F32 norms,
+    // state projections and signs. Preserve that contract independent of
+    // mmap; recasting it is not the stock Qwen/JANG dtype policy.
     let materialiseBFloat16 =
-        !preserveJANGAffineMmapDtypes
+        hadamardContract == nil
+        && !model.preservesCheckpointParameterDTypes
+        && !preserveJANGAffineMmapDtypes
         && (!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16
             || autoJANGTQMmapBFloat16)
     if materialiseBFloat16 {
         convertToBFloat16(
             model: model,
             shouldSkip: isJANGTQNative ? isJANGTQParameterKey : { _ in false })
+    }
+    if let hadamardContract {
+        try hadamardContract.verifyLoaded(model: model)
+        FileHandle.standardError.write(Data(
+            ("[Load] JANG Hadamard verified=\(hadamardContract.modulePaths.count) "
+                + "block=\(hadamardContract.blockSize) compute=float32 stored_dtypes_preserved=true\n").utf8))
     }
     // Always-on, one line per load: which dtype policy this load took and what
     // the parameters actually are afterwards. An f16-seeded activation stream
@@ -1279,6 +1329,7 @@ public func loadWeights(
         FileHandle.standardError.write(Data(
             ("[Load] dtype-materialisation bf16=\(materialiseBFloat16) mmap=\(mmapSafetensorsActive) "
                 + "jangtqNative=\(isJANGTQNative) preserveJANGAffine=\(preserveJANGAffineMmapDtypes) "
+                + "preserveCheckpointDTypes=\(model.preservesCheckpointParameterDTypes) "
                 + "autoJANGTQBF16=\(autoJANGTQMmapBFloat16) allowJANGTQBF16=\(allowJANGTQMmapBFloat16) "
                 + "params[\(summary)]\n").utf8))
     }
@@ -1292,7 +1343,7 @@ public func loadWeights(
     // gates). Pin only the embedding OUTPUT to bf16: the dequant math still
     // reads the exact file-backed f16 metadata; qwen4_exp bundles are
     // excluded because their native-module swap already handles this.
-    if preserveJANGAffineMmapDtypes,
+    if hadamardContract == nil, preserveJANGAffineMmapDtypes,
         !shouldUseQwen4ExpNativeBF16Affine(modelDirectory: modelDirectory)
     {
         var pinned = 0

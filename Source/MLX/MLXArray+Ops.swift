@@ -1551,7 +1551,7 @@ extension MLXArray {
         axis: Int, reverse: Bool = false, inclusive: Bool = true, stream: StreamOrDevice = .default
     ) -> MLXArray {
         var result = mlx_array_new()
-        mlx_cummax(&result, ctx, axis.int32, reverse, inclusive, stream.ctx)
+        mlx_cummax_axis(&result, ctx, axis.int32, reverse, inclusive, stream.ctx)
         return MLXArray(result)
     }
 
@@ -1578,7 +1578,7 @@ extension MLXArray {
     ) -> MLXArray {
         let flat = self.reshaped([-1], stream: stream)
         var result = mlx_array_new()
-        mlx_cummax(&result, flat.ctx, 0, reverse, inclusive, stream.ctx)
+        mlx_cummax_axis(&result, flat.ctx, 0, reverse, inclusive, stream.ctx)
         return MLXArray(result)
     }
 
@@ -1605,7 +1605,7 @@ extension MLXArray {
         axis: Int, reverse: Bool = false, inclusive: Bool = true, stream: StreamOrDevice = .default
     ) -> MLXArray {
         var result = mlx_array_new()
-        mlx_cummin(&result, ctx, axis.int32, reverse, inclusive, stream.ctx)
+        mlx_cummin_axis(&result, ctx, axis.int32, reverse, inclusive, stream.ctx)
         return MLXArray(result)
     }
 
@@ -1632,7 +1632,7 @@ extension MLXArray {
     ) -> MLXArray {
         let flat = self.reshaped([-1], stream: stream)
         var result = mlx_array_new()
-        mlx_cummin(&result, flat.ctx, 0, reverse, inclusive, stream.ctx)
+        mlx_cummin_axis(&result, flat.ctx, 0, reverse, inclusive, stream.ctx)
         return MLXArray(result)
     }
 
@@ -1659,7 +1659,7 @@ extension MLXArray {
         axis: Int, reverse: Bool = false, inclusive: Bool = true, stream: StreamOrDevice = .default
     ) -> MLXArray {
         var result = mlx_array_new()
-        mlx_cumprod(&result, ctx, axis.int32, reverse, inclusive, stream.ctx)
+        mlx_cumprod_axis(&result, ctx, axis.int32, reverse, inclusive, mlx_optional_dtype(nil), stream.ctx)
         return MLXArray(result)
     }
 
@@ -1686,7 +1686,7 @@ extension MLXArray {
     ) -> MLXArray {
         let flat = self.reshaped([-1], stream: stream)
         var result = mlx_array_new()
-        mlx_cumprod(&result, flat.ctx, 0, reverse, inclusive, stream.ctx)
+        mlx_cumprod_axis(&result, flat.ctx, 0, reverse, inclusive, mlx_optional_dtype(nil), stream.ctx)
         return MLXArray(result)
     }
 
@@ -1713,7 +1713,7 @@ extension MLXArray {
         axis: Int, reverse: Bool = false, inclusive: Bool = true, stream: StreamOrDevice = .default
     ) -> MLXArray {
         var result = mlx_array_new()
-        mlx_cumsum(&result, ctx, axis.int32, reverse, inclusive, stream.ctx)
+        mlx_cumsum_axis(&result, ctx, axis.int32, reverse, inclusive, mlx_optional_dtype(nil), stream.ctx)
         return MLXArray(result)
     }
 
@@ -1740,7 +1740,7 @@ extension MLXArray {
     ) -> MLXArray {
         let flat = self.reshaped([-1], stream: stream)
         var result = mlx_array_new()
-        mlx_cumsum(&result, flat.ctx, 0, reverse, inclusive, stream.ctx)
+        mlx_cumsum_axis(&result, flat.ctx, 0, reverse, inclusive, mlx_optional_dtype(nil), stream.ctx)
         return MLXArray(result)
     }
 

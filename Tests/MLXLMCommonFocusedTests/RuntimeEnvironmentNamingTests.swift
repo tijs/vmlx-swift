@@ -16,6 +16,56 @@ struct RuntimeEnvironmentNamingTests {
         #expect(RuntimeEnvironment.value("VMLX_THING", in: ["VMLX_THING": "a"]) == "a")
     }
 
+    @Test("live lookup matches snapshots without retaining stale environment values")
+    func liveLookupParity() {
+        let suffix = "LOOKUP_TEST_" + UUID().uuidString.replacingOccurrences(of: "-", with: "_")
+        let current = "VMLX_" + suffix
+        let legacy = "VMLINUX_" + suffix
+        defer {
+            unsetenv(current)
+            unsetenv(legacy)
+            unsetenv(suffix)
+        }
+        #expect(RuntimeEnvironment.value(current) == nil)
+        setenv(legacy, "legacy", 1)
+        #expect(RuntimeEnvironment.value(current) == "legacy")
+        for raw in ["", "new", " true ", "0", "yes", "off", "한글 🌍"] {
+            setenv(current, raw, 1)
+            let snapshot = ProcessInfo.processInfo.environment
+            #expect(RuntimeEnvironment.value(current) == RuntimeEnvironment.value(current, in: snapshot))
+            for fallback in [false, true] {
+                #expect(RuntimeEnvironment.flag(current, default: fallback)
+                    == RuntimeEnvironment.flag(current, default: fallback, in: snapshot))
+            }
+        }
+        let retained = RuntimeEnvironment.value(current)
+        unsetenv(current)
+        #expect(retained == "한글 🌍")
+        #expect(RuntimeEnvironment.value(current) == "legacy")
+        #expect(RuntimeEnvironment.value(suffix) == nil)
+        setenv(suffix, "unprefixed", 1)
+        #expect(RuntimeEnvironment.value(suffix) == "unprefixed")
+        #expect(RuntimeEnvironment.value(suffix + "\u{0}ignored") == nil)
+    }
+
+    @Test("live lookup host-cost diagnostic against the previous dictionary path")
+    func liveLookupHostCost() {
+        let key = "VMLX_LOOKUP_COST_" + UUID().uuidString
+        let iterations = 10_000
+        var missing = 0
+        for direct in [false, true, true, false] {
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<iterations {
+                let result = direct ? RuntimeEnvironment.value(key)
+                    : RuntimeEnvironment.value(key, in: ProcessInfo.processInfo.environment)
+                if result == nil { missing += 1 }
+            }
+            let elapsed = DispatchTime.now().uptimeNanoseconds - start
+            print("ENV_LOOKUP_COST direct=\(direct) calls=\(iterations) ns=\(elapsed)")
+        }
+        #expect(missing == 4 * iterations)
+    }
+
     /// The whole point of the migration: someone's existing script must not break.
     @Test("the legacy spelling is still honoured")
     func legacySpellingHonoured() {

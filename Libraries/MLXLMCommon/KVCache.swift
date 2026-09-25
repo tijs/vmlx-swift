@@ -76,6 +76,15 @@ public protocol KVCache: Evaluatable, Updatable {
     func copy() -> any KVCache
 }
 
+/// Opt-in disk persistence for cache implementations with model-owned
+/// companion tensors. The identifier versions the complete state layout,
+/// including runtime modes that change its meaning. Restoration must validate
+/// every tensor and metadata field before accepting the prompt boundary.
+public protocol DiskCacheStateProviding: KVCache {
+    var diskCacheStateIdentifier: String { get }
+    func restoreDiskCacheState(_ state: [MLXArray], metadata: [String], offset: Int) -> Bool
+}
+
 /// Materialize an OWNED copy of a cache state array for `copy()`.
 ///
 /// The previous idiom, `x[.ellipsis]`, is a slice — and `Slice::eval` shares
@@ -597,16 +606,52 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
 /// KV cache for QSA (Qwen sparse attention, qwen4_exp) full-attention
 /// layers: the standard K/V buffers plus the layer's RAW indexer keys
-/// (pre-norm, pre-rope, `[B, T, indexerHeadDim]`). The indexer re-pools and
-/// re-ropes its key blocks every forward, so the raw keys are the only
-/// auxiliary state that must persist — and they must stay row-for-row in
+/// (pre-norm, pre-rope, `[B, T, indexerHeadDim]`). Completed pooled blocks
+/// are derived, so the raw keys are the only auxiliary state that must
+/// persist — and they must stay row-for-row in
 /// sync with `offset` across trim/rollback or block selection reads keys
 /// from the wrong positions.
 public class QSAKVCache: KVCacheSimple {
+    private var indexerKeyStorage: MLXArray?
+    private var indexerKeyCount = 0
+    private let useIndexerCapacity: Bool
+    private var reportIndexerStorage = RuntimeEnvironment.flag("VMLX_QSA_RAW_STORAGE_TRACE")
+
+    // Counts explicit backing-store growth, not physical Metal allocations.
+    // Retained views can still prevent donation; benchmark the actual workload.
+    internal private(set) var indexerStorageGrowths = 0
+    internal var indexerStorageCapacity: Int { indexerKeyStorage?.dim(1) ?? 0 }
+
+    public override init() {
+        useIndexerCapacity = RuntimeEnvironment.value("VMLX_QSA_RAW_CAPACITY") != "0"
+        super.init()
+    }
+
+    internal init(useIndexerCapacity: Bool) {
+        self.useIndexerCapacity = useIndexerCapacity
+        super.init()
+    }
+
+    private func traceIndexerUpdate() {
+        guard reportIndexerStorage else { return }
+        reportIndexerStorage = false
+        NSLog(
+            "[QSAKVCache] raw_storage=%@ committed=%d logical=%d capacity=%d step=%d dtype=%@",
+            useIndexerCapacity ? "capacity" : "concat", offset, indexerKeyCount,
+            indexerStorageCapacity, step, String(describing: indexerKeyStorage?.dtype))
+    }
+
     /// Raw indexer keys covering `[0, offset + pending)` — the layer calls
     /// `updateIndexerKeys` BEFORE `update(keys:values:)` advances `offset`,
-    /// matching the reference forward order.
-    public private(set) var indexerKeys: MLXArray?
+    /// matching the reference forward order. Spare capacity is never visible.
+    /// Do not retain a second cached view: that would block buffer donation.
+    public var indexerKeys: MLXArray? {
+        guard let storage = indexerKeyStorage else { return nil }
+        // MLXArray is a mutable reference wrapper. Even at exact capacity,
+        // return a fresh view so later slice assignment cannot replace a
+        // caller's retained array context during rollback or pending reuse.
+        return storage[0..., ..<indexerKeyCount, 0...]
+    }
 
     /// DERIVED pooled-index lane: kNorm+rope-processed block keys
     /// `[B, blockCount, indexerHeadDim]`, processed left-to-right by the
@@ -629,20 +674,60 @@ public class QSAKVCache: KVCacheSimple {
     }
 
     public func updateIndexerKeys(_ rawKeys: MLXArray) -> MLXArray {
-        if let existing = indexerKeys, existing.dim(1) > 0 {
-            // Stale rows beyond `offset` (a trim/rollback that happened
-            // between forwards) must not survive into the concat.
-            let valid = existing.dim(1) > offset
-                ? existing[0..., ..<offset, 0...] : existing
-            indexerKeys = concatenated([valid, rawKeys], axis: 1)
-        } else {
-            indexerKeys = rawKeys
+        precondition(rawKeys.ndim == 3, "QSA indexer keys must be [B, T, D]")
+        // offset still describes committed K/V. Replace any pending suffix,
+        // including a second indexer call before update(keys:values:).
+        // A damaged short lane must remain short, not gain fabricated rows.
+        let previous = min(offset, indexerKeyCount)
+        let end = previous + rawKeys.dim(1)
+
+        if indexerKeyCount > 0, let storage = indexerKeyStorage {
+            precondition(
+                storage.dim(0) == rawKeys.dim(0) && storage.dim(2) == rawKeys.dim(2),
+                "QSA indexer update geometry changed")
         }
+
+        // Retain the original concat as the A/B control and for unusual dtype
+        // transitions: slice assignment alone would silently cast new rows to
+        // the old dtype instead of preserving concatenate's type promotion.
+        if !useIndexerCapacity || (indexerKeyCount > 0 && indexerKeyStorage?.dtype != rawKeys.dtype)
+        {
+            if indexerKeyCount > 0, let storage = indexerKeyStorage {
+                indexerKeyStorage = concatenated(
+                    [storage[0..., ..<previous, 0...], rawKeys], axis: 1)
+            } else {
+                indexerKeyStorage = rawKeys
+            }
+            indexerKeyCount = end
+            traceIndexerUpdate()
+            return indexerKeys!
+        }
+
+        let sameLayout =
+            indexerKeyStorage?.dim(0) == rawKeys.dim(0)
+            && indexerKeyStorage?.dim(2) == rawKeys.dim(2)
+            && indexerKeyStorage?.dtype == rawKeys.dtype
+        if !sameLayout || end > indexerStorageCapacity {
+            let quantum = max(1, step)
+            let capacity = ((end + quantum - 1) / quantum) * quantum
+            var storage = MLXArray.zeros(
+                [rawKeys.dim(0), capacity, rawKeys.dim(2)], dtype: rawKeys.dtype)
+            if previous > 0, let old = indexerKeyStorage {
+                storage[0..., ..<previous, 0...] = old[0..., ..<previous, 0...]
+            }
+            indexerKeyStorage = storage
+            indexerStorageGrowths += 1
+        }
+        if end > previous {
+            indexerKeyStorage?[0..., previous ..< end, 0...] = rawKeys
+        }
+        indexerKeyCount = end
+        traceIndexerUpdate()
         return indexerKeys!
     }
 
     public override func innerState() -> [MLXArray] {
-        super.innerState() + [indexerKeys, derivedPooledBlocks].compactMap { $0 }
+        super.innerState() + [indexerKeyStorage, derivedPooledBlocks].compactMap { $0 }
     }
 
     public override var state: [MLXArray] {
@@ -658,11 +743,17 @@ public class QSAKVCache: KVCacheSimple {
         set {
             if newValue.count == 3 {
                 super.state = Array(newValue[0 ..< 2])
-                indexerKeys = newValue[2]
+                // Adopt the data, not the caller's mutable Swift wrapper.
+                // Retained serialized/source state must survive in-capacity
+                // writes after trimming the restored cache.
+                indexerKeyStorage = newValue[2][0..., 0..., 0...]
+                indexerKeyCount = newValue[2].dim(1)
             } else {
                 super.state = newValue
-                indexerKeys = nil
+                indexerKeyStorage = nil
+                indexerKeyCount = 0
             }
+            indexerStorageGrowths = 0
             // A restored cache may hold any raw-lane content; the derived
             // pooled lane is rebuilt from it on the next forward.
             dropDerivedPooledBlocks()
@@ -673,9 +764,7 @@ public class QSAKVCache: KVCacheSimple {
     public override func trim(_ n: Int) -> Int {
         let trimmed = super.trim(n)
         if trimmed > 0 {
-            if let existing = indexerKeys, existing.dim(1) > offset {
-                indexerKeys = existing[0..., ..<offset, 0...]
-            }
+            indexerKeyCount = min(indexerKeyCount, offset)
             // Rollback invalidates trailing blocks; rebuild from raw keys.
             dropDerivedPooledBlocks()
         }
@@ -683,7 +772,7 @@ public class QSAKVCache: KVCacheSimple {
     }
 
     public override func copy() -> any KVCache {
-        let new = QSAKVCache()
+        let new = QSAKVCache(useIndexerCapacity: useIndexerCapacity)
         new.step = self.step
         new.offset = self.offset
         let s = self.state
@@ -1727,6 +1816,9 @@ public class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 public class MambaCache: ArraysCache {
+    /// Leading slots that belong to a resumable model state. Remaining slots
+    /// are request-local scratch and must never enter a disk snapshot.
+    public let persistentSlotCount: Int
     private struct PrefixCommitState {
         var arrays: [MLXArray]
         var offset: Int
@@ -1735,6 +1827,7 @@ public class MambaCache: ArraysCache {
     private var prefixCommitStates: [Int: PrefixCommitState] = [:]
 
     public init(leftPadding: [Int]? = nil) {
+        self.persistentSlotCount = 2
         super.init(size: 2, leftPadding: leftPadding)
     }
 
@@ -1743,7 +1836,20 @@ public class MambaCache: ArraysCache {
     /// layer's cache and stores previous-context token ids in slot 2 and the
     /// dilated-conv state in slot 3.
     public init(slots: Int, leftPadding: [Int]? = nil) {
+        precondition(slots > 0)
+        self.persistentSlotCount = slots
         super.init(size: slots, leftPadding: leftPadding)
+    }
+
+    public init(slots: Int, persistentSlotCount: Int, leftPadding: [Int]? = nil) {
+        precondition(persistentSlotCount > 0 && persistentSlotCount <= slots)
+        self.persistentSlotCount = persistentSlotCount
+        super.init(size: slots, leftPadding: leftPadding)
+    }
+
+    public override var state: [MLXArray] {
+        get { (0..<persistentSlotCount).compactMap { self[$0] } }
+        set { super.state = newValue }
     }
 
     public func recordPrefixCommitState(length: Int, arrays: [MLXArray], offset: Int) {
@@ -1859,7 +1965,7 @@ public class MambaCache: ArraysCache {
     }
 
     public override func copy() -> any KVCache {
-        let new = MambaCache(slots: slotCount)
+        let new = MambaCache(slots: slotCount, persistentSlotCount: persistentSlotCount)
         copySlots(into: new)
         new.offset = self.offset
         new.leftPadding = self.leftPadding
@@ -1953,9 +2059,23 @@ public func savePromptCache(
     cache: [KVCache],
     metadata: [String: String] = [:]
 ) throws {
+    func needsMambaGeometry(_ mamba: MambaCache) -> Bool {
+        let occupied = (0..<mamba.persistentSlotCount).filter { mamba[$0] != nil }
+        return mamba.slotCount != 2 || mamba.persistentSlotCount != 2 || mamba.offset != 0
+            || occupied != Array(0..<occupied.count)
+    }
     let cacheData = cache.map { $0.state }
-    let cacheInfo = cache.map { $0.metaState }
-    // Use Python-compatible class names for cross-platform compatibility
+    let cacheInfo = cache.map { layer -> [String] in
+        if let mamba = layer as? MambaCache, needsMambaGeometry(mamba) {
+            let occupied = (0..<mamba.persistentSlotCount).filter { mamba[$0] != nil }
+            return ["1", String(mamba.slotCount), String(mamba.persistentSlotCount),
+                    String(mamba.offset), occupied.map(String.init).joined(separator: ",")]
+        }
+        return layer.metaState
+    }
+    // Ordinary layouts retain Python-compatible names. Extended recurrent
+    // records use a distinct class tag so older readers reject rather than
+    // silently seating a partial state into their default two-slot cache.
     let cacheClasses = cache.map { cache -> String in
         switch cache {
         case is ChunkedKVCache:
@@ -1966,8 +2086,8 @@ public func savePromptCache(
             return "RotatingKVCache"
         case is QuantizedKVCache:
             return "QuantizedKVCache"
-        case is MambaCache:
-            return "MambaCache"  // Must precede ArraysCache because of inheritance
+        case let mamba as MambaCache:
+            return needsMambaGeometry(mamba) ? "VmlxMambaCacheV1" : "MambaCache"
         case is ArraysCache:
             return "ArraysCache"
         case is CacheList:
@@ -2069,7 +2189,31 @@ public func loadPromptCache(
         case "ChunkedKVCache":
             cache = ChunkedKVCache()
         case "MambaCache":
+            guard cacheData[i].count <= 2 else {
+                throw KVCacheError(message: "Extended legacy Mamba cache lacks persistent-slot geometry")
+            }
             cache = MambaCache()
+        case "VmlxMambaCacheV1":
+            let info = cacheInfo[i]
+            guard info.count == 5, info[0] == "1",
+                  let slots = Int(info[1]), slots > 0, slots <= 4096,
+                  let persistent = Int(info[2]), persistent > 0, persistent <= slots,
+                  let offset = Int(info[3]), offset >= 0
+            else { throw KVCacheError(message: "Invalid persistent Mamba cache geometry") }
+            // Bound metadata-driven allocation before constructing the cache.
+            // This is a file-format resource limit, not model dispatch.
+            let rawIndices = info[4].split(separator: ",", omittingEmptySubsequences: false)
+            let occupied = info[4].isEmpty ? [] : rawIndices.compactMap { Int($0) }
+            guard (info[4].isEmpty || occupied.count == rawIndices.count),
+                  occupied.count == cacheData[i].count,
+                  Set(occupied).count == occupied.count, occupied == occupied.sorted(),
+                  occupied.allSatisfy({ $0 >= 0 && $0 < persistent })
+            else { throw KVCacheError(message: "Invalid persistent Mamba cache occupancy") }
+            let mamba = MambaCache(slots: slots, persistentSlotCount: persistent)
+            for (slot, state) in zip(occupied, cacheData[i]) { mamba[slot] = state }
+            mamba.offset = offset
+            caches.append(mamba)
+            continue
         case "ArraysCache":
             // Size doesn't matter here as it's only needed to initialize the `cache` container inside
             // The container will be set as a `state` with correct size before returning a cache

@@ -35,7 +35,8 @@ final class CompiledFunction: @unchecked (Sendable) {
     /// unique (for the lifetime of the object) identifier for the compiled function
     private var id: UInt!
 
-    let lock = NSLock()
+    // Always acquired after evalLock, including nested compiled traces.
+    let lock = NSRecursiveLock()
 
     /// the function to compile
     let f: ([MLXArray]) -> [MLXArray]
@@ -73,12 +74,20 @@ final class CompiledFunction: @unchecked (Sendable) {
     private var cachedInnerClosure: mlx_closure? = nil
     private var cachedCompiledClosure: mlx_closure? = nil
     private var cachedArgumentCount: Int = -1
+    // A Swift closure can execute on several core thread-local caches and
+    // deinitialize on yet another thread. Retain weak handles to every cache
+    // it actually used, not the cache of the deinitializing thread.
+    private var compileCaches: [UInt64: mlx_compile_cache] = [:]
 
     deinit {
-        if let cached = cachedCompiledClosure { mlx_closure_free(cached) }
-        if let cached = cachedInnerClosure { mlx_closure_free(cached) }
-        // remove the compiled structure from the back end
-        mlx_detail_compile_erase(id)
+        evalLock.withLock {
+            if let cached = cachedCompiledClosure { mlx_closure_free(cached) }
+            if let cached = cachedInnerClosure { mlx_closure_free(cached) }
+            for cache in compileCaches.values {
+                mlx_detail_compile_erase(cache, id)
+                mlx_compile_cache_free(cache)
+            }
+        }
     }
 
     func call(_ arguments: [MLXArray]) -> [MLXArray] {
@@ -89,8 +98,8 @@ final class CompiledFunction: @unchecked (Sendable) {
             return f(arguments)
         }
 
-        return lock.withLock {
-            innerCall(arguments)
+        return evalLock.withLock {
+            lock.withLock { innerCall(arguments) }
         }
     }
 
@@ -142,8 +151,12 @@ final class CompiledFunction: @unchecked (Sendable) {
             return result + stateOutputTracers
         }
 
-        evalLock.lock()
-        defer { evalLock.unlock() }
+        let cacheID = mlx_detail_compile_cache_id()
+        if compileCaches[cacheID] == nil {
+            var cache = mlx_compile_cache_new()
+            mlx_detail_compile_cache(&cache)
+            compileCaches[cacheID] = cache
+        }
 
         let compiled: mlx_closure
         var transient: (inner: mlx_closure, compiled: mlx_closure)? = nil

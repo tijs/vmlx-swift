@@ -1005,6 +1005,25 @@ struct CacheCoordinatorTopologyFocusedTests {
             boundary: tokens.count,
             requireComplete: false) == nil)
 
+        // The native v2 payload already owns the recurrent state. Requiring
+        // the deliberately omitted sidecar here makes the boundary producer
+        // replay a restorable prefix after every answer.
+        #expect(coordinator.diskCache?.hasDurableEntry(tokens: tokens) == true)
+        #expect(coordinator.hasDurableDiskEntry(tokens: tokens))
+        #expect(coordinator.hasValidatedDiskEntry(tokens: tokens))
+
+        let reopened = makeCoordinator(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheDir: tmp,
+            modelKey: "mamba-no-separate-payload-focused")
+        reopened.setHybrid(
+            true,
+            requiresRecurrentSSMCompanion: true,
+            requiresSeparateRecurrentPayload: false)
+        #expect(reopened.hasDurableDiskEntry(tokens: tokens))
+        #expect(!reopened.hasValidatedDiskEntry(tokens: tokens))
+
         switch coordinator.fetch(tokens: tokens + [513]) {
         case .hit(let matched, let remaining, let detail, let blocks, let ssm, let arrays):
             #expect(matched == tokens.count)

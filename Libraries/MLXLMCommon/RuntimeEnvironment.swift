@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// Runtime environment variables, under the project's `VMLX_` prefix.
 ///
@@ -37,10 +42,20 @@ public enum RuntimeEnvironment {
     /// - Parameter name: the FULL current name, e.g. `"VMLX_ACCELERATOR"`. A name without the
     ///   prefix is looked up verbatim with no fallback, which is what a caller passing some
     ///   unrelated variable would want.
-    public static func value(
-        _ name: String,
-        in environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> String? {
+    public static func value(_ name: String) -> String? {
+        // ProcessInfo.environment reconstructs the entire dictionary. Decode
+        // gates call this per layer, so a single lookup must not copy every
+        // unrelated process variable. Copy the C value immediately; do not
+        // cache it or retain a pointer across later environment mutations.
+        guard !name.utf8.contains(0) else { return nil }
+        if let current = getenv(name) { return String(cString: current) }
+        guard let legacy = legacyName(of: name), let value = getenv(legacy) else { return nil }
+        return String(cString: value)
+    }
+
+    /// Explicit snapshots keep the same deterministic lookup contract for
+    /// configuration resolution and tests. No process lookup occurs here.
+    public static func value(_ name: String, in environment: [String: String]) -> String? {
         if let current = environment[name] { return current }
         guard let legacy = legacyName(of: name) else { return nil }
         return environment[legacy]
@@ -52,11 +67,22 @@ public enum RuntimeEnvironment {
     /// variable changes meaning: `1` / `true` / `yes` / `on` are true.
     public static func flag(
         _ name: String,
-        default defaultValue: Bool = false,
-        in environment: [String: String] = ProcessInfo.processInfo.environment
+        default defaultValue: Bool = false
     ) -> Bool {
+        parseFlag(value(name), default: defaultValue)
+    }
+
+    public static func flag(
+        _ name: String,
+        default defaultValue: Bool = false,
+        in environment: [String: String]
+    ) -> Bool {
+        parseFlag(value(name, in: environment), default: defaultValue)
+    }
+
+    private static func parseFlag(_ value: String?, default defaultValue: Bool) -> Bool {
         guard
-            let raw = value(name, in: environment)?
+            let raw = value?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased(),
             !raw.isEmpty

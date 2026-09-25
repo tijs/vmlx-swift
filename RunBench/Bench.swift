@@ -252,13 +252,18 @@ struct Bench {
         //   BENCH_PERF_PERSISTENT_ALLOCATOR_CACHE_BYTES — post-load MLX
         //     freed-buffer reuse limit for allocator-policy A/B measurements.
         if (env["BENCH_PERF"] ?? "0") == "1" {
-            try await runPerfBench(
-                modelPath: modelPath, maxNew: maxNew,
-                variant: env["BENCH_PERF_VARIANT"] ?? "auto",
-                warmup: Int(env["BENCH_PERF_WARMUP"] ?? "1") ?? 1,
-                runs: Int(env["BENCH_PERF_RUNS"] ?? "3") ?? 3,
-                useTokenIterator:
-                    (env["BENCH_PERF_PATH"] ?? "batch") == "iter")
+            do {
+                try await runPerfBench(
+                    modelPath: modelPath, maxNew: maxNew,
+                    variant: env["BENCH_PERF_VARIANT"] ?? "auto",
+                    warmup: Int(env["BENCH_PERF_WARMUP"] ?? "1") ?? 1,
+                    runs: Int(env["BENCH_PERF_RUNS"] ?? "3") ?? 3,
+                    useTokenIterator:
+                        (env["BENCH_PERF_PATH"] ?? "batch") == "iter")
+            } catch {
+                print("[BENCH_PERF] error: \(String(reflecting: error))")
+                exit(benchFailureExitCode(for: error))
+            }
             return
         }
 
@@ -2916,6 +2921,22 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     let modelName = modelDir.lastPathComponent
     let env = ProcessInfo.processInfo.environment
+    // Benchmark-only override: validate before loading weights or creating the
+    // cache root. The default remains the historical 4 GiB regression quota.
+    let diskMaxGB: Float
+    if let raw = env["BENCH_GROWING_DISK_MAX_GB"] {
+        guard let value = Float(raw), value.isFinite, value > 0,
+            Double(value) * 1_073_741_824 >= 1,
+            Double(value) * 1_073_741_824 < Double(Int.max)
+        else {
+            throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 13,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "BENCH_GROWING_DISK_MAX_GB must be a positive finite, representable GiB quota"])
+        }
+        diskMaxGB = value
+    } else {
+        diskMaxGB = 4
+    }
     let cacheDir = URL(fileURLWithPath:
         env["BENCH_GROWING_CACHE_DIR"] ??
         "/tmp/vmlx-growing-chat-cache-\(modelName)-\(UUID().uuidString)")
@@ -2929,6 +2950,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
 
     print("\n=== BENCH_GROWING_CHAT_CACHE — \(modelName) ===")
     print("Cache dir: \(cacheDir.path)")
+    print("Requested disk quota: \(diskMaxGB) GiB")
     let nativeMTPDepth = env["BENCH_GROWING_NATIVE_MTP_DEPTH"].flatMap(Int.init)
     let useMmap = env["BENCH_GROWING_MMAP"] == "1"
     let loadStart = CFAbsoluteTimeGetCurrent()
@@ -2969,7 +2991,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         enableDiskCache: enableDiskCache,
         pagedBlockSize: 64,
         maxCacheBlocks: 512,
-        diskCacheMaxGB: 4.0,
+        diskCacheMaxGB: diskMaxGB,
         diskCacheDir: cacheDir,
         ssmMaxEntries: 64,
         modelKey: modelName))
@@ -3025,6 +3047,10 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     if let nativeMTPDepth {
         params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
     }
+    params.cacheChainId = env["BENCH_GROWING_CACHE_CHAIN_ID"]
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .flatMap { $0.isEmpty ? nil : $0 }
+    print("Cache chain: \(params.cacheChainId ?? "unowned")")
     let growingKVMode: String
     switch (env["BENCH_GROWING_KV_MODE"] ?? "none").lowercased() {
     case "tq", "tq44", "turboquant":
@@ -3119,6 +3145,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         let promptSize = input.text.tokens.size
         let t0 = CFAbsoluteTimeGetCurrent()
         var firstTokenWall: Double?
+        var completionInfoWall: Double?
         var out: [Int] = []
         var info: GenerateCompletionInfo?
 
@@ -3140,6 +3167,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
                     break
                 case .info(let i):
                     info = i
+                    completionInfoWall = CFAbsoluteTimeGetCurrent() - t0
                 }
             }
             await task.value
@@ -3157,6 +3185,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
                     break
                 case .info(let i):
                     info = i
+                    completionInfoWall = CFAbsoluteTimeGetCurrent() - t0
                 }
             }
         }
@@ -3174,6 +3203,15 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             wall,
             tokps,
             String(text.prefix(120)).replacingOccurrences(of: "\n", with: "\\n")))
+        if env["BENCH_GROWING_FULL_TEXT"] == "1" {
+            print("GROWING_FULL_TEXT label=\(label) text=\(text.debugDescription)")
+            if let completionInfoWall {
+                print(String(format:
+                    "GROWING_STREAM_TAIL label=%@ completion_info_ms=%.3f stream_end_ms=%.3f tail_ms=%.3f",
+                    label, completionInfoWall * 1000, wall * 1000,
+                    max(0, wall - completionInfoWall) * 1000))
+            }
+        }
         return (out, info, wall)
     }
 
@@ -3243,7 +3281,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             "hits=\($0.cacheHits),misses=\($0.cacheMisses),allocated=\($0.allocatedBlocks),free=\($0.freeBlocks),evictions=\($0.evictions)"
         } ?? "disabled"
         let disk = snapshot.diskStats.map {
-            "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes)"
+            "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),skips=\($0.storeSkips),evictions=\($0.evictions),bytes=\($0.currentPayloadBytes),maxBytes=\($0.maxSizeBytes)"
         } ?? "disabled"
         let ssm = snapshot.ssmStats
         print(
@@ -8371,7 +8409,12 @@ func runOrnithReportedReplay(modelPath: String, maxNew: Int) async throws {
 /// to seed sampling from the bundle's generation_config.json, with explicit
 /// BENCH_PERF_TEMP/TOP_P/TOP_K/MIN_P/REPETITION_PENALTY env overrides still
 /// taking final precedence. Set BENCH_PERF_SEED to make stochastic rows
-/// reproducible.
+/// reproducible. `logical_prompt_tps` includes cache reuse; `PERF_PREFILL`
+/// reports the runtime's initial prefill units separately. Raw `submit` mode
+/// additionally reports host token-delivery latency (not GPU kernel timing).
+/// `BENCH_PERF_CACHE_CHAIN_ID` opts into conversation-aware quota ownership.
+/// Omit `BENCH_PERF_ENABLE_THINKING` to preserve the bundle's template default;
+/// explicit `0` / `1` select off / on. Invalid values fail before model loading.
 func runPerfBench(
     modelPath: String,
     maxNew: Int,
@@ -8382,10 +8425,30 @@ func runPerfBench(
 ) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     let env = ProcessInfo.processInfo.environment
+    let thinkingContext: [String: any Sendable]?
+    let thinkingLabel: String
+    switch env["BENCH_PERF_ENABLE_THINKING"] {
+    case nil:
+        thinkingContext = nil
+        thinkingLabel = "omitted"
+    case "0":
+        thinkingContext = ["enable_thinking": false]
+        thinkingLabel = "false"
+    case "1":
+        thinkingContext = ["enable_thinking": true]
+        thinkingLabel = "true"
+    default:
+        throw NSError(
+            domain: "BENCH_PERF", code: 1,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "BENCH_PERF_ENABLE_THINKING must be 0, 1, or unset"
+            ])
+    }
     let modelName = modelDir.lastPathComponent
     let useJangPressLoad = env["BENCH_PERF_JANGPRESS"] == "1"
     let useMmap = env["BENCH_PERF_MMAP"] != "0"
-        let pathLabel = useTokenIterator ? "iter" : "batch"
+        let pathLabel = useTokenIterator ? "iter" : (env["BENCH_PERF_PATH"] ?? "batch")
         var perfLine = ""
 
         do {
@@ -8470,17 +8533,11 @@ func runPerfBench(
             ["role": "user", "content": promptText]
         ]
 
-        let promptTokens: [Int]
-        let enableThinking = (env["BENCH_PERF_ENABLE_THINKING"] ?? "0") == "1"
-        do {
-            promptTokens = try context.tokenizer.applyChatTemplate(
-                messages: messages,
-                tools: nil,
-                additionalContext: ["enable_thinking": enableThinking])
-        } catch {
-            promptTokens = try context.tokenizer.applyChatTemplate(messages: messages)
-        }
-        print("PERF_TEMPLATE enable_thinking=\(enableThinking)")
+        // A template error must fail the benchmark, not silently drop a
+        // requested override and measure a different generation contract.
+        let promptTokens = try context.tokenizer.applyChatTemplate(
+            messages: messages, tools: nil, additionalContext: thinkingContext)
+        print("PERF_TEMPLATE enable_thinking=\(thinkingLabel)")
         let promptIds = MLXArray(promptTokens.map { Int32($0) })
             .reshaped(1, promptTokens.count)
 
@@ -8538,6 +8595,28 @@ func runPerfBench(
             var unclosedReasoning = false
             var rssMiB = 0.0
             var footprintMiB = 0.0
+
+            // Progress units are token counts for this text-only benchmark.
+            // Keep them separate from logical prompt throughput: restored
+            // tokens must not be advertised as freshly computed prefill work.
+            var prefillStart: PrefillProgress?
+            var tokenDeliveryIntervals: [TimeInterval] = []
+            var lastTokenDelivery: TimeInterval?
+
+            mutating func recordPrefill(_ progress: PrefillProgress) {
+                if prefillStart == nil, progress.stage == .prefill,
+                    progress.detail == "running"
+                {
+                    prefillStart = progress
+                }
+            }
+
+            mutating func recordTokenDelivery(at time: TimeInterval) {
+                if let lastTokenDelivery {
+                    tokenDeliveryIntervals.append(max(0, time - lastTokenDelivery))
+                }
+                lastTokenDelivery = time
+            }
 
             var tokps: Double {
                 genSec > 0 ? Double(genTokens) / genSec : 0
@@ -8696,6 +8775,7 @@ func runPerfBench(
             default:
                 break
             }
+            params.cacheChainId = env["BENCH_PERF_CACHE_CHAIN_ID"]
             var result = PerfTurnResult()
             let start = CFAbsoluteTimeGetCurrent()
             let whichPath = env["BENCH_PERF_PATH"] ?? "batch"
@@ -8722,9 +8802,8 @@ func runPerfBench(
                         result.toolCalls += 1
                     case .toolCallProgress:
                         break
-                    case .prefillProgress:
-
-                        break
+                    case .prefillProgress(let progress):
+                        result.recordPrefill(progress)
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
                         result.promptSec = info.promptTime
@@ -8740,13 +8819,13 @@ func runPerfBench(
                 for await ev in stream {
                     switch ev {
                     case .token(let token):
+                        result.recordTokenDelivery(at: CFAbsoluteTimeGetCurrent())
                         if result.ttftSec == 0 {
                             result.ttftSec = CFAbsoluteTimeGetCurrent() - start
                         }
                         rawTokens.append(token)
-                    case .prefillProgress:
-
-                        break
+                    case .prefillProgress(let progress):
+                        result.recordPrefill(progress)
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
                         result.promptSec = info.promptTime
@@ -8778,9 +8857,8 @@ func runPerfBench(
                         result.toolCalls += 1
                     case .toolCallProgress:
                         break
-                    case .prefillProgress:
-
-                        break
+                    case .prefillProgress(let progress):
+                        result.recordPrefill(progress)
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
                         result.promptSec = info.promptTime
@@ -8814,7 +8892,7 @@ func runPerfBench(
                 let leaks = markerLeaks(in: result.text).joined(separator: ",")
                 let loop = lagunaLoopHeuristic(visible)
                 print(String(format:
-                    "  PERF_RUN label=%@ samplingSource=%@ seed=%@ ttft_ms=%.0f prompt_ms=%.0f prompt_tps=%.0f first_decode_ms=%.0f genTokens=%d genSec=%.3f tokps=%.1f tail_tokps_est=%.1f rss_mib=%.0f footprint_mib=%.0f temp=%.2f topP=%.2f topK=%d minP=%.2f rep=%@ stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d toolCalls=%d loop=%@ leaks=%@",
+                    "  PERF_RUN label=%@ samplingSource=%@ seed=%@ ttft_ms=%.0f prompt_ms=%.0f logical_prompt_tps=%.0f first_decode_ms=%.0f genTokens=%d genSec=%.3f tokps=%.1f tail_tokps_est=%.1f rss_mib=%.0f footprint_mib=%.0f temp=%.2f topP=%.2f topK=%d minP=%.2f rep=%@ stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d toolCalls=%d loop=%@ leaks=%@",
                     label, samplingSource, perfSeedLabel,
                     result.ttftSec * 1000,
                     result.promptSec * 1000,
@@ -8831,6 +8909,27 @@ func runPerfBench(
                     result.text.count, result.reasoning.count,
                     result.toolCalls, loop ? "YES" : "NO",
                     leaks.isEmpty ? "none" : leaks))
+                if let progress = result.prefillStart {
+                    let restored = min(progress.completedUnitCount, progress.totalUnitCount)
+                    let remaining = progress.totalUnitCount - restored
+                    print(
+                        "  PERF_PREFILL label=\(label) logical_tokens=\(promptTokens.count) reported_restored_units=\(restored) reported_remaining_units=\(remaining) source=first_running_progress"
+                    )
+                } else {
+                    print("  PERF_PREFILL label=\(label) reported_restored_units=unknown reported_remaining_units=unknown")
+                }
+                // Raw submit emits exactly one event per token. Parsed chunk
+                // timing is not token timing; never synthesize its percentiles.
+                let intervals = result.tokenDeliveryIntervals.sorted()
+                if !intervals.isEmpty {
+                    let median = intervals.count.isMultiple(of: 2)
+                        ? (intervals[intervals.count / 2 - 1] + intervals[intervals.count / 2]) / 2
+                        : intervals[intervals.count / 2]
+                    let p95 = intervals[max(0, Int(ceil(Double(intervals.count) * 0.95)) - 1)]
+                    print(String(format:
+                        "  PERF_TOKEN_DELIVERY label=%@ intervals=%d median_ms=%.3f p95_ms=%.3f max_ms=%.3f scope=host_delivery_not_gpu_kernel raw_protocol_output=YES",
+                        label, intervals.count, median * 1000, p95 * 1000, intervals.last! * 1000))
+                }
                 if !result.reasoning.isEmpty {
                     print("    REASONING_PREVIEW \"\(compactPreview(result.reasoning))\"")
                 }
@@ -8846,7 +8945,7 @@ func runPerfBench(
                     "hits=\($0.cacheHits),misses=\($0.cacheMisses),allocated=\($0.allocatedBlocks),free=\($0.freeBlocks),evictions=\($0.evictions)"
                 } ?? "disabled"
                 let disk = snapshot.diskStats.map {
-                    "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes)"
+                    "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes),bytes=\($0.currentPayloadBytes),evictions=\($0.evictions),evictedBytes=\($0.evictedBytes),quotaPasses=\($0.quotaPasses),lastQuotaPassMs=\($0.lastQuotaPassMs)"
                 } ?? "disabled"
                 let ssm = snapshot.ssmStats
                 print(

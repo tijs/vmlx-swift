@@ -300,6 +300,10 @@ public struct GenerateParameters: Sendable {
     /// `DDTREE-DESIGN.md` for the full spec.
     public var draftStrategy: DraftStrategy? = nil
 
+    /// Fixed native-MTP depth is a ceiling; adaptive exploration must be
+    /// requested explicitly. Either policy may descend to shallower work or AR.
+    public var nativeMTPDepthPolicy: NativeMTPDepthPolicy = .fixed
+
     /// Additional text-level stop sequences. When any of these strings
     /// appears in the user-visible assistant output, the library halts
     /// generation, truncates the match and everything after it, and
@@ -317,6 +321,15 @@ public struct GenerateParameters: Sendable {
     ///
     /// See `Libraries/MLXLMCommon/BatchEngine/STOP-SEQUENCES-CONTRACT.md`.
     public var extraStopStrings: [String] = []
+
+    /// The conversation this request belongs to, as the host names it (a chat
+    /// session id). Rides with every disk-cache row the request stores, so the
+    /// quota pass can tell the chat in progress from cold ones and evict cold
+    /// conversations' superseded snapshots first. It is not part of any cache
+    /// key: two chats sharing a prefix still share the entry. `nil` (the
+    /// default, and every non-chat caller) leaves rows unowned; the eviction
+    /// order is then exactly what it was before this field existed.
+    public var cacheChainId: String? = nil
 
     public init(
         maxTokens: Int? = nil,
@@ -1548,6 +1561,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     private static let logger = Logger(subsystem: "vmlx", category: "TokenIterator")
 
     private static func compiledDecodeDenied(for model: any LanguageModel) -> Bool {
+        guard model.supportsWholeForwardCompilation else { return true }
         let typeName = String(describing: type(of: model)).lowercased()
         // DSV4 owns a composite SWA + CSA/HSA cache. Its stateless gate and
         // SwiGLU micrographs are already compiled inside the model, while the
@@ -1596,6 +1610,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     var state: LMOutput.State?
 
     var y: LMInput.Text
+    // `y` advances to the next prediction before next() returns. Retain the
+    // token actually forwarded into KV using the existing return-value sync.
+    private var lastForwardedTokenId: Int?
     var cache: [KVCache]
     var processor: LogitProcessor?
     let sampler: LogitSampler
@@ -1661,11 +1678,12 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// generated token is fed back into the model.
     var promptCacheSnapshot: [KVCache]?
 
-    /// Absolute index into ``promptTokenIds`` of the hybrid cross-turn reuse
-    /// boundary — the last turn-start token, i.e. the end of the prompt with
-    /// its trailing generation prompt stripped. `nil` when the boundary does
-    /// not apply (dense model, media input, no turn-start token, cache tiers
-    /// all disabled).
+    /// Absolute index into ``promptTokenIds`` of the generation-suffix-stripped
+    /// cross-turn reuse boundary — the last turn-start token, i.e. the end of
+    /// the prompt with its trailing generation prompt stripped. `nil` when the
+    /// boundary does not apply (dense model, media input, no turn-start token,
+    /// cache tiers all disabled, or a topology that is neither hybrid nor a
+    /// standalone rotating/sliding-window cache).
     var hybridStripBoundary: Int?
 
     /// Cache state at ``hybridStripBoundary``, captured *during* prefill.
@@ -1932,7 +1950,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                     mediaSalt: mediaSalt,
                     skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: originalInput
-                        .cacheStablePrefixTokenCounts)
+                        .cacheStablePrefixTokenCounts,
+                    chainId: parameters.cacheChainId)
                 switch result {
                 case .hit(
                     let matchedTokens, let remainingTokens, let detail, let blocks,
@@ -1941,7 +1960,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 var retainedDiskRestore = false
                 var restoredTokenCount = 0
                 if !blocks.isEmpty {
-                    let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
+                    let restoredTokens = restoreLayerData(
+                        from: blocks, into: self.cache,
+                        preserveStandardKVStorageDType: coordinator.config.preserveStandardKVStorageDType)
                     coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
                         restoredTokenCount = restoredTokens
@@ -1970,7 +1991,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // entry).
                     let diskRestored = MLXCacheIOLock.withSerializedMLXCacheIO {
                         () -> Int in
-                        let count = restoreFromDiskArrays(diskArrays, into: &self.cache)
+                        let count = restoreFromDiskArrays(
+                                diskArrays, into: &self.cache, requirePromptBoundary: true)
                         if count > 0 {
                             // The v2 disk format has NO LayerKind for the
                             // GatedDeltaNet linear-attention (ArraysCache) state
@@ -2019,6 +2041,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                         Self.logger.info(
                             "Cache \(detail.rawValue) hit: restored \(diskRestored) tokens from disk, prefilling \(remainingTokens.count) remaining"
                         )
+                    } else if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: cacheLookupTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "payload does not fit the runtime cache")
                     }
                 }
 
@@ -2030,6 +2057,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: detail.rawValue)
                 {
+                    if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: cacheLookupTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "restored offsets do not match the boundary")
+                    }
                     restored = false
                     retainedDiskRestore = false
                     self.cache = self.model.newCache(parameters: effectiveParameters)
@@ -2314,13 +2347,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
     }
 
-    /// The hybrid cross-turn reuse boundary. Prefer the canonical history
-    /// boundary derived from the exact active chat template (including the
+    /// The cross-turn reuse boundary for path-dependent hybrid and standalone
+    /// rotating/sliding-window caches. Prefer the canonical history boundary
+    /// derived from the exact active chat template (including the
     /// assistant-continuation LCP proof); fall back to the model-load suffix
     /// heuristic only for raw/benchmark inputs that carry no canonical chat
     /// boundaries. The next chat turn replaces the generation prompt with the
     /// assistant's reply, so the full-prompt key never matches again, but this
-    /// boundary does — it is what gives hybrid models cross-turn prefix reuse.
+    /// boundary does — it is what gives hybrid and standalone rotating/SWA
+    /// models cross-turn prefix reuse.
     ///
     /// Also emits the boundary for non-hybrid topologies that cannot serve a
     /// growing-turn prefix match from any other tier: rotating paged
@@ -2342,7 +2377,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         coordinator: CacheCoordinator?,
         promptTokenIds: [Int],
         input: LMInput,
-        cache: [any KVCache]
+        cache: [KVCache]
     ) -> Int? {
         let heuristicBoundary = coordinator?.genPromptSuffixTokens.first
             .flatMap { promptTokenIds.lastIndex(of: $0) }
@@ -2436,6 +2471,22 @@ public struct TokenIterator: TokenIteratorProtocol {
         let split = boundary - (promptTokenIds.count - size)
         guard split >= 0, split < size else { return nil }
 
+        // Keep a media payload with the complete placeholder span it belongs
+        // to. Stable system/history boundaries can precede that span; putting
+        // the payload on the text-only head loses it from the actual media
+        // prefill. A split inside the span cannot partition opaque tower inputs.
+        var mediaInHead = false
+        var mediaInTail = false
+        if input.hasMediaContent {
+            guard let mediaTokenIds = input.mediaTokenIds, !mediaTokenIds.isEmpty else { return nil }
+            let ids = input.text.tokenIds ?? input.text.tokens.reshaped(-1).asArray(Int.self)
+            guard ids.count == size else { return nil }
+            let media = Set(mediaTokenIds)
+            mediaInHead = ids[..<split].contains(where: media.contains)
+            mediaInTail = ids[split...].contains(where: media.contains)
+            guard mediaInHead != mediaInTail else { return nil }
+        }
+
         // The mask, when present, is per-token (`Qwen3VLProcessor` hands the
         // hybrids an all-ones `[1, T]`), so it slices exactly like the tokens.
         // Anything not token-aligned — a materialized `[1, 1, T, T]` attention
@@ -2458,9 +2509,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                     tokens: flat[..<split][.newAxis, 0...],
                     mask: flatMask.map { slice($0[..<split]) },
                     tokenIds: headTokenIds),
-                image: input.image,
-                video: input.video,
-                audio: input.audio,
+                image: mediaInHead ? input.image : nil,
+                video: mediaInHead ? input.video : nil,
+                audio: mediaInHead ? input.audio : nil,
                 mediaTokenIds: input.mediaTokenIds,
                 cacheScopeSalt: input.cacheScopeSalt,
                 cachePromptIntent: input.cachePromptIntent,
@@ -2471,6 +2522,10 @@ public struct TokenIterator: TokenIteratorProtocol {
                 tokens: flat[split...][.newAxis, 0...],
                 mask: flatMask.map { slice($0[split...]) },
                 tokenIds: tailTokenIds),
+            image: mediaInTail ? input.image : nil,
+            video: mediaInTail ? input.video : nil,
+            audio: mediaInTail ? input.audio : nil,
+            mediaTokenIds: input.mediaTokenIds,
             cacheScopeSalt: input.cacheScopeSalt,
             cachePromptIntent: input.cachePromptIntent,
             toolSchemas: input.toolSchemas)
@@ -2500,6 +2555,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        // A warm input contains only the suffix after the restored prefix.
+        // Snapshot keys and processor boundaries refer to the whole prompt.
+        let inputStart = promptTokenIds.count - input.text.tokens.size
         // Prefill to a reusable structural boundary first, copy the exact cache
         // state, then consume the tail. Both halves run through the model's real
         // prepare/forward path in order; this avoids a second full prefill after
@@ -2530,11 +2588,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             // The head we just prefilled ends exactly at a boundary the store
             // loop will ask for later. Keep it so that loop can use it instead
             // of replaying the prefix through the model.
-            var capturedHeadCount = 0
+            var capturedBoundary = inputStart
             if let head = capture.head {
-                capturedHeadCount = head.text.tokenIds?.count ?? head.text.tokens.size
-                if capturedHeadCount > 0 {
-                    stableBoundarySnapshots[capturedHeadCount] = snapshot
+                capturedBoundary += head.text.tokenIds?.count ?? head.text.tokens.size
+                if capturedBoundary > inputStart {
+                    stableBoundarySnapshots[capturedBoundary] = snapshot
                 }
             }
             // Keep going through the stable boundaries that sit AFTER this
@@ -2546,7 +2604,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             if try prepareCapturingStableBoundaries(
                 input: capture.tail,
                 windowSize: windowSize,
-                alreadyConsumed: capturedHeadCount,
+                alreadyConsumed: capturedBoundary,
                 promptTokensForProcessor: input.text.tokens)
             {
                 return
@@ -2557,7 +2615,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             return
         }
         if try prepareCapturingStableBoundaries(
-            input: input, windowSize: windowSize, alreadyConsumed: 0,
+            input: input, windowSize: windowSize, alreadyConsumed: inputStart,
             promptTokensForProcessor: input.text.tokens)
         {
             return
@@ -2609,7 +2667,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         var remaining = input
         for boundary in wanted {
             guard boundary > consumed,
-                let split = boundarySplit(of: remaining, at: boundary - consumed),
+                let split = boundarySplit(of: remaining, at: boundary),
                 let head = split.head
             else { continue }
             let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
@@ -2939,9 +2997,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             Memory.clearCache()
         }
 
-        return MLXPressGenerationProfile.time("decode.token_item_sync") {
+        let forwardedToken = MLXPressGenerationProfile.time("decode.token_item_sync") {
             previousY.tokens.item(Int.self)
         }
+        lastForwardedTokenId = forwardedToken
+        return forwardedToken
     }
 
     public mutating func storeCacheAfterGeneration(
@@ -2966,6 +3026,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         // post-answer snapshots are both larger and not the boundary the next
         // templated turn is guaranteed to contain.  Prompts without this
         // processor-proven boundary keep the existing storage policy.
+        // Standalone rotating/SWA caches deliberately keep the exact/N-1
+        // disk-seed and post-answer policy (see `diskSeedBoundaryIndex`); they
+        // only gain the stripped-boundary store itself.
         let usesCanonicalHybridBoundary =
             coordinator.isHybrid && hybridStripBoundary != nil
         let isReusablePrefixWarmup =
@@ -2979,8 +3042,13 @@ public struct TokenIterator: TokenIteratorProtocol {
             tokens: [Int],
             cache cacheToStore: [KVCache],
             kvBits diskKVBits: Int?,
-            kvMode diskKVMode: KVQuantizationMode
+            kvMode diskKVMode: KVQuantizationMode,
+            isStableBoundary: Bool = false,
+            isResumeBoundary: Bool = false,
+            isPostAnswer: Bool = false
         ) {
+            var trace = CacheFinalizationTrace("solo-entry", tokens: tokens.count)
+            defer { trace.mark("return") }
             guard !tokens.isEmpty else { return }
             // Saving the cache duplicates it several times over (snapshot, host
             // `Data` for the disk write, disk-store cache) at the point where
@@ -3056,7 +3124,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                 perLayerData: perLayerData,
                 ssmStates: ssmCapture,
                 cache: diskStoreCache,
-                mediaSalt: mediaSalt
+                mediaSalt: mediaSalt,
+                chainId: cacheInitParameters?.cacheChainId,
+                isStableRoot: isStableBoundary,
+                isResumeBoundary: isResumeBoundary,
+                isPostAnswer: isPostAnswer
             )
         }
 
@@ -3137,23 +3209,17 @@ public struct TokenIterator: TokenIteratorProtocol {
                     }
                 }
                 // Cross-turn reuse boundary for hybrid-SSM models (qwen3.5 /
-                // ornith GatedDeltaNet, Nemotron-H Mamba-2, LFM2, ZAYA CCA, …):
-                // store the generation-prompt-STRIPPED prompt, ending just before
-                // the LAST turn-start token (`<|im_start|>` / `<start_of_turn>` —
-                // the first token of the gen-prompt diff computed at load).
-                // `add_generation_prompt` appends `<turn-start>assistant\n` + a
-                // request-dependent scaffold, so we anchor on the structural
-                // turn-start token, not the exact suffix. The NEXT chat turn
-                // replaces that trailing gen prompt with the actual assistant
-                // reply, so the full-prompt key never matches next turn — but
-                // this stripped boundary (ending at the user turn) DOES, which is
-                // what restores hybrid cross-turn prefix reuse (proven live on
-                // qwen-agentworld-35B / qwen3.6-35B-A3B GDN MoE + Qwen3.6-27B MTP:
-                // growing turns HIT the stripped boundary and stay coherent —
-                // byte-identical to cache-off ground truth). Default ON for hybrid
-                // models; disable with `VMLX_HYBRID_STRIPPED_STORE=0`. Dense /
-                // sliding-window models are excluded — they already reuse via the
-                // post-answer boundary and don't need this.
+                // ornith GatedDeltaNet, Nemotron-H Mamba-2, LFM2, ZAYA CCA, …)
+                // and standalone rotating/sliding-window caches: store the
+                // generation-prompt-STRIPPED prompt, ending just before the LAST
+                // turn-start token (`<|im_start|>` / `<start_of_turn>` — the first
+                // token of the gen-prompt diff computed at load). The NEXT chat
+                // turn replaces that trailing gen prompt with the actual assistant
+                // reply, so the full-prompt key never matches next turn — but the
+                // stripped boundary does, restoring cross-turn prefix reuse.
+                // Default ON for hybrid and standalone rotating/SWA topologies;
+                // disable with `VMLX_HYBRID_STRIPPED_STORE=0`. Dense models are
+                // excluded because they already reuse via the post-answer boundary.
                 //
                 // `hybridStripSnapshot` was captured as prefill crossed the
                 // boundary, so this store is just a copy. There is deliberately no
@@ -3176,13 +3242,17 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // `stripAt` routinely coincides with a `cachePrefixTokenCounts`
                     // entry.
                     if let strippedSnapshot = hybridStripSnapshot {
+                        // The stripped boundary is where a hybrid model's
+                        // next turn resumes (measured: every warm turn of
+                        // LFM2.5 landed here), so it is the row to keep.
                         store(
                             tokens: Array(promptTokenIds.prefix(stripAt)),
                             cache: strippedSnapshot,
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: strippedSnapshot,
-                                requested: kvMode))
+                                requested: kvMode),
+                            isResumeBoundary: true)
                     } else {
                         Self.logger.debug(
                             "TokenIterator: no stripped-boundary snapshot to store at \(stripAt, privacy: .public); prefill did not cross the boundary"
@@ -3274,7 +3344,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: boundarySnapshot,
-                                requested: kvMode))
+                                requested: kvMode),
+                            isStableBoundary: isStableBoundary,
+                            // A message boundary that is not the shared root
+                            // is what the next prompt of this chat (or an
+                            // edited one) starts with.
+                            isResumeBoundary: !isStableBoundary)
                     }
                 }
         }
@@ -3304,15 +3379,19 @@ public struct TokenIterator: TokenIteratorProtocol {
         // boundary-offset guard (correctly) refuses the store, silently
         // costing the post-answer boundary every turn (observed live:
         // "REFUSED offset/key mismatch tokens=3627 offsets=[3628]").
-        // Extend the key by the pending drained token instead.
+        // Extend the key by the forwarded stop token. `y` already holds the
+        // next prediction, which has never been forwarded and cannot label KV.
         let generatedBoundaryTokens = Self.generatedBoundaryTokensAligned(
             promptTokenIds: promptTokenIds,
             generatedTokenIds: generatedTokenIds,
             cacheOffsets: cache.map(\.offset),
-            pendingDrainedTokenId: y.tokens.size == 1
-                ? y.tokens.item(Int.self) : nil)
+            pendingDrainedTokenId: lastForwardedTokenId)
         guard let generatedBoundaryTokens else { return }
-        store(tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode)
+        // Whether the next prompt starts from this row depends on the
+        // template; the cache learns that from the first hit on one.
+        store(
+            tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode,
+            isPostAnswer: true)
     }
 
     /// Align the post-answer boundary key with what the cache actually
@@ -3853,7 +3932,7 @@ private func runSynchronousGenerationLoop(
     let now = Date.timeIntervalSinceReferenceDate
     let generateTime = now - start
 
-    Stream().synchronize()
+    StreamOrDevice.default.stream.synchronize()
 
     return SynchronousGenerationLoopResult(
         generatedTokenIds: generatedTokenIds,
@@ -4668,8 +4747,13 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
+        // Cover deferred prefill and the final cache/GPU drains, not merely
+        // visible token emission. Cancellation/error paths also release it.
+        let activity = GenerationActivity()
+        defer { activity.end() }
         let performIteration = {
             var handler = handler.consume()
+            let streamTiming = StreamTimingRecorder()
 
             // Construct the iterator *inside* the streaming task so any
             // prefill work (cache fetch + prompt prepare) runs here rather
@@ -4697,7 +4781,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 // "command encoder is already encoding" / end_encoding races.
                 // The normal completion path below drains twice for the same
                 // reason; the early-exit paths must match it.
-                Stream().synchronize()
+                StreamOrDevice.default.stream.synchronize()
                 handler.onGenerationEnd(emit: continuation.yield)
                 _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
                     promptTokenCount: promptTokenCount,
@@ -4714,7 +4798,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     "Iterator construction failed: \(error.localizedDescription, privacy: .public)")
                 // Drain any prefill work enqueued before the failure before
                 // closing the stream (see the CancellationError branch above).
-                Stream().synchronize()
+                StreamOrDevice.default.stream.synchronize()
                 handler.onGenerationEnd(emit: continuation.yield)
                 _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
                     promptTokenCount: promptTokenCount,
@@ -4749,6 +4833,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 // prose to EOS (measured up to maxTokens of zombie decode).
                 if Task.isCancelled {
                     stopReason = handler.emittedToolCall ? .stop : .cancelled
+                    streamTiming?.recordTermination(handler.emittedToolCall ? "tool_consumer_cancelled" : "task_cancelled")
                     break
                 }
 
@@ -4760,9 +4845,13 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
                 // Check for end-of-sequence tokens
                 if token == tokenizer.unknownTokenId || stopTokenIds.contains(token) {
+                    streamTiming?.recordTermination(
+                        token == tokenizer.unknownTokenId ? "unknown_token:\(token)" : "stop_token:\(token)")
                     if includeStopToken {
                         tokenCount += 1
+                        streamTiming?.record()
                         if !handler.onStopToken(token, emit: continuation.yield) {
+                            streamTiming?.recordTermination("stop_token_consumer_terminated:\(token)")
                             stopReason = .cancelled
                             break
                         }
@@ -4772,7 +4861,12 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 }
 
                 tokenCount += 1
+                streamTiming?.record()
                 if !handler.onToken(token, emit: continuation.yield) {
+                    streamTiming?.recordTermination(
+                        handler.stopSequenceHit ? "stop_sequence"
+                        : handler.haltedOnRepetition ? "repetition_detector"
+                        : handler.emittedToolCall ? "tool_call" : "consumer_terminated")
                     // Distinguish "downstream consumer terminated the
                     // stream" from "library-internal stop-sequence
                     // match" — the latter should report `stopReason =
@@ -4791,8 +4885,10 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             if stopReason == nil {
                 if Task.isCancelled {
                     stopReason = handler.emittedToolCall ? .stop : .cancelled
+                    streamTiming?.recordTermination(handler.emittedToolCall ? "tool_consumer_cancelled" : "task_cancelled")
                 } else if let maxTokens = iterator.maxTokens, tokenCount >= maxTokens {
                     stopReason = .length
+                    streamTiming?.recordTermination("token_limit")
                 } else {
                     stopReason = .cancelled
                 }
@@ -4807,6 +4903,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start
+            streamTiming?.finish(tokenCount: tokenCount, stopReason: String(describing: stopReason))
             MLXPressGenerationProfile.dumpAndReset(
                 reason: "generation-end tokens=\(tokenCount)")
 
@@ -4849,7 +4946,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             let genTailTrace =
                 ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
             let tailT0 = Date()
-            Stream().synchronize()
+            StreamOrDevice.default.stream.synchronize()
             let tailT1 = Date()
             iterator.storeCacheAfterGeneration(
                 generatedTokenIds: generatedTokenIds,
@@ -4857,7 +4954,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     && !handler.stopSequenceHit
                     && !handler.emittedToolCall)
             let tailT2 = Date()
-            Stream().synchronize()
+            StreamOrDevice.default.stream.synchronize()
             let tailT3 = Date()
 
             // Router-advice readback runs on its own Dispatch queue. Drain it

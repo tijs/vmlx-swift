@@ -27,6 +27,8 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     public var arraysLayerCount: Int
     public var zayaCCALayerCount: Int
     public var cacheListLayerCount: Int
+    /// Optional for decoding telemetry written before custom disk contracts.
+    public private(set) var diskCacheStateIdentifiers: [String]?
 
     public init(
         layerCount: Int = 0,
@@ -106,6 +108,7 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
 
     public var requiresDiskBackedCoordinatorRestore: Bool {
         requiresSSMCompanionState
+            || !(diskCacheStateIdentifiers ?? []).isEmpty
             || rotatingKVLayerCount > 0
             || compilableRotatingKVLayerCount > 0
             || rotatingWrapperLayerCount > 0
@@ -117,6 +120,9 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
 
     public var topologyTags: [String] {
         var tags: [String] = ["layers=\(layerCount)"]
+        for identifier in diskCacheStateIdentifiers ?? [] {
+            tags.append("diskState=\(identifier)")
+        }
         if kvLayerCount > 0 { tags.append("kvLayers=\(kvLayerCount)") }
         if chunkedKVLayerCount > 0 { tags.append("chunkedKVLayers=\(chunkedKVLayerCount)") }
         if quantizedKVLayerCount > 0 { tags.append("quantizedKVLayers=\(quantizedKVLayerCount)") }
@@ -143,6 +149,13 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     }
 
     private mutating func record(_ cache: any KVCache) {
+        if let custom = cache as? any DiskCacheStateProviding {
+            // Hosts include these tags in cache keys, separating a new
+            // complete layout (or runtime mode) from older lossy records.
+            var identifiers = Set(diskCacheStateIdentifiers ?? [])
+            identifiers.insert(custom.diskCacheStateIdentifier)
+            diskCacheStateIdentifiers = identifiers.sorted()
+        }
         switch cache {
         case let list as CacheList:
             cacheListLayerCount += 1
@@ -258,6 +271,7 @@ public struct TurboQuantCacheTransitionSnapshot: Codable, Sendable, Equatable {
 /// ```
 public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
+    private let attentionCacheKeyComponent: String?
 
     // MARK: - Multi-tier KV Cache
 
@@ -275,6 +289,9 @@ public final class ModelContainer: Sendable {
     /// Auto-detects hybrid models and sets modelKey from configuration if not provided.
     public func enableCaching(config: CacheCoordinatorConfig = CacheCoordinatorConfig()) {
         var config = config
+        if attentionCacheKeyComponent != nil {
+            config.preserveStandardKVStorageDType = true
+        }
         // Auto-set modelKey from model configuration if not provided
         if config.modelKey == nil {
             // Will be set asynchronously after first access — for now use a placeholder
@@ -282,7 +299,8 @@ public final class ModelContainer: Sendable {
             config.modelKey = "\(ObjectIdentifier(self))"
         }
         if let modelKey = config.modelKey {
-            config.modelKey = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+            let scoped = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+            config.modelKey = attentionCacheKeyComponent.map { "\(scoped)|\($0)" } ?? scoped
         }
         let coordinator = CacheCoordinator(config: config)
         _cacheCoordinator.withLock { $0 = coordinator }
@@ -292,12 +310,16 @@ public final class ModelContainer: Sendable {
     /// Call after model loading. Inspects the model's cache types to detect SSM layers.
     public func enableCachingAsync(config baseConfig: CacheCoordinatorConfig = CacheCoordinatorConfig()) async {
         var config = baseConfig
+        if attentionCacheKeyComponent != nil {
+            config.preserveStandardKVStorageDType = true
+        }
         let modelConfig = await context.read { $0.configuration }
         if config.modelKey == nil {
             config.modelKey = modelConfig.name
         }
         if let modelKey = config.modelKey {
-            config.modelKey = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+            let scoped = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+            config.modelKey = attentionCacheKeyComponent.map { "\(scoped)|\($0)" } ?? scoped
         }
 
         let topology = await cacheTopologySnapshot()
@@ -487,6 +509,7 @@ public final class ModelContainer: Sendable {
     }
 
     public init(context: consuming ModelContext) {
+        self.attentionCacheKeyComponent = JangHadamardAttention.cacheKeyComponent(model: context.model)
         self.context = .init(context)
     }
 

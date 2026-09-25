@@ -31,6 +31,7 @@ int  vmlx_group_rank(VMLXGroup g);
 int  vmlx_group_size(VMLXGroup g);
 VMLXGroup vmlx_group_init(bool strict, const char* backend);
 VMLXGroup vmlx_group_split(VMLXGroup g, int color, int key);
+void vmlx_group_free(VMLXGroup g);
 bool vmlx_distributed_is_available(const char* backend);
 
 // Collectives. Each returns 0 on success, non-zero on error. The result

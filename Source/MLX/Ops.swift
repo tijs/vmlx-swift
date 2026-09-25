@@ -1986,7 +1986,7 @@ public func median(
     stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
-    mlx_median(&result, a.ctx, [axis.int32], 1, keepDims, stream.ctx)
+    mlx_median_axis(&result, a.ctx, axis.int32, keepDims, stream.ctx)
     return MLXArray(result)
 }
 
@@ -2005,7 +2005,7 @@ public func median(
     stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
-    mlx_median(&result, a.ctx, axes.asInt32, axes.count, keepDims, stream.ctx)
+    mlx_median_axes(&result, a.ctx, axes.asInt32, axes.count, keepDims, stream.ctx)
     return MLXArray(result)
 }
 
@@ -2023,7 +2023,7 @@ public func median(
     stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
-    mlx_median(&result, a.ctx, nil, 0, keepDims, stream.ctx)
+    mlx_median(&result, a.ctx, keepDims, stream.ctx)
     return MLXArray(result)
 }
 
@@ -3124,7 +3124,7 @@ public func trace(
     stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
-    mlx_trace(
+    mlx_trace_axes(
         &result,
         array.ctx, offset.int32, axis1.int32, axis2.int32, (dtype ?? array.dtype).cmlxDtype,
         stream.ctx)

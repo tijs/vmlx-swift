@@ -117,6 +117,14 @@ public struct ReasoningParser: Sendable {
     /// reasoning/content mode.
     public let consumesRecipientHeaders: Bool
 
+    /// MiniCPM5's native XML envelope owns its payload, including literal
+    /// reasoning tags inside CDATA. Opt-in; other dialects are unchanged.
+    public let preservesXMLFunctionPayloads: Bool
+
+    /// Qwen's content-side <tool_call> envelope owns literal reasoning markers
+    /// in its values. Separate from MiniCPM's CDATA-aware function envelope.
+    public let preservesQwenToolCallPayloads: Bool
+
     // MARK: State
 
     /// Text not yet emitted because it might be a partial tag prefix.
@@ -124,6 +132,7 @@ public struct ReasoningParser: Sendable {
 
     /// Whether we're currently inside a reasoning block.
     private var insideReasoning: Bool = false
+    private var insideQwenToolCall: Bool = false
 
     /// Harmony-specific channel state. Gemma 4 uses
     /// `<|channel>...<channel|>`, while GPT-OSS uses
@@ -171,13 +180,17 @@ public struct ReasoningParser: Sendable {
         stripStrayTags: Bool = true,
         startTagAliases: [String] = [],
         endTagAliases: [String] = [],
-        consumesRecipientHeaders: Bool = false
+        consumesRecipientHeaders: Bool = false,
+        preservesXMLFunctionPayloads: Bool = false,
+        preservesQwenToolCallPayloads: Bool = false
     ) {
         self.startTag = startTag
         self.endTag = endTag
         self.insideReasoning = startInReasoning
         self.stripStrayTags = stripStrayTags
         self.consumesRecipientHeaders = consumesRecipientHeaders
+        self.preservesXMLFunctionPayloads = preservesXMLFunctionPayloads
+        self.preservesQwenToolCallPayloads = preservesQwenToolCallPayloads
         self.startTagAliases = startTagAliases.filter { !$0.isEmpty && $0 != startTag }
         self.endTagAliases = endTagAliases.filter { !$0.isEmpty && $0 != endTag }
     }
@@ -223,6 +236,7 @@ public struct ReasoningParser: Sendable {
             buffer.removeAll(keepingCapacity: false)
         }
         insideReasoning = false
+        insideQwenToolCall = false
         return out
     }
 
@@ -670,6 +684,24 @@ public struct ReasoningParser: Sendable {
         var out: [ReasoningSegment] = []
 
         while !buffer.isEmpty {
+            if insideQwenToolCall {
+                // Stream the opaque payload onward; hold only a possible closing
+                // tag suffix, not the entire (potentially large) tool argument.
+                let closer = "</tool_call>"
+                if let end = buffer.range(of: closer) {
+                    out.append(.content(String(buffer[..<end.upperBound])))
+                    buffer.removeSubrange(buffer.startIndex..<end.upperBound)
+                    insideQwenToolCall = false
+                    continue
+                }
+                let hold = allowPartialTagAtEnd ? closer.count - 1 : 0
+                if buffer.count > hold {
+                    let end = buffer.index(buffer.endIndex, offsetBy: -hold)
+                    out.append(.content(String(buffer[..<end])))
+                    buffer.removeSubrange(buffer.startIndex..<end)
+                }
+                break
+            }
             // Tag-search dispatch: stripStrayTags=true scans for both
             // and resolves to whichever appears first; stripStrayTags=
             // false (legacy harmony) only scans for the tag matching
@@ -711,6 +743,39 @@ public struct ReasoningParser: Sendable {
                     couldGrowIntoLongerSpelling(
                         $0, among: firstTagIsOpener ? openerSpellings : closerSpellings)
                 } == true
+
+            if preservesQwenToolCallPayloads, !insideReasoning,
+                let tool = buffer.range(of: "<tool_call>"),
+                firstTagRange.map({ tool.lowerBound < $0.lowerBound }) ?? true
+            {
+                out.append(.content(String(buffer[..<tool.upperBound])))
+                buffer.removeSubrange(buffer.startIndex..<tool.upperBound)
+                insideQwenToolCall = true
+                continue
+            }
+
+            // Once content commits to a native XML function, reasoning tags
+            // inside its values are data. A reasoning example is deliberately
+            // NOT protected while insideReasoning. Hold incomplete envelopes
+            // until their CDATA-aware closer; never invent or close a tag.
+            if preservesXMLFunctionPayloads, !insideReasoning,
+                let function = buffer.range(of: "<function name=\""),
+                firstTagRange.map({ function.lowerBound < $0.lowerBound }) ?? true
+            {
+                let before = String(buffer[..<function.lowerBound])
+                if !before.isEmpty { out.append(.content(before)) }
+                buffer = String(buffer[function.lowerBound...])
+                if let end = MiniCPM5ToolCallParser().completeToolCallEnd(in: buffer) {
+                    out.append(.content(String(buffer[..<end])))
+                    buffer.removeSubrange(buffer.startIndex..<end)
+                    continue
+                }
+                if !allowPartialTagAtEnd {
+                    out.append(.content(buffer))
+                    buffer.removeAll(keepingCapacity: false)
+                }
+                break
+            }
 
             // A tool-recipient channel header is protocol that no tag spelling
             // covers, so it is resolved against the tag search by position:
@@ -780,7 +845,12 @@ public struct ReasoningParser: Sendable {
                 // guards the edge case of an empty tag (a mis-configured
                 // model-specific override), where a negative `safeTail` would
                 // make `offsetBy: -safeTail` walk past `endIndex` and trap.
-                let longestTag = (openerSpellings + closerSpellings)
+                var literalOpeners = preservesXMLFunctionPayloads && !insideReasoning
+                    ? ["<function name=\""] : []
+                if preservesQwenToolCallPayloads && !insideReasoning {
+                    literalOpeners.append("<tool_call>")
+                }
+                let longestTag = (openerSpellings + closerSpellings + literalOpeners)
                     .map(\.count).max() ?? 0
                 let safeTail = max(0, longestTag - 1)
                 if buffer.count > safeTail {
@@ -861,6 +931,10 @@ extension ReasoningParser {
         let n = name.lowercased()
         let normalized = normalizedReasoningAlias(n)
         let compact = compactReasoningAlias(n)
+
+        if normalized == "minicpm5" || normalized == "minicpm5_xml_function" {
+            return ReasoningParser(preservesXMLFunctionPayloads: true)
+        }
 
         if compact.hasPrefix("gemma4") {
             return ReasoningParser(
@@ -996,7 +1070,10 @@ extension ReasoningParser {
         }
 
         switch n {
-        case "think_xml", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
+        case "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36":
+            return ReasoningParser(
+                startInReasoning: true, preservesQwenToolCallPayloads: true)
+        case "think_xml",
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",
             "nemotron", "nemotron_h", "minimax", "minimax_m2",
             "kimi", "kimi_k2", "kimik2",
@@ -1191,7 +1268,9 @@ extension ReasoningParser {
             // exactly this way: the flag was set by `fromCapabilityName`,
             // dropped here, and the generation loop only ever uses this path,
             // so three correct parser fixes changed nothing on the app.
-            consumesRecipientHeaders: base.consumesRecipientHeaders)
+            consumesRecipientHeaders: base.consumesRecipientHeaders,
+            preservesXMLFunctionPayloads: base.preservesXMLFunctionPayloads,
+            preservesQwenToolCallPayloads: base.preservesQwenToolCallPayloads)
         if startInReasoning && parser.isHarmonyChannelParser {
             parser.insideHarmonyChannel = true
             parser.harmonyChannelIsReasoning = true

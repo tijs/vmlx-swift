@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 
 public enum VLMError: LocalizedError, Equatable {
@@ -119,6 +120,12 @@ public enum VLMTypeRegistry {
     public static let shared: ModelTypeRegistry = .init(creators: _creators)
 
     nonisolated(unsafe) private static let _creators: [String: ModelCreator] = [
+        "mimo_v2": { data, requesting in
+            guard MiMoV26Contract.matches(data) else {
+                throw ModelFactoryError.unsupportedModelType("mimo_v2 without the V2.6 fused mixed-quant contract")
+            }
+            return try MiMoV26(JSONDecoder.json5().decode(MiMoV26Configuration.self, from: data), requesting: requesting)
+        },
         "paligemma": create(PaliGemmaConfiguration.self, PaliGemma.init),
         // Block-diffusion Gemma: the MLXLLM engine with the Gemma4 vision
         // tower installed. Generation runs via BlockDiffusionTokenIterator;
@@ -220,8 +227,35 @@ public enum VLMTypeRegistry {
 
 public enum VLMProcessorTypeRegistry {
 
+    /// Resolve the configured architecture's processor exactly as the factory does.
+    /// This is also used by header-only admission; catalog/model display names are not inputs.
+    public static func processorType(modelType: String, declaredProcessorType: String) -> String {
+        // Override processor type based on model type for models that need special handling
+        // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
+        // to handle spatial merging correctly. Nemotron-Omni bundles use a custom
+        // image_processor_type that doesn't map to processor_class — force the
+        // NemotronHOmniProcessor when we've detected the omni bundle.
+        let processorTypeOverrides: [String: String] = [
+            "mistral3": "Mistral3Processor",
+            // Mistral 3.5 VLM bundles can carry the outer model_type
+            // `ministral3` (the inner text decoder spelling promoted to
+            // the outer level). Their preprocessor_config.json still
+            // ships `processor_class: "PixtralProcessor"`, which loses
+            // Mistral3's spatial-merge handling. Force the spatial-merge
+            // processor here for both spellings — same dispatch as
+            // VLMTypeRegistry.dispatchMistral3VLM.
+            "ministral3": "Mistral3Processor",
+            "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHOmniProcessor",
+            "nemotron_h_omni": "NemotronHOmniProcessor",
+        ]
+        return processorTypeOverrides[modelType] ?? declaredProcessorType
+    }
+
     /// Shared instance with default processor types.
     public static let shared: ProcessorTypeRegistry = .init(creators: [
+        "MiMoV26Processor": { data, tokenizer in
+            try MiMoV26Processor(JSONDecoder.json5().decode(MiMoV26ProcessorConfiguration.self, from: data), tokenizer: tokenizer)
+        },
         "MuseGlimmerProcessor": create(
             MuseGlimmerProcessorConfiguration.self, MuseGlimmerProcessor.init),
         "Glm5NextProcessor": create(
@@ -622,6 +656,9 @@ public final class VLMModelFactory: ModelFactory {
         if let configurable = model as? Qwen4ExpModelDirectoryConfigurable {
             try configurable.configure(modelDirectory: modelDirectory)
         }
+        if let mimo = model as? MiMoV26 {
+            try mimo.configure(modelDirectory: modelDirectory)
+        }
 
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig =
@@ -658,7 +695,7 @@ public final class VLMModelFactory: ModelFactory {
             // Same priority ladder as LLMModelFactory — DSV4 VLM
             // bundles will stamp `chat.tool_calling.parser = "dsml"`.
             let chatStamped = ToolCallFormat.fromCapabilityName(
-                jangConfig?.chat?.toolCalling?.parser)
+                jangConfig?.chat?.toolCalling?.parser, modelType: baseConfig.modelType)
             let templateAwareJang = ParserResolution.toolCall(
                 capabilities: jangConfig?.capabilities,
                 modelType: baseConfig.modelType,
@@ -690,7 +727,7 @@ public final class VLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? "qwen3"
+                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
                         : reasoningStampFromModelType(baseConfig.modelType))
             } else if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
@@ -703,7 +740,7 @@ public final class VLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? "qwen3"
+                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
                         : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
@@ -755,26 +792,9 @@ public final class VLMModelFactory: ModelFactory {
                 error.filename, configuration.name, error.underlying)
         }
 
-        // Override processor type based on model type for models that need special handling
-        // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
-        // to handle spatial merging correctly. Nemotron-Omni bundles use a custom
-        // image_processor_type that doesn't map to processor_class — force the
-        // NemotronHOmniProcessor when we've detected the omni bundle.
-        let processorTypeOverrides: [String: String] = [
-            "mistral3": "Mistral3Processor",
-            // Mistral 3.5 VLM bundles can carry the outer model_type
-            // `ministral3` (the inner text decoder spelling promoted to
-            // the outer level). Their preprocessor_config.json still
-            // ships `processor_class: "PixtralProcessor"`, which loses
-            // Mistral3's spatial-merge handling. Force the spatial-merge
-            // processor here for both spellings — same dispatch as
-            // VLMTypeRegistry.dispatchMistral3VLM.
-            "ministral3": "Mistral3Processor",
-            "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHOmniProcessor",
-            "nemotron_h_omni": "NemotronHOmniProcessor",
-        ]
-        let processorType =
-            processorTypeOverrides[dispatchModelType] ?? baseProcessorConfig.processorClass
+        let processorType = VLMProcessorTypeRegistry.processorType(
+            modelType: dispatchModelType,
+            declaredProcessorType: baseProcessorConfig.processorClass)
 
         let baseProcessor = try await processorRegistry.createModel(
             configuration: processorConfigData,
@@ -832,6 +852,12 @@ private struct ProcessorConfigError: Error {
 private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
     Data, BaseProcessorConfiguration
 ) {
+    // Converted MiMo carries the authoritative settings in config.json.
+    // Its legacy Qwen preprocessor sidecar describes a different pixel path.
+    if let data = try? Data(contentsOf: modelDirectory.appendingPathComponent("config.json")),
+        MiMoV26Contract.matches(data) {
+        return (data, BaseProcessorConfiguration(processorClass: "MiMoV26Processor"))
+    }
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
     let audioPreprocessorConfigURL = modelDirectory.appending(
