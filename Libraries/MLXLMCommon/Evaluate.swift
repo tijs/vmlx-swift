@@ -1367,6 +1367,69 @@ public struct PenaltyProcessor: LogitProcessor {
     }
 }
 
+/// Composes the built-in effective processor with a request-supplied
+/// additional processor.
+///
+/// Order is fixed and load-bearing: `base` (the processor built from
+/// ``GenerateParameters`` — repetition/presence/frequency/suppress/reasoning
+/// stages) runs FIRST and `additional` runs LAST. An additional constraint
+/// such as a structured-output token mask therefore sees the same penalised
+/// logits the sampler would have seen without it, and no later penalty stage
+/// can re-open a token the constraint masked. `prompt` and `didSample` are
+/// forwarded to both members in the same order.
+///
+/// This is the composition behind
+/// ``TokenIterator/init(input:model:cache:parameters:cacheCoordinator:disableDiskBackedRequiredToolRestore:skipDiskBackedToolPromptSeedBoundary:prefillProgressHandler:additionalProcessor:)``.
+/// Ordinary callers never see it: without an `additionalProcessor` the
+/// iterator stores the built-in effective processor unchanged.
+///
+/// Scope: the ordinary single-sequence, non-speculative decode path. The
+/// additional processor runs host-side on every sampled position of the
+/// `TokenIterator` — including compiled decode, whose sampling still runs in
+/// Swift — and does not participate in speculative draft/verify.
+public struct CompositeLogitProcessor: LogitProcessor {
+
+    /// The built-in effective processor (`GenerateParameters.processor()`),
+    /// or `nil` when the parameters configure no penalty stage at all.
+    var base: LogitProcessor?
+
+    /// The request-supplied processor. Runs last.
+    var additional: LogitProcessor
+
+    public init(base: LogitProcessor?, additional: LogitProcessor) {
+        self.base = base
+        self.additional = additional
+    }
+
+    /// Deep copy: BOTH members may hold reference-typed state
+    /// (`GeneratedTokenCounts`, embedder state), so the default value copy is
+    /// not enough — see ``LogitProcessor/independentCopy()``.
+    public func independentCopy() -> Self {
+        var copy = self
+        copy.base = base?.independentCopy()
+        copy.additional = additional.independentCopy()
+        return copy
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {
+        base?.prompt(prompt)
+        additional.prompt(prompt)
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        var logits = logits
+        if let base {
+            logits = base.process(logits: logits)
+        }
+        return additional.process(logits: logits)
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        base?.didSample(token: token)
+        additional.didSample(token: token)
+    }
+}
+
 /// Common properties shared by token-generating iterators.
 public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
     var maxTokens: Int? { get }
@@ -1795,13 +1858,26 @@ public struct TokenIterator: TokenIteratorProtocol {
     ///   - cache: optional ``KVCache``
     ///   - parameters: the generation parameters
     ///   - cacheCoordinator: optional multi-tier cache coordinator for prefix reuse
+    ///   - additionalProcessor: optional embedder-supplied ``LogitProcessor``
+    ///     for request-scoped token-level constraints (structured/constrained
+    ///     decoding). Opt-in: `nil` (the default) stores the built-in effective
+    ///     processor exactly as before. When supplied it is composed through
+    ///     ``CompositeLogitProcessor`` so the built-in penalty stages run FIRST
+    ///     and this processor runs LAST, and it receives
+    ///     `prompt`/`process`/`didSample` on every sampled position of this
+    ///     iterator, including compiled decode (whose sampling still runs in
+    ///     Swift). Scope: the ordinary single-sequence, NON-speculative
+    ///     `TokenIterator` path only — speculative (draft/MTP/DFlash)
+    ///     iterators do not accept one, so do not pair it with a
+    ///     `DraftStrategy`.
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
         parameters: GenerateParameters,
         cacheCoordinator: CacheCoordinator? = nil,
         disableDiskBackedRequiredToolRestore: Bool = false,
         skipDiskBackedToolPromptSeedBoundary: Bool = false,
-        prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil
+        prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil,
+        additionalProcessor: LogitProcessor? = nil
     ) throws {
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
@@ -1838,7 +1914,17 @@ public struct TokenIterator: TokenIteratorProtocol {
             coordinator.setPagedIncompatible(true)
         }
 
-        self.processor = effectiveParameters.processor()
+        let builtInProcessor = effectiveParameters.processor()
+        if let additionalProcessor {
+            // Request-scoped constraint (structured/constrained decoding):
+            // composed so the built-in penalty stages run first and the
+            // constraint runs last. `nil` keeps the previous behavior
+            // byte-for-byte.
+            self.processor = CompositeLogitProcessor(
+                base: builtInProcessor, additional: additionalProcessor)
+        } else {
+            self.processor = builtInProcessor
+        }
         self.sampler = effectiveParameters.sampler()
         self.maxTokens = MetalLiveBufferGuard.clampedMaxTokens(
             requested: effectiveParameters.maxTokens, cache: self.cache)
