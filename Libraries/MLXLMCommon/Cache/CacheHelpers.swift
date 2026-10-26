@@ -1480,7 +1480,11 @@ private func restoreRotatingLayer(
     into layer: any KVCache
 ) {
     func apply(_ rot: RotatingKVCache) {
-        rot.state = [comp.keys, comp.values]
+        // The restored slot mutates MLXArray wrapper contexts during one-token
+        // ring updates. Give it independent wrappers so advancing a request
+        // cannot rewrite the coordinator's retained boundary payload. Slices
+        // share immutable storage safely through MLX's copy-on-write graph.
+        rot.state = [comp.keys[0...], comp.values[0...]]
         rot.metaState = [
             String(comp.keep),
             String(comp.maxSize),

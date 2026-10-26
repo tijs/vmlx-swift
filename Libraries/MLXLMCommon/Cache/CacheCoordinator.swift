@@ -227,6 +227,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             self.pagedCache = PagedCacheManager(
                 blockSize: config.pagedBlockSize,
                 maxBlocks: config.maxCacheBlocks,
+                maxBytes: config.maxCacheBytes,
                 modelKey: config.modelKey
             )
         } else {

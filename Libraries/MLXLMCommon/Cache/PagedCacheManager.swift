@@ -16,6 +16,10 @@ public struct CacheStats: Sendable {
     public var cacheHits: Int = 0
     public var cacheMisses: Int = 0
     public var evictions: Int = 0
+    /// Conservative retained storage charge including compact-buffer slack.
+    public var residentBytes: Int = 0
+    public var companionBytes: Int = 0
+    public var maxResidentBytes: Int? = nil
 }
 
 // MARK: - PrefixFetchResult
@@ -46,6 +50,9 @@ public final class PagedCacheManager: @unchecked Sendable {
 
     /// Total number of blocks in the pool (including the null sentinel at index 0).
     public let maxBlocks: Int
+
+    /// Optional retained KV/companion storage budget, not an allocator limit.
+    public let maxBytes: Int?
 
     /// Model key for cache isolation (prevents cross-model hash collisions).
     public let modelKey: String?
@@ -79,9 +86,14 @@ public final class PagedCacheManager: @unchecked Sendable {
     /// - Parameters:
     ///   - blockSize: Number of tokens per block (default 64).
     ///   - maxBlocks: Total pool size including the null sentinel (default 1000).
-    public init(blockSize: Int = 64, maxBlocks: Int = 1000, modelKey: String? = nil) {
+    public init(
+        blockSize: Int = 64, maxBlocks: Int = 1000, maxBytes: Int? = nil,
+        modelKey: String? = nil
+    ) {
+        precondition(maxBytes == nil || maxBytes! >= 0)
         self.blockSize = blockSize
         self.maxBlocks = maxBlocks
+        self.maxBytes = maxBytes
         self.modelKey = modelKey
 
         // Pre-allocate all blocks.
@@ -93,6 +105,7 @@ public final class PagedCacheManager: @unchecked Sendable {
             freeQueue.append(blocks[i])
         }
 
+        stats.maxResidentBytes = maxBytes
         stats.totalBlocks = maxBlocks
         stats.freeBlocks = maxBlocks - 1
     }
@@ -121,11 +134,62 @@ public final class PagedCacheManager: @unchecked Sendable {
             hashMap.remove(block)
             stats.evictions += 1
         }
+        removeStorageCharge(block)
         block.reset()
         block.incrementRef()
         stats.allocatedBlocks += 1
         stats.freeBlocks -= 1
         return block
+    }
+
+    // MLX contiguous may share an already-contiguous source only when its
+    // backing allocation exceeds logical bytes by at most 16 KiB (the pinned
+    // backend's compact-view allowance). Charge that slack per tensor so views
+    // cannot hide larger source allocations behind tiny logical slices.
+    private static let compactStorageSlack = 16_384
+
+    private static func storageCharge(_ array: MLXArray) -> Int {
+        let (bytes, overflow) = array.nbytes.addingReportingOverflow(compactStorageSlack)
+        return overflow ? Int.max : bytes
+    }
+
+    private static func storageCharge(_ arrays: [MLXArray]) -> Int {
+        arrays.reduce(0) { total, array in
+            let (bytes, overflow) = total.addingReportingOverflow(storageCharge(array))
+            return overflow ? Int.max : bytes
+        }
+    }
+
+    private static func kvArrays(_ block: CacheBlock) -> [MLXArray] {
+        (block.cacheData ?? []).compactMap { $0 }.flatMap { [$0.keys, $0.values] }
+    }
+
+    private func removeStorageCharge(_ block: CacheBlock) {
+        let companion = Self.storageCharge(Array((block.boundaryCompanionData ?? [:]).values))
+        stats.residentBytes -= Self.storageCharge(Self.kvArrays(block)) + companion
+        stats.companionBytes -= companion
+    }
+
+    /// Make room using only unpinned LRU payloads. An admitted fetch owns its
+    /// blocks until release, so a concurrent store must never recycle them.
+    private func reserveStorage(_ bytes: Int) -> Bool {
+        guard let maxBytes else { return true }
+        guard bytes <= maxBytes else { return false }
+        while stats.residentBytes > maxBytes - bytes {
+            guard let victim = freeQueue.popFirst(where: {
+                $0.refCount == 0 && ($0.cacheData != nil || $0.boundaryCompanionData != nil)
+            }) else { return false }
+            hashMap.remove(victim)
+            removeStorageCharge(victim)
+            victim.reset()
+            freeQueue.append(victim)
+            stats.evictions += 1
+        }
+        return true
+    }
+
+    private static func compact(_ array: MLXArray) -> MLXArray {
+        contiguous(array)
     }
 
     /// Release a block back to the pool.
@@ -147,6 +211,7 @@ public final class PagedCacheManager: @unchecked Sendable {
         if block.refCount == 0 {
             if block.blockHash == nil || block.cacheData == nil || block.tokenIds.isEmpty {
                 hashMap.remove(block)
+                removeStorageCharge(block)
                 block.reset()
             }
             freeQueue.append(block)
@@ -211,6 +276,7 @@ public final class PagedCacheManager: @unchecked Sendable {
         }
 
         stats = CacheStats()
+        stats.maxResidentBytes = maxBytes
         stats.totalBlocks = maxBlocks
         stats.freeBlocks = maxBlocks - 1
     }
@@ -286,11 +352,19 @@ public final class PagedCacheManager: @unchecked Sendable {
                 break
             }
 
-            // Allocate a new block.
+            let incoming = layerData[chunkIndex]
+            let bytes = Self.storageCharge(incoming.flatMap { [$0.keys, $0.values] })
+            guard reserveStorage(bytes) else { break }
             guard let block = _allocateBlock() else { break }
 
             block.tokenIds = chunk
-            block.cacheData = layerData[chunkIndex].map { Optional($0) }
+            block.cacheData = incoming.map {
+                Optional((keys: Self.compact($0.keys), values: Self.compact($0.values)))
+            }
+            // Batch-evaluate one block to sever lazy source dependencies
+            // without one GPU synchronization per individual tensor.
+            eval(Self.kvArrays(block))
+            stats.residentBytes += bytes
 
             block.blockHash = hash
             hashMap.insert(block)
@@ -307,7 +381,14 @@ public final class PagedCacheManager: @unchecked Sendable {
         // the partial chain remains useful to ordinary KV models but must not
         // be advertised as a complete mixed rotating/KV boundary.
         if offset == tokens.count, let leaf = pinnedBlocks.last {
-            leaf.boundaryCompanionData = boundaryCompanionData
+            let previous = Self.storageCharge(Array((leaf.boundaryCompanionData ?? [:]).values))
+            let next = Self.storageCharge(Array((boundaryCompanionData ?? [:]).values))
+            if reserveStorage(max(0, next - previous)) {
+                leaf.boundaryCompanionData = boundaryCompanionData?.mapValues(Self.compact)
+                eval(Array((leaf.boundaryCompanionData ?? [:]).values))
+                stats.residentBytes += next - previous
+                stats.companionBytes += next - previous
+            }
         }
     }
 
