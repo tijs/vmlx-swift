@@ -494,6 +494,40 @@ public final class VLMModelFactory: ModelFactory {
             dispatchModelType = "NemotronH_Nano_Omni_Reasoning_V3"
         }
 
+        // A generic load probes VLM before LLM. Refuse text-only Qwen
+        // derivatives before allocating/reading the same language weights in
+        // a factory that cannot finish. The Qwen VLM decoder reads the tower
+        // declaration from the top-level vision_config field.
+        guard await typeRegistry.registeredModelTypes.contains(dispatchModelType) else {
+            throw ModelFactoryError.unsupportedModelType(dispatchModelType)
+        }
+        if ["qwen3_5", "qwen3_5_moe"].contains(dispatchModelType),
+           try !JSONDecoder.json5().decode(QwenTowerDeclaration.self, from: configData).hasVision {
+            throw ModelFactoryError.unsupportedModelType("\(dispatchModelType) without vision_config")
+        }
+
+        // Processor metadata is cheap and mandatory. Previously its async
+        // error was awaited only AFTER loadWeights, so missing or malformed
+        // sidecars caused a full discarded weight load before fallback.
+        let processorConfigData: Data
+        let baseProcessorConfig: BaseProcessorConfiguration
+        do {
+            (processorConfigData, baseProcessorConfig) = try await loadProcessorConfig(from: modelDirectory)
+        } catch let error as ProcessorConfigError {
+            if let decodingError = error.underlying as? DecodingError {
+                throw ModelFactoryError.configurationDecodingError(
+                    error.filename, configuration.name, decodingError)
+            }
+            throw ModelFactoryError.configurationFileError(
+                error.filename, configuration.name, error.underlying)
+        }
+        let processorType = VLMProcessorTypeRegistry.processorType(
+            modelType: dispatchModelType,
+            declaredProcessorType: baseProcessorConfig.processorClass)
+        guard processorRegistry.containsProcessorType(processorType) else {
+            throw ModelFactoryError.unsupportedProcessorType(processorType)
+        }
+
         // 2026-04-29: merge jang_config.json fields into the config.json
         // dictionary BEFORE decoding so omni `NemotronHOmniConfiguration`
         // sees `weight_format` + `mxtq_bits` + `mxtq_seed` and can opt
@@ -745,11 +779,8 @@ public final class VLMModelFactory: ModelFactory {
             }
         }
 
-        // Load tokenizer from model directory (or alternate tokenizer repo),
-        // processor config, and weights in parallel using async let.
-        // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
-        // parallel scheduling. This may briefly block a cooperative thread pool thread,
-        // but the config file is small and model loading is not a high-concurrency path.
+        // Processor metadata has passed preflight. Load the tokenizer from
+        // the model directory (or alternate tokenizer repo) alongside weights.
         //
         // JANG VL bundles (e.g. Qwen3.5-VL-*-JANG_*) may also ship
         // weights-only. `resolveTokenizerDirectory` falls back to the cached
@@ -762,7 +793,6 @@ public final class VLMModelFactory: ModelFactory {
         let tokenizerDirectory = JangLoader.resolveTokenizerClassSubstitution(
             for: templateResolvedDir)
         async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
-        async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
 
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
@@ -779,23 +809,6 @@ public final class VLMModelFactory: ModelFactory {
             loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask
-        let processorConfigData: Data
-        let baseProcessorConfig: BaseProcessorConfiguration
-        do {
-            (processorConfigData, baseProcessorConfig) = try await processorConfigTask
-        } catch let error as ProcessorConfigError {
-            if let decodingError = error.underlying as? DecodingError {
-                throw ModelFactoryError.configurationDecodingError(
-                    error.filename, configuration.name, decodingError)
-            }
-            throw ModelFactoryError.configurationFileError(
-                error.filename, configuration.name, error.underlying)
-        }
-
-        let processorType = VLMProcessorTypeRegistry.processorType(
-            modelType: dispatchModelType,
-            declaredProcessorType: baseProcessorConfig.processorClass)
-
         let baseProcessor = try await processorRegistry.createModel(
             configuration: processorConfigData,
             processorType: processorType, tokenizer: tokenizer)
@@ -844,6 +857,16 @@ public final class VLMModelFactory: ModelFactory {
 private struct ProcessorConfigError: Error {
     let filename: String
     let underlying: Error
+}
+
+/// Inspect declaration without constructing Qwen modules or reading weights.
+private struct QwenTowerDeclaration: Decodable {
+    let hasVision: Bool
+    private enum CodingKeys: String, CodingKey { case vision_config }
+    init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        hasVision = try fields.contains(.vision_config) && !fields.decodeNil(forKey: .vision_config)
+    }
 }
 
 /// Loads processor configuration, preferring preprocessor_config.json over processor_config.json.
