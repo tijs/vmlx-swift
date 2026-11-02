@@ -4658,7 +4658,8 @@ public func generateTask(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     extraStopStrings: [String] = [],
     promptTail: String? = nil,
-    toolSchemas: [ToolSpec]? = nil
+    toolSchemas: [ToolSpec]? = nil,
+    parseChatMarkup: Bool = true
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     let effectivePromptTail =
         promptTail
@@ -4687,7 +4688,8 @@ public func generateTask(
             reasoningParser: ReasoningParser.forPrompt(
                 stampName: modelConfiguration.reasoningParserName,
                 promptTail: effectivePromptTail),
-            stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings)
+            stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings),
+            parseChatMarkup: parseChatMarkup
         )
     )
 }
@@ -5708,7 +5710,8 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         format: ToolCallFormat,
         tools: [[String: any Sendable]]? = nil,
         reasoningParser: ReasoningParser? = nil,
-        stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: [])
+        stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: []),
+        parseChatMarkup: Bool = true
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         let activeTools = tools?.isEmpty == false ? tools : nil
@@ -5718,14 +5721,14 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         // whose tool schema rides in the system prompt sends an empty `tools`
         // field — and without a processor the raw `<|tool_call>…<tool_call|>`
         // envelope leaks verbatim into visible text. Mirrors BatchEngine.
-        if let activeTools {
+        if parseChatMarkup, let activeTools {
             toolCallProcessor = ToolCallProcessor(format: format, tools: activeTools)
-        } else if format.hasTaggedToolMarkers {
+        } else if parseChatMarkup, format.hasTaggedToolMarkers {
             toolCallProcessor = ToolCallProcessor(format: format, tools: nil, stripOnly: true)
         } else {
             toolCallProcessor = nil
         }
-        self.reasoningParser = reasoningParser
+        self.reasoningParser = parseChatMarkup ? reasoningParser : nil
         self.stopStringMatcher = stopStringMatcher
     }
 
