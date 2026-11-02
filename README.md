@@ -1,5 +1,9 @@
 # vmlx-swift
 
+This Mei-maintained fork pins the [MLX allocator dependency](https://github.com/tijs/mlx/commit/bbdcd4d1431e64a4ae44f353cea6ec0be72f4bee)
+for bounded admission of recent Metal buffer shapes. Mei integration and
+qualification use exact source revisions. The upstream documentation follows.
+
 vmlx-swift is Osaurus's unified Swift inference stack for MLX-powered local AI on
 Apple Silicon.
 
