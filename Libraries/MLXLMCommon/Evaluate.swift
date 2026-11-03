@@ -2683,6 +2683,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         // A warm input contains only the suffix after the restored prefix.
         // Snapshot keys and processor boundaries refer to the whole prompt.
         let inputStart = promptTokenIds.count - input.text.tokens.size
+        // These requests cannot persist any boundary: without a coordinator
+        // there is no store, and auxiliary prompts explicitly never store.
+        // Avoid splitting prefill and copying caches that nobody can consume.
+        if cacheCoordinator == nil || originalInput.cachePromptIntent == .auxiliary {
+            try prepareRemainder(
+                input: input, windowSize: windowSize,
+                promptTokensForProcessor: input.text.tokens)
+            return
+        }
         // Prefill to a reusable structural boundary first, copy the exact cache
         // state, then consume the tail. Both halves run through the model's real
         // prepare/forward path in order; this avoids a second full prefill after
