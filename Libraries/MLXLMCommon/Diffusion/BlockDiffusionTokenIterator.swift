@@ -487,16 +487,15 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        // Same guard as the other two store paths: saving the cache duplicates it
-        // several times over at the memory high-water mark, and a prefix-cache entry
-        // is only ever a speed-up for a later request — it must never be able to take
-        // the host down. If the copies won't fit, don't make them.
+        // The writer can materialize compact KV buffers at a memory high-water
+        // mark. Respect host pressure and the byte budget before this optional
+        // store, using the same guard as the other generation paths.
         guard CacheStoreBudget.canStore(promptCacheSnapshot) else {
             let gib = Double(CacheStoreBudget.cacheBytes(promptCacheSnapshot)) / 1_073_741_824
             Self.logger.info(
                 """
                 prefix-cache: skipping store of a \(String(format: "%.1f", gib), privacy: .public) GiB \
-                KV cache — the copies it requires do not fit in memory. Generation was unaffected; \
+                KV cache — host pressure or the byte budget rejected this optional store. Generation was unaffected; \
                 only the cache entry was dropped.
                 """
             )

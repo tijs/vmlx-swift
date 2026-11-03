@@ -3265,18 +3265,17 @@ public struct TokenIterator: TokenIteratorProtocol {
             var trace = CacheFinalizationTrace("solo-entry", tokens: tokens.count)
             defer { trace.mark("return") }
             guard !tokens.isEmpty else { return }
-            // Saving the cache duplicates it several times over (snapshot, host
-            // `Data` for the disk write, disk-store cache) at the point where
-            // memory is already at its peak. A prefix-cache entry is only ever a
-            // speed-up for some later request — it must never be able to take the
-            // host down. If the copies won't fit, don't make them.
+            // The writer may materialize a compact copy of the logical KV;
+            // snapshots and raw disk-store views otherwise share buffers (see
+            // CacheStoreBudget.materializationFactor). This optional speed-up
+            // must respect host pressure and the byte budget before that copy.
             guard CacheStoreBudget.canStore(cacheToStore) else {
                 let gib = Double(CacheStoreBudget.cacheBytes(cacheToStore)) / 1_073_741_824
                 Self.logger.info(
                     """
                     prefix-cache: skipping store of a \(String(format: "%.1f", gib), privacy: .public) GiB \
-                    KV cache — the copies it requires do not fit in memory. The request completed \
-                    normally; only the cache entry was dropped.
+                    KV cache — host pressure or the byte budget rejected this optional store. \
+                    The request completed normally; only the cache entry was dropped.
                     """
                 )
                 return

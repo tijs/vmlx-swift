@@ -3432,19 +3432,17 @@ public actor BatchEngine {
                 var trace = CacheFinalizationTrace("batch-entry-" + label, tokens: tokens.count)
                 defer { trace.mark("return") }
                 guard !tokens.isEmpty else { return }
-                // Serialising the cache materialises it again (host `Data` for the
-                // disk write, plus the disk-store cache) while the snapshot and the
-                // live cache are both still resident. A prefix-cache entry only ever
-                // speeds up some later request — it must never be able to take the
-                // host down, so if the copies won't fit, don't make them.
+                // The writer can materialize compact KV buffers at a memory
+                // high-water mark. Respect host pressure and the byte budget
+                // before this optional store (see CacheStoreBudget).
                 guard CacheStoreBudget.canStore(snapshot) else {
                     let gib = Double(CacheStoreBudget.cacheBytes(snapshot)) / 1_073_741_824
                     Self.logger.info(
                         """
                         prefix-cache: skipping \(label, privacy: .public) store of a \
-                        \(String(format: "%.1f", gib), privacy: .public) GiB KV cache — the copies it \
-                        requires do not fit in memory. Generation was unaffected; only the cache \
-                        entry was dropped.
+                        \(String(format: "%.1f", gib), privacy: .public) GiB KV cache — host pressure or \
+                        the byte budget rejected this optional store. Generation was unaffected; \
+                        only the cache entry was dropped.
                         """
                     )
                     return
