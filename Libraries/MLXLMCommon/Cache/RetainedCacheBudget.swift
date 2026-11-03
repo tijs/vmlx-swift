@@ -41,6 +41,7 @@ final class RetainedCacheBudget: @unchecked Sendable {
         fileprivate init(budget: RetainedCacheBudget) { self.budget = budget }
 
         var limit: Int? { budget.limit }
+        var residentBytes: Int { budget.lock.withLock { bytes } }
 
         func reserve(_ amount: Int) -> Bool {
             precondition(amount >= 0)
@@ -73,5 +74,25 @@ final class RetainedCacheBudget: @unchecked Sendable {
         }
 
         deinit { releaseAll() }
+    }
+}
+
+/// One optional exact-prompt copy and its shared-budget reservation travel
+/// together, including when a value-type iterator is copied. Clearing cache
+/// tiers cannot revoke an iterator's live arrays or its charge.
+final class RetainedPromptCacheSnapshot {
+    private(set) var cache: [KVCache]
+    private let account: RetainedCacheBudget.Account
+    private let bytes: Int
+
+    init(cache: [KVCache], account: RetainedCacheBudget.Account, bytes: Int) {
+        self.cache = cache
+        self.account = account
+        self.bytes = bytes
+    }
+
+    deinit {
+        cache.removeAll()
+        account.release(bytes)
     }
 }

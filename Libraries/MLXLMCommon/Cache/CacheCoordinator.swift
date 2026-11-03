@@ -95,10 +95,16 @@ public struct CacheCoordinatorStatsSnapshot: Sendable {
 public final class CacheCoordinator: @unchecked Sendable {
 
     private let retainedBudget: RetainedCacheBudget
+    private let promptSnapshotAccount: RetainedCacheBudget.Account
+    private let promptSnapshotStoreAdmission: @Sendable ([KVCache]) -> Bool
 
     /// Conservative retained charge across paged KV, rotating companions and
-    /// separate SSM snapshots, including reservations for in-flight stores.
+    /// separate SSM and exact-prompt snapshots, including in-flight copies.
     public var retainedCacheBytes: Int { retainedBudget.residentBytes }
+
+    /// Component of `retainedCacheBytes`, under the same `maxCacheBytes`
+    /// ceiling. Live iterator-owned snapshots remain charged across clear.
+    public var promptSnapshotBytes: Int { promptSnapshotAccount.residentBytes }
 
     // MARK: - Properties
 
@@ -223,11 +229,16 @@ public final class CacheCoordinator: @unchecked Sendable {
         config: CacheCoordinatorConfig, diskIndexBusyTimeoutMs: Int32,
         diskIndexMigrationBusyTimeoutMs: Int32 = DiskCacheIndexSchema.defaultBusyTimeoutMs,
         importRetryInterval: TimeInterval = CacheCoordinator.defaultImportRetryInterval,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        promptSnapshotStoreAdmission: @escaping @Sendable ([KVCache]) -> Bool = {
+            CacheStoreBudget.canStore($0)
+        }
     ) {
         self.initialConfig = config
         let retainedBudget = RetainedCacheBudget(limit: config.maxCacheBytes)
         self.retainedBudget = retainedBudget
+        self.promptSnapshotAccount = retainedBudget.makeAccount()
+        self.promptSnapshotStoreAdmission = promptSnapshotStoreAdmission
         self.importRetryInterval = importRetryInterval
         self.now = now
 
@@ -560,7 +571,33 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// boundary snapshot — the hybrid stripped boundary in particular costs a
     /// retained cache copy or, failing that, a whole extra prefill.
     public var canPersistBoundaries: Bool {
-        (pagedCache != nil && !isPagedIncompatible) || diskCache != nil
+        (pagedCache.map { $0.maxBlocks > 1 && $0.maxBytes != 0 } == true
+            && !isPagedIncompatible) || diskCache != nil
+    }
+
+    /// Reserve before copying. The snapshot is optional and never evicts
+    /// another tier or calls back under the budget lock. Typed N-1 captures
+    /// have a separate persistence contract and do not pass through here.
+    func retainExactPromptSnapshot(from cache: [KVCache]) -> RetainedPromptCacheSnapshot? {
+        guard canPersistBoundaries,
+            diskCache != nil || !cacheCannotUsePagedCoordinatorRestore(cache)
+                || cacheCanUsePagedWithRotatingCompanion(cache),
+            promptSnapshotStoreAdmission(cache)
+        else { return nil }
+        // Most copies compact `state`; innerState also covers occupied
+        // recurrent slots not included in serialized state. Charge the larger
+        // estimate, with the same per-buffer slack as the other retained tiers.
+        let bytes = max(
+            RetainedCacheBudget.storageCharge(cache.flatMap { $0.state }),
+            RetainedCacheBudget.storageCharge(cache.flatMap { $0.innerState() }))
+        guard promptSnapshotAccount.reserve(bytes) else {
+            FileHandle.standardError.write(Data(
+                "prefix-cache: skipping exact prompt snapshot — shared retained-byte allowance exhausted\n".utf8))
+            return nil
+        }
+        return RetainedPromptCacheSnapshot(
+            cache: makePromptBoundaryCacheSnapshot(from: cache),
+            account: promptSnapshotAccount, bytes: bytes)
     }
 
     /// 2026-05-04: mark the model as paged-incompatible (DSV4 hybrid pool

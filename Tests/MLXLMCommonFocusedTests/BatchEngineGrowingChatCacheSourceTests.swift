@@ -362,7 +362,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(batch.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(storageTopologySnapshot)"))
         #expect(batch.contains("liveSlot.diskSeedSnapshot = nil"))
         #expect(batch.contains("liveSlot.promptCacheSnapshot = nil"))
-        #expect(source.contains("self.promptCacheSnapshot = makeRetainedExactPromptSnapshot("))
+        #expect(source.contains("self.retainedPromptSnapshot = cacheCoordinator.retainExactPromptSnapshot("))
         #expect(source.contains("diskSeedSnapshot = nil"))
         #expect(scheduler.contains("var diskSeedSnapshot: [KVCache]?"))
 
@@ -377,7 +377,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         let seedSelection = try #require(source.range(
             of: "self.diskSeedBoundary = Self.diskSeedBoundaryIndex("))
         let retainedSnapshot = try #require(source.range(
-            of: "self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(",
+            of: "self.retainedPromptSnapshot = cacheCoordinator.retainExactPromptSnapshot(",
             range: seedSelection.lowerBound..<source.endIndex))
         let compiledDecode = try #require(source.range(
             of: "if effectiveParameters.enableCompiledDecode",
@@ -397,7 +397,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
             of: "guard !usesCanonicalHybridBoundary",
             range: stableLoop.lowerBound..<source.endIndex))
         let storageBody = source[topology.lowerBound..<generatedBoundary.lowerBound]
-        #expect(storageBody.contains("if let storageTopologySnapshot,"))
+        #expect(storageBody.contains("if !originalInput.requiresPostPrepareCacheKey"))
         #expect(storageBody.contains("storageSnapshot: storageTopologySnapshot"))
         #expect(topology.lowerBound < stableLoop.lowerBound)
     }

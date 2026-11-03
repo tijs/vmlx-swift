@@ -1741,7 +1741,13 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     /// Clean cache state captured immediately after prefill and before any
     /// generated token is fed back into the model.
-    var promptCacheSnapshot: [KVCache]?
+    private var retainedPromptSnapshot: RetainedPromptCacheSnapshot?
+    var promptCacheSnapshot: [KVCache]? { retainedPromptSnapshot?.cache }
+
+    /// A deliberate pressure/budget decline must not be replaced by a full
+    /// prefix replay during finalization. Independent prefill captures remain
+    /// usable. Typed N-1-only topologies are not declines.
+    private var exactPromptSnapshotWasDeclined = false
 
     /// Absolute index into ``promptTokenIds`` of the generation-suffix-stripped
     /// cross-turn reuse boundary — the last turn-start token, i.e. the end of
@@ -1833,7 +1839,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.cachePrefixTokenCounts = []
         self.originalInput = LMInput(text: y)
         self.cacheInitParameters = parameters
-        self.promptCacheSnapshot = nil
         self.mediaSalt = nil
 
         self.promptPrefillTime = try measure {
@@ -1842,7 +1847,6 @@ public struct TokenIterator: TokenIteratorProtocol {
                 input: promptInput,
                 windowSize: parameters.prefillStepSize)
         }
-        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
     }
 
     /// Initialize a `TokenIterator` with the given input.
@@ -1943,7 +1947,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
         self.originalInput = input
         self.cacheInitParameters = effectiveParameters
-        self.promptCacheSnapshot = nil
 
         // Compute a stable fingerprint of request-scope/media content plus
         // effective cache policy once at init, so both the pre-prepare fetch
@@ -2384,8 +2387,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         // The prefill-captured N-1 state is the only prompt checkpoint an
         // exact DSV4 replay can consume safely. Keep one retained snapshot,
         // not both N-1 and the deliberately skipped exact prompt boundary.
-        self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
-            from: self.cache)
+        if let cacheCoordinator, cacheCoordinator.canPersistBoundaries,
+            !self.promptTokenIds.isEmpty,
+            input.cachePromptIntent != .auxiliary,
+            !cacheRequiresPrefillCapturedDiskSeed(self.cache)
+        {
+            self.retainedPromptSnapshot = cacheCoordinator.retainExactPromptSnapshot(
+                from: self.cache)
+            self.exactPromptSnapshotWasDeclined = self.retainedPromptSnapshot == nil
+        }
 
         if effectiveParameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model) {
             // The Compilable caches are FIXED-size buffers with no overflow
@@ -2451,7 +2461,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
         self.originalInput = input
         self.cacheInitParameters = nil
-        self.promptCacheSnapshot = nil
         self.mediaSalt = nil
 
         self.promptPrefillTime = try measure {
@@ -2461,7 +2470,6 @@ public struct TokenIterator: TokenIteratorProtocol {
                     windowSize: prefillStepSize)
             }
         }
-        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
     }
 
     /// The cross-turn reuse boundary for path-dependent hybrid and standalone
@@ -3223,6 +3231,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        defer { retainedPromptSnapshot = nil }
         guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
             return
         }
@@ -3383,11 +3392,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
         }
 
-        if let storageTopologySnapshot,
-           !originalInput.requiresPostPrepareCacheKey
-        {
+        if !originalInput.requiresPostPrepareCacheKey {
                 let requiresDiskBackedRestore =
-                    cacheRequiresDiskBackedCoordinatorRestore(storageTopologySnapshot)
+                    cacheRequiresDiskBackedCoordinatorRestore(storageTopologySnapshot ?? cache)
                 if !usesCanonicalHybridBoundary,
                    requiresDiskBackedRestore,
                    !skipDiskBackedToolPromptSeedBoundary,
@@ -3406,7 +3413,10 @@ public struct TokenIterator: TokenIteratorProtocol {
                     var seedSnapshot: [KVCache]?
                     if diskSeedBoundary == seedTokens.count {
                         seedSnapshot = capturedDiskSeed
-                    } else if !isReusablePrefixWarmup {
+                    } else if !isReusablePrefixWarmup,
+                        !exactPromptSnapshotWasDeclined,
+                        let storageTopologySnapshot
+                    {
                         seedSnapshot = cacheSnapshotForBoundary(
                             tokens: seedTokens,
                             storageSnapshot: storageTopologySnapshot,
@@ -3527,15 +3537,18 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // replays the prefix through the model for any topology it
                     // cannot trim, which is a whole extra prefill per boundary
                     // and runs after the answer is already visible.
-                    let boundarySnapshotOrNil =
-                        stableBoundarySnapshots[storeBoundary].map { captured in
-                            captured.map { $0.copy() }
-                        }
-                        ?? cacheSnapshotForBoundary(
+                    let boundarySnapshotOrNil: [KVCache]?
+                    if let captured = stableBoundarySnapshots[storeBoundary] {
+                        boundarySnapshotOrNil = captured.map { $0.copy() }
+                    } else if !exactPromptSnapshotWasDeclined, let storageTopologySnapshot {
+                        boundarySnapshotOrNil = cacheSnapshotForBoundary(
                             tokens: boundaryTokens,
                             storageSnapshot: storageTopologySnapshot,
                             storageSnapshotTokenCount: storageSnapshotTokenCount,
                             allowDiskBackedRederive: allowRederive)
+                    } else {
+                        boundarySnapshotOrNil = nil
+                    }
                     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                         // Hybrid-SSM models never store the seed their own
                         // fetch probes for, so a second conversation re-prefills
