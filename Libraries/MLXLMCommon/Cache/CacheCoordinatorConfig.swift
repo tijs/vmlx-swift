@@ -41,8 +41,8 @@ public struct CacheCoordinatorConfig: Sendable {
     /// Maximum number of blocks in the paged cache pool (including sentinel).
     public var maxCacheBlocks: Int
 
-    /// Retained paged KV and rotating-companion byte budget. Nil preserves
-    /// the embedding host's block-count-only policy; zero admits no payloads.
+    /// Shared retained paged KV, rotating-companion and SSM byte budget. Nil preserves
+    /// legacy block/entry-count limits; zero admits no retained payloads.
     /// This is separate from MLX's reusable allocator-buffer cache limit.
     public var maxCacheBytes: Int?
 

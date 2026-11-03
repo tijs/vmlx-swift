@@ -5,7 +5,12 @@ for bounded admission of recent Metal buffer shapes. Mei integration and
 qualification use exact source revisions. Optional prefix-cache stores also
 respect kernel warning/critical memory pressure before materializing a copy;
 normal-pressure byte budgeting and mmap footprint accounting remain intact.
-Real-model qualification remains separate from these guard contracts.
+A coordinator's explicit retained-byte limit now covers paged KV/rotating
+companions and separate SSM snapshots together, including disk hydration.
+Cache-local eviction avoids cross-tier lock callbacks; checkpoints can still
+persist and restore from disk when RAM retention does not fit. Nil keeps the
+legacy entry/block policy. This is separate from allocator buffers and active
+request memory. Real-model qualification remains separate from these contracts.
 The upstream documentation follows.
 
 vmlx-swift is Osaurus's unified Swift inference stack for MLX-powered local AI on

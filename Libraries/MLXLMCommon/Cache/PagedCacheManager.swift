@@ -54,6 +54,10 @@ public final class PagedCacheManager: @unchecked Sendable {
     /// Optional retained KV/companion storage budget, not an allocator limit.
     public let maxBytes: Int?
 
+    private let retainedAccount: RetainedCacheBudget.Account
+    // Charges follow manager admissions, not mutable public CacheBlock fields.
+    private var storageCharges: [Int: (kv: Int, companion: Int)] = [:]
+
     /// Model key for cache isolation (prevents cross-model hash collisions).
     public let modelKey: String?
 
@@ -86,14 +90,22 @@ public final class PagedCacheManager: @unchecked Sendable {
     /// - Parameters:
     ///   - blockSize: Number of tokens per block (default 64).
     ///   - maxBlocks: Total pool size including the null sentinel (default 1000).
-    public init(
+    public convenience init(
         blockSize: Int = 64, maxBlocks: Int = 1000, maxBytes: Int? = nil,
         modelKey: String? = nil
     ) {
-        precondition(maxBytes == nil || maxBytes! >= 0)
+        self.init(blockSize: blockSize, maxBlocks: maxBlocks, modelKey: modelKey,
+                  retainedBudget: RetainedCacheBudget(limit: maxBytes))
+    }
+
+    init(
+        blockSize: Int, maxBlocks: Int, modelKey: String?,
+        retainedBudget: RetainedCacheBudget
+    ) {
         self.blockSize = blockSize
         self.maxBlocks = maxBlocks
-        self.maxBytes = maxBytes
+        self.maxBytes = retainedBudget.limit
+        self.retainedAccount = retainedBudget.makeAccount()
         self.modelKey = modelKey
 
         // Pre-allocate all blocks.
@@ -146,18 +158,8 @@ public final class PagedCacheManager: @unchecked Sendable {
     // backing allocation exceeds logical bytes by at most 16 KiB (the pinned
     // backend's compact-view allowance). Charge that slack per tensor so views
     // cannot hide larger source allocations behind tiny logical slices.
-    private static let compactStorageSlack = 16_384
-
-    private static func storageCharge(_ array: MLXArray) -> Int {
-        let (bytes, overflow) = array.nbytes.addingReportingOverflow(compactStorageSlack)
-        return overflow ? Int.max : bytes
-    }
-
     private static func storageCharge(_ arrays: [MLXArray]) -> Int {
-        arrays.reduce(0) { total, array in
-            let (bytes, overflow) = total.addingReportingOverflow(storageCharge(array))
-            return overflow ? Int.max : bytes
-        }
+        RetainedCacheBudget.storageCharge(arrays)
     }
 
     private static func kvArrays(_ block: CacheBlock) -> [MLXArray] {
@@ -165,17 +167,18 @@ public final class PagedCacheManager: @unchecked Sendable {
     }
 
     private func removeStorageCharge(_ block: CacheBlock) {
-        let companion = Self.storageCharge(Array((block.boundaryCompanionData ?? [:]).values))
-        stats.residentBytes -= Self.storageCharge(Self.kvArrays(block)) + companion
-        stats.companionBytes -= companion
+        guard let charge = storageCharges.removeValue(forKey: block.blockId) else { return }
+        let bytes = charge.kv + charge.companion
+        retainedAccount.release(bytes)
+        stats.residentBytes -= bytes
+        stats.companionBytes -= charge.companion
     }
 
     /// Make room using only unpinned LRU payloads. An admitted fetch owns its
     /// blocks until release, so a concurrent store must never recycle them.
     private func reserveStorage(_ bytes: Int) -> Bool {
-        guard let maxBytes else { return true }
-        guard bytes <= maxBytes else { return false }
-        while stats.residentBytes > maxBytes - bytes {
+        if let maxBytes, bytes > maxBytes { return false }
+        while !retainedAccount.reserve(bytes) {
             guard let victim = freeQueue.popFirst(where: {
                 $0.refCount == 0 && ($0.cacheData != nil || $0.boundaryCompanionData != nil)
             }) else { return false }
@@ -269,6 +272,8 @@ public final class PagedCacheManager: @unchecked Sendable {
         for i in 0..<maxBlocks {
             blocks[i].reset()
         }
+        storageCharges.removeAll()
+        retainedAccount.releaseAll()
 
         // Re-enqueue blocks 1..<maxBlocks.
         for i in 1..<maxBlocks {
@@ -355,7 +360,10 @@ public final class PagedCacheManager: @unchecked Sendable {
             let incoming = layerData[chunkIndex]
             let bytes = Self.storageCharge(incoming.flatMap { [$0.keys, $0.values] })
             guard reserveStorage(bytes) else { break }
-            guard let block = _allocateBlock() else { break }
+            guard let block = _allocateBlock() else {
+                retainedAccount.release(bytes)
+                break
+            }
 
             block.tokenIds = chunk
             block.cacheData = incoming.map {
@@ -364,6 +372,7 @@ public final class PagedCacheManager: @unchecked Sendable {
             // Batch-evaluate one block to sever lazy source dependencies
             // without one GPU synchronization per individual tensor.
             eval(Self.kvArrays(block))
+            storageCharges[block.blockId] = (kv: bytes, companion: 0)
             stats.residentBytes += bytes
 
             block.blockHash = hash
@@ -381,13 +390,16 @@ public final class PagedCacheManager: @unchecked Sendable {
         // the partial chain remains useful to ordinary KV models but must not
         // be advertised as a complete mixed rotating/KV boundary.
         if offset == tokens.count, let leaf = pinnedBlocks.last {
-            let previous = Self.storageCharge(Array((leaf.boundaryCompanionData ?? [:]).values))
+            let previous = storageCharges[leaf.blockId]?.companion ?? 0
             let next = Self.storageCharge(Array((boundaryCompanionData ?? [:]).values))
             if reserveStorage(max(0, next - previous)) {
                 leaf.boundaryCompanionData = boundaryCompanionData?.mapValues(Self.compact)
                 eval(Array((leaf.boundaryCompanionData ?? [:]).values))
+                storageCharges[leaf.blockId] = (
+                    kv: storageCharges[leaf.blockId]?.kv ?? 0, companion: next)
                 stats.residentBytes += next - previous
                 stats.companionBytes += next - previous
+                if next < previous { retainedAccount.release(previous - next) }
             }
         }
     }
