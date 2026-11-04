@@ -98,4 +98,74 @@ struct ExperimentalSafetensorsRegionReaderTests {
             }, drain: { _ in }, invalidate: { _ in })
         }
     }
+    @Test("arena aggregate charges repeated mappings and rejects cap changes")
+    func aggregateBudget() throws {
+        let (root, inspection) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let descriptor = try #require(inspection.tensors[resident])
+        let page = UInt64(getpagesize())
+        let span = descriptor.byteOffset % page + descriptor.byteLength
+        let charge = ((span + page - 1) / page) * page
+        let gate = ExperimentalRequestArenaGate()
+        let _: Void = try gate.withRequest(operation: { arena in
+            _ = try ExperimentalSafetensorsRegionReader.read(key: resident, inspection: inspection, arena: arena, maxMappedBytes: charge)
+            #expect(throws: ExperimentalSafetensorsRegionReader.ReadError.self) {
+                try ExperimentalSafetensorsRegionReader.read(key: resident, inspection: inspection, arena: arena, maxMappedBytes: charge)
+            }
+            #expect(throws: ExperimentalSafetensorsRegionReader.ReadError.self) {
+                try ExperimentalSafetensorsRegionReader.read(key: resident, inspection: inspection, arena: arena, maxMappedBytes: charge * 2)
+            }
+            return .finished(())
+        }, drain: { _ in }, invalidate: { _ in })
+    }
+
+    @Test("failed mmap reservation is returned to the arena budget")
+    func failedMappingReleasesReservation() throws {
+        let (root, inspection) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let descriptor = try #require(inspection.tensors[resident])
+        let page = UInt64(getpagesize())
+        let span = descriptor.byteOffset % page + descriptor.byteLength
+        let charge = ((span + page - 1) / page) * page
+        let file = root.appendingPathComponent("model.safetensors")
+        let content = try Data(contentsOf: file)
+        let gate = ExperimentalRequestArenaGate()
+        let _: Void = try gate.withRequest(operation: { arena in
+            try FileManager.default.removeItem(at: file)
+            #expect(throws: (any Error).self) {
+                try ExperimentalSafetensorsRegionReader.read(key: resident, inspection: inspection, arena: arena, maxMappedBytes: charge)
+            }
+            // Test-only recreation occurs before any mapping succeeds. Real callers
+            // must keep the inspected snapshot immutable for its whole lifetime.
+            try content.write(to: file)
+            let value = try ExperimentalSafetensorsRegionReader.read(key: resident, inspection: inspection, arena: arena, maxMappedBytes: charge)
+            #expect(value.shape == [4])
+            return .finished(())
+        }, drain: { _ in }, invalidate: { _ in })
+    }
+
+    @Test("concurrent reservations cannot exceed aggregate limit")
+    func concurrentReservations() throws {
+        final class State: @unchecked Sendable {
+            let arena: ExperimentalRequestArena
+            let lock = NSLock()
+            var accepted = 0
+            init(_ arena: ExperimentalRequestArena) { self.arena = arena }
+            func reserve() {
+                if (try? arena.reserveMappedRegion(bytes: 1, limit: 8)) == true {
+                    lock.lock(); accepted += 1; lock.unlock()
+                }
+            }
+        }
+        let gate = ExperimentalRequestArenaGate()
+        let _: Void = try gate.withRequest(operation: { arena in
+            let state = State(arena)
+            DispatchQueue.concurrentPerform(iterations: 16) { _ in state.reserve() }
+            #expect(state.accepted == 8)
+            let extra = try arena.reserveMappedRegion(bytes: 1, limit: 8)
+            #expect(extra == false)
+            return .finished(())
+        }, drain: { _ in }, invalidate: { _ in })
+    }
+
 }

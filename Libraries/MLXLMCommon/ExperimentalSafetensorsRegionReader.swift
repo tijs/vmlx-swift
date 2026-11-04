@@ -13,7 +13,7 @@ import Glibc
 /// retain that snapshot, prevent path replacement/truncation, own all streams,
 /// and prevent returned aliases escaping the enclosing drained arena. The C
 /// operation creates a file-backed Metal buffer but does not submit GPU work.
-/// The cap covers only this region's page-rounded mapping, not total memory.
+/// The arena-wide cap covers summed page-rounded mappings, not total memory.
 enum ExperimentalSafetensorsRegionReader {
     struct ReadError: Error, CustomStringConvertible {
         let description: String
@@ -55,6 +55,13 @@ enum ExperimentalSafetensorsRegionReader {
         let root = inspection.modelDirectory.resolvingSymlinksInPath().standardizedFileURL
         let file = root.appendingPathComponent(descriptor.shard).resolvingSymlinksInPath().standardizedFileURL
         guard file.path.hasPrefix(root.path + "/") else { throw ReadError("shard escaped checkpoint root") }
+        guard try arena.reserveMappedRegion(bytes: mapped.partialValue, limit: maxMappedBytes) else {
+            throw ReadError("aggregate mapping budget exceeded or inconsistent: \(key)")
+        }
+        var retained = false
+        defer {
+            if !retained { arena.releaseFailedMappedRegion(bytes: mapped.partialValue) }
+        }
         var shape = descriptor.shape.map(Int32.init)
         var result = mlx_array_new()
         let status: Int32
@@ -74,6 +81,8 @@ enum ExperimentalSafetensorsRegionReader {
         let array = MLXArray(result)
         // No graph or evaluation has been submitted; retain before returning.
         try arena.retain(array)
+        retained = true
+        try Task<Never, Never>.checkCancellation()
         return array
     }
 }

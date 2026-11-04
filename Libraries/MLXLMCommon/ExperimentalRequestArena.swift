@@ -27,6 +27,8 @@ public final class ExperimentalRequestArena {
     private let lock = NSLock()
     private var resources: [AnyObject] = []
     private var sealed = false
+    private var mappedRegionBytes: UInt64 = 0
+    private var mappedRegionLimit: UInt64?
     fileprivate init() {}
     /// Register before submission. After the operation returns, registration
     /// is sealed; late or escaped registrations fail rather than race cleanup.
@@ -35,6 +37,27 @@ public final class ExperimentalRequestArena {
         defer { lock.unlock() }
         guard !sealed else { throw ExperimentalRequestArenaError.sealed }
         resources.append(resource)
+    }
+    /// Reserve before mmap, including concurrent readers. Successful mappings
+    /// stay charged for the lifetime of this arena; failed mappings roll back.
+    /// This is virtual mapped length, not a bound on physical or GPU memory.
+    func reserveMappedRegion(bytes: UInt64, limit: UInt64) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !sealed else { throw ExperimentalRequestArenaError.sealed }
+        guard mappedRegionLimit == nil || mappedRegionLimit == limit else { return false }
+        let total = mappedRegionBytes.addingReportingOverflow(bytes)
+        guard !total.overflow, total.partialValue <= limit else { return false }
+        mappedRegionLimit = limit
+        mappedRegionBytes = total.partialValue
+        return true
+    }
+
+    func releaseFailedMappedRegion(bytes: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        precondition(mappedRegionBytes >= bytes)
+        mappedRegionBytes -= bytes
     }
     // Rejects stale aliases, but is not an in-flight lease: callers must join
     // all submitting workers before the owning operation returns or throws.
