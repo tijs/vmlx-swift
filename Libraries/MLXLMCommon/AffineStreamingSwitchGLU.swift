@@ -504,12 +504,12 @@ public final class AffineStreamingSwitchGLU: Module {
     /// cacheExpertLimit bounds mappings per layer, not global mapped bytes.
     public func researchQwen35GroupedReduced(
         _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
-        tokenWindow: Int = .max, observeWindow: ((Int, Int) -> Void)? = nil
+        tokenWindow: Int, observeWindow: ((Int, Int) -> Void)? = nil
     ) throws -> MLXArray {
         guard catalog.layout == .qwen35 else {
             throw AffineStreamingExpertError.invalidInput("Qwen35 layout required")
         }
-        guard inputDims > 0, numExperts > 0, groupLimit > 0, tokenWindow > 0,
+        guard inputDims > 0, numExperts > 0, groupLimit > 0, tokenWindow > 0, tokenWindow < .max,
             inputDims == catalog.inputDims, hiddenDims == catalog.hiddenDims,
             numExperts == catalog.numExperts,
             !x.shape.isEmpty, x.dim(-1) == inputDims,

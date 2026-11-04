@@ -667,7 +667,7 @@ struct AffineStreamingSwitchGLUTests {
                             #expect(actual.dtype == expected.dtype, "\(context)")
                             #expect(exact, "\(context)")
                             let streamed = try streaming.researchQwen35GroupedReduced(
-                                x, indices: indices, scores: scores, groupLimit: groupLimit)
+                                x, indices: indices, scores: scores, groupLimit: groupLimit, tokenWindow: 256)
                             MLX.eval(streamed)
                             let streamedDifference = MLX.max(MLX.abs(streamed.asType(.float32)
                                 - expected.asType(.float32))).item(Float.self)
@@ -817,29 +817,33 @@ struct AffineStreamingSwitchGLUTests {
         let ids = MLXArray([Int32(0)], [1, 1, 1])
         let scores = MLXArray([Float(1)], [1, 1, 1])
         #expect(throws: AffineStreamingExpertError.self) {
-            try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 0)
+            try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 0, tokenWindow: 32)
         }
         #expect(throws: AffineStreamingExpertError.self) {
             try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
                 groupLimit: 16, tokenWindow: 0)
         }
         #expect(throws: AffineStreamingExpertError.self) {
+            try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
+                groupLimit: 16, tokenWindow: .max)
+        }
+        #expect(throws: AffineStreamingExpertError.self) {
             try reducer.researchQwen35GroupedReduced(x, indices: MLXArray([Int32(4)], [1, 1, 1]),
-                scores: scores, groupLimit: 16)
+                scores: scores, groupLimit: 16, tokenWindow: 32)
         }
         #expect(throws: AffineStreamingExpertError.self) {
             try reducer.researchQwen35GroupedReduced(x, indices: ids,
-                scores: MLXArray([Float(1), 1], [1, 1, 2]), groupLimit: 16)
+                scores: MLXArray([Float(1), 1], [1, 1, 2]), groupLimit: 16, tokenWindow: 32)
         }
         #expect(throws: AffineStreamingExpertError.self) {
-            try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 16)
+            try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 16, tokenWindow: 32)
         }
         // Geometry mismatch must be rejected before trying to map an expert.
         let wrongGeometry = AffineStreamingSwitchGLU(inputDims: 64, hiddenDims: 64,
             numExperts: 5, layerIndex: 0, catalog: catalog)
         do {
             _ = try wrongGeometry.researchQwen35GroupedReduced(
-                x, indices: ids, scores: scores, groupLimit: 16)
+                x, indices: ids, scores: scores, groupLimit: 16, tokenWindow: 32)
             Issue.record("mismatched catalog geometry was accepted")
         } catch AffineStreamingExpertError.invalidInput {
             // Validation precedes the unconfigured catalog lookup.
@@ -850,7 +854,7 @@ struct AffineStreamingSwitchGLUTests {
         let wrongLayout = AffineStreamingSwitchGLU(inputDims: 64, hiddenDims: 64,
             numExperts: 4, layerIndex: 0, catalog: qwen4)
         #expect(throws: AffineStreamingExpertError.self) {
-            try wrongLayout.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 16)
+            try wrongLayout.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 16, tokenWindow: 32)
         }
     }
 
