@@ -13,6 +13,19 @@ import Testing
 struct Qwen35AffineResearchHybridTests {
     private enum FixtureFailure: Error, Equatable { case prefill, decode, drain }
 
+    /// Keep an isolated test gate alive if real stream recovery fails. Dropping
+    /// a poisoned local gate would also drop its quarantined model resources.
+    private final class FailedGateRegistry: @unchecked Sendable {
+        static let shared = FailedGateRegistry()
+        private let lock = NSLock()
+        private var gates: [ExperimentalRequestArenaGate] = []
+        func retain(_ gate: ExperimentalRequestArenaGate) {
+            lock.lock()
+            defer { lock.unlock() }
+            gates.append(gate)
+        }
+    }
+
     /// Supplies the iterator with fresh hybrid caches while the test controls
     /// the fallible forward explicitly.
     private final class IteratorModel: Module, LanguageModel {
@@ -94,7 +107,10 @@ struct Qwen35AffineResearchHybridTests {
     func hybridPrefillDecodeParity() throws {
         try MLXMetalTestLock.withLock {
             let (directory, tensors) = try fixture()
-            defer { try? FileManager.default.removeItem(at: directory) }
+            var preserveFixture = false
+            defer {
+                if !preserveFixture { try? FileManager.default.removeItem(at: directory) }
+            }
             let json = """
                 {"model_type":"qwen3_5_moe","text_config":{
                  "hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,
@@ -291,9 +307,15 @@ struct Qwen35AffineResearchHybridTests {
             weak var retainedSource: ExperimentalArenaTokenIterator?
             var invalidated = false
             defer {
-                try? gate.recover(drain: { _ in
-                    try MLX.withError { StreamOrDevice.default.stream.synchronize() }
-                }, invalidate: { _ in language.resetPositionState() })
+                do {
+                    try gate.recover(drain: { _ in
+                        try MLX.withError { StreamOrDevice.default.stream.synchronize() }
+                    }, invalidate: { _ in language.resetPositionState() })
+                } catch {
+                    FailedGateRegistry.shared.retain(gate)
+                    preserveFixture = true
+                    Issue.record("hybrid arena recovery failed; retained fixture at \(directory.path): \(error)")
+                }
             }
             do {
                 let _: Int = try gate.withRequest(operation: { arena in
@@ -332,6 +354,84 @@ struct Qwen35AffineResearchHybridTests {
             })
             #expect(invalidated)
             #expect(retainedSource == nil)
+
+            // The same real hybrid fixture through the owned-stream wrapper.
+            // The synthetic stream error below tests quarantine mechanics, not
+            // GPU error reporting or a production inference integration.
+            let streamGate = ExperimentalRequestArenaGate()
+            let exactStream = StreamOrDevice.default.stream
+            language.resetPositionState()
+            var ownedTokens: [Int] = []
+            try ExperimentalOwnedStreamRequest.run(gate: streamGate,
+                streams: [ExperimentalOwnedStream(stream: exactStream)],
+                operation: { arena in
+                    let source = try ExperimentalThrowingTokenIterator.experimentalArenaTextPrefill(
+                        input: input, model: model, arena: arena, processor: nil,
+                        sampler: ArgMaxSampler(), maxTokens: 3,
+                        prepare: { input, _, _ in .tokens(input.text) },
+                        forward: { text, cache, _ in
+                            try language.researchAffineForward(text.tokens,
+                                cache: cache?.map { $0 as KVCache? }, reducers: reducers,
+                                limits: researchLimits, groupLimit: 16, tokenWindow: 2)
+                        })
+                    while let token = try source.nextToken() { ownedTokens.append(token) }
+                }, invalidate: { language.resetPositionState() })
+            #expect(ownedTokens == referenceTokens)
+
+            language.resetPositionState()
+            var failDrain = true
+            var streamInvalidated = false
+            weak var streamSource: ExperimentalArenaTokenIterator?
+            defer {
+                failDrain = false
+                do { try ExperimentalOwnedStreamRequest.recover(gate: streamGate) }
+                catch {
+                    FailedGateRegistry.shared.retain(streamGate)
+                    preserveFixture = true
+                    Issue.record("hybrid owned-stream recovery failed; retained fixture at \(directory.path): \(error)")
+                }
+            }
+            do {
+                try ExperimentalOwnedStreamRequest.run(gate: streamGate,
+                    streams: [ExperimentalOwnedStream(drain: {
+                        if failDrain { throw FixtureFailure.drain }
+                        try exactStream.experimentalSynchronize()
+                    })], operation: { arena in
+                        let source = try ExperimentalThrowingTokenIterator.experimentalArenaTextPrefill(
+                            input: input, model: model, arena: arena, processor: nil,
+                            sampler: ArgMaxSampler(),
+                            prepare: { input, _, _ in .tokens(input.text) },
+                            forward: { text, cache, _ in
+                                let output = try language.researchAffineForward(text.tokens,
+                                    cache: cache?.map { $0 as KVCache? }, reducers: reducers,
+                                    limits: researchLimits, groupLimit: 16, tokenWindow: 2)
+                                if text.tokens.size == 1 {
+                                    #expect(cache?.count == 2)
+                                    #expect(cache?.allSatisfy { $0.offset == 4 } == true)
+                                    throw FixtureFailure.decode
+                                }
+                                return output
+                            })
+                        streamSource = source
+                        _ = try source.nextToken()
+                    }, invalidate: {
+                        #expect(streamSource != nil)
+                        streamInvalidated = true
+                        language.resetPositionState()
+                    })
+                Issue.record("owned-stream decode and drain failure was accepted")
+            } catch let error as ExperimentalRequestArenaCleanupError {
+                #expect(error.primary as? FixtureFailure == .decode)
+                let failures = (error.cleanup as? ExperimentalOwnedStreamsDrainError)?.failures
+                #expect(failures?.first?.streamIndex == 0)
+                #expect(failures?.first?.error as? FixtureFailure == .drain)
+            }
+            #expect(streamSource != nil)
+            #expect(!streamInvalidated)
+            failDrain = false
+            try ExperimentalOwnedStreamRequest.recover(gate: streamGate)
+            #expect(streamInvalidated)
+            #expect(streamSource == nil)
         }
     }
 }
