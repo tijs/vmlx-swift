@@ -10,6 +10,10 @@ import Testing
 struct ExperimentalThrowingPrefillTests {
     enum Failure: Error, Equatable { case prefill, prime }
 
+    struct InvalidSampler: LogitSampler {
+        func sample(logits: MLXArray) -> MLXArray { MLXArray([Int32(1), 2]) }
+    }
+
     final class Model: Module, LanguageModel {
         var kvHeads: [Int] { [1] }
         func newCache(parameters: GenerateParameters?) -> [KVCache] { [KVCacheSimple()] }
@@ -120,6 +124,33 @@ struct ExperimentalThrowingPrefillTests {
                     discardOnFailure: { calls += 1 })
             }
             #expect(calls == 0)
+        }
+    }
+
+    @Test("invalid logits or sampled token fail prefill and run cleanup")
+    func invalidSamplingShapes() throws {
+        try MLXMetalTestLock.withLock {
+            let oldDevice = Device.defaultDevice()
+            Device.setDefault(device: .cpu)
+            defer { Device.setDefault(device: oldDevice) }
+            let model = Model()
+            for badSampler in [false, true] {
+                var discarded = 0
+                let sampler: any LogitSampler = badSampler ? InvalidSampler() : ArgMaxSampler()
+                let logits = badSampler ? MLXArray([Float(0), 1, 0]).reshaped([1, 1, 3])
+                                        : MLXArray([Float(0), 1, 0])
+                do {
+                    _ = try ExperimentalThrowingTokenIterator.experimentalTextPrefill(input: input(),
+                        model: model, processor: nil, sampler: sampler,
+                        prepare: { _, _, _ in .logits(LMOutput(logits: logits)) },
+                        forward: { _, _, _ in throw Failure.prime },
+                        discardOnFailure: { discarded += 1 })
+                    Issue.record("invalid sampling shape accepted")
+                } catch let error as ExperimentalDecodeError {
+                    #expect(error == (badSampler ? .invalidTokenShape : .invalidLogitShape))
+                } catch { Issue.record("unexpected sampling error: \(error)") }
+                #expect(discarded == 1)
+            }
         }
     }
 

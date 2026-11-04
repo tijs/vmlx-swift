@@ -1441,6 +1441,14 @@ public enum ExperimentalDecodeError: Error, Sendable, Equatable {
     case compiledDecodeUnsupported
     case invalidated
     case unsupportedPrefill
+    case invalidTokenShape
+    case invalidLogitShape
+}
+
+/// Both the original prefill failure and the subsequent stream-drain failure.
+public struct ExperimentalPrefillCleanupError: Error {
+    public let primary: any Error
+    public let drain: any Error
 }
 
 /// Adapts a prepared TokenIterator to a throwing eager decode forward. The
@@ -2600,21 +2608,29 @@ public struct TokenIterator: TokenIteratorProtocol {
                     let output = try experimentalForward(stepInput, cache.isEmpty ? nil : cache, state)
                     try Task.checkCancellation()
                     state = output.state
-                    y = .init(tokens: convertToToken(logits: output.logits))
+                    y = .init(tokens: try experimentalSample(logits: output.logits))
                 case .logits(let result):
                     let promptTokens = result.effectivePromptTokens.map {
                         MLXArray($0.map { Int32($0) }).expandedDimensions(axis: 0)
                     } ?? input.text.tokens
                     self.processor?.prompt(promptTokens)
-                    y = .init(tokens: convertToToken(logits: result.logits))
+                    y = .init(tokens: try experimentalSample(logits: result.logits))
                 }
-                asyncEval(y.tokens)
                 try Task.checkCancellation()
             }
         } catch {
-            StreamOrDevice.default.stream.synchronize()
+            let primary = error
+            var drainFailure: (any Error)?
+            do {
+                try MLX.withError { StreamOrDevice.default.stream.synchronize() }
+            } catch {
+                drainFailure = error
+            }
             discardOnFailure()
-            throw error
+            if let drainFailure {
+                throw ExperimentalPrefillCleanupError(primary: primary, drain: drainFailure)
+            }
+            throw primary
         }
     }
 
@@ -3433,6 +3449,37 @@ public struct TokenIterator: TokenIteratorProtocol {
         return forwardedToken
     }
 
+    private mutating func experimentalSample(logits: MLXArray) throws -> MLXArray {
+        guard logits.ndim == 3, logits.dim(0) == 1, logits.dim(1) > 0, logits.dim(2) > 0 else {
+            throw ExperimentalDecodeError.invalidLogitShape
+        }
+        return try MLX.withError { error in
+            var row = logits[0..., -1, 0...]
+            try error.check()
+            let rawRow = NaNLogitsTrace.isEnabled ? row : nil
+            var activeProcessor = processor
+            if let current = activeProcessor {
+                row = current.process(logits: row)
+                activeProcessor = current
+                try error.check()
+            }
+            let token = sampler.sample(logits: row)
+            try error.check()
+            guard token.size == 1 else { throw ExperimentalDecodeError.invalidTokenShape }
+            try MLX.checkedEval(token)
+            if var current = activeProcessor {
+                current.didSample(token: token)
+                try error.check()
+                processor = current
+            }
+            if let rawRow {
+                probeNonFiniteLogits(rawRow, sampled: token)
+                try error.check()
+            }
+            return token
+        }
+    }
+
     /// Experimental eager decode bridge for a fallible model forward. Prefill
     /// and iterator construction still use the existing model API. The caller
     /// must own this iterator and its caches exclusively, discard them on any
@@ -3452,17 +3499,17 @@ public struct TokenIterator: TokenIteratorProtocol {
             try Task.checkCancellation()
             if let maxTokens, tokenCount >= maxTokens { return nil }
             let previous = y
+            guard previous.tokens.size == 1 else { throw ExperimentalDecodeError.invalidTokenShape }
             let input: LMInput.Text = previous.tokens.ndim == 1 ? previous[text: .newAxis] : previous
             let result = try forward(input, cache.isEmpty ? nil : cache, state)
             try Task.checkCancellation()
             state = result.state
             if shouldQuantizeAfterStep { maybeQuantizeCacheForStep() }
-            let token = convertToToken(logits: result.logits)
+            let token = try experimentalSample(logits: result.logits)
             y = .init(tokens: token)
-            asyncEval(token)
             tokenCount += 1
             if tokenCount % 256 == 0 { Memory.clearCache() }
-            let forwardedToken = previous.tokens.item(Int.self)
+            let forwardedToken = try MLX.withError { previous.tokens.item(Int.self) }
             try Task.checkCancellation()
             lastForwardedTokenId = forwardedToken
             return forwardedToken

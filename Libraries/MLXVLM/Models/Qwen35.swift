@@ -3235,7 +3235,16 @@ enum Qwen35Language {
                     reducers: reducers, limits: limits, groupLimit: groupLimit,
                     tokenWindow: tokenWindow, shouldCancel: shouldCancel)
                 if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
-                return LMOutput(logits: headLogits(hidden))
+                // The returned logits must not defer an MLX error until after
+                // this method's failure handler has reset position state.
+                let logits = try MLX.withError { error in
+                    let logits = headLogits(hidden)
+                    try error.check()
+                    try MLX.checkedEval(logits)
+                    return logits
+                }
+                if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
+                return LMOutput(logits: logits)
             } catch {
                 resetPositionState()
                 throw error

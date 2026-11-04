@@ -280,6 +280,29 @@ struct Qwen35AffineResearchDecoderTests {
             } catch AffineStreamingExpertError.invalidInput(let reason) {
                 #expect(reason.contains("restored research cache requires explicit position IDs"))
             } catch { Issue.record("unexpected post-failure error: \(error)") }
+
+            // A malformed head produces an MLX shape error after attention and
+            // routing have executed. The language boundary must throw and
+            // reset position state instead of returning a poisoned lazy graph.
+            let head = try #require(language.lmHead)
+            try head.update(parameters: ModuleParameters.unflattened([
+                "weight": MLXArray.zeros([32, 32]).asType(.bfloat16)
+            ]), verify: [])
+            let failedCache = KVCacheSimple()
+            do {
+                _ = try language.researchAffineForward(prompt, cache: [failedCache], reducers: [reducer],
+                    limits: limits, groupLimit: 16, tokenWindow: 2)
+                Issue.record("invalid output head unexpectedly succeeded")
+            } catch is MLXError {
+                #expect(failedCache.offset == 3)
+            } catch { Issue.record("unexpected output evaluation error: \(error)") }
+            do {
+                _ = try language.researchAffineForward(next, cache: [failedCache], reducers: [reducer],
+                    limits: limits, groupLimit: 16, tokenWindow: 2)
+                Issue.record("failed cache reused without restored positions")
+            } catch AffineStreamingExpertError.invalidInput(let reason) {
+                #expect(reason.contains("restored research cache requires explicit position IDs"))
+            } catch { Issue.record("unexpected state after evaluation failure: \(error)") }
         }
     }
 }

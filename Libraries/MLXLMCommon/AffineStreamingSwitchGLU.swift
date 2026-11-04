@@ -749,7 +749,7 @@ public final class AffineStreamingSwitchGLU: Module {
                         let up = project(mapped.up, group)
                         let down = project(mapped.down, silu(gate) * up)
                         let kept = down[0 ..< count, 0..., 0...]
-                        MLX.eval(kept)
+                        try MLX.checkedEval(kept)
                         segments.append(kept)
                         offset = stop
                     }
@@ -764,7 +764,7 @@ public final class AffineStreamingSwitchGLU: Module {
                     ? windowScores.asType(routed.dtype) : windowScores
                 let output = (routed * weightedScores[.ellipsis, .newAxis])
                     .sum(axis: -2)
-                MLX.eval(output)
+                try MLX.checkedEval(output)
                 try checkCancellation()
                 return output
             }
@@ -778,7 +778,7 @@ public final class AffineStreamingSwitchGLU: Module {
         }
         try checkCancellation()
         let result = concatenated(outputs, axis: 0).reshaped(x.shape)
-        MLX.eval(result)
+        try MLX.checkedEval(result)
         try checkCancellation()
         return result
     }
