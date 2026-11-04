@@ -58,12 +58,50 @@ struct Qwen35SanitizeCollisionTests {
         }
     }
 
+    @Test("retained tower drops position ID aliases only on the remapping path")
+    func visionPositionIDs() throws {
+        let m = try model(vision: true)
+        let aliases = weights(["model.visual.position_ids", "vision_tower.position_ids"])
+        try m.validateBeforeSanitize(weights: aliases, metadata: [:])
+        let result = m.sanitize(weights: aliases, metadata: [:])
+        #expect(result.keys.allSatisfy { !$0.contains("position_ids") })
+
+        // No remap trigger: the MLX fast path returns directly and does not
+        // run the tower sanitizer, so this key remains present.
+        let fastWeights = weights(["vision_tower.position_ids"])
+        let metadata = ["format": "mlx", "norm_convention": "shifted"]
+        try m.validateBeforeSanitize(weights: fastWeights, metadata: metadata)
+        let fastResult = m.sanitize(weights: fastWeights, metadata: metadata)
+        #expect(fastResult["vision_tower.position_ids"] != nil)
+    }
+
     @Test("MTP aliases count only when native MTP is enabled")
     func mtpAliases() throws {
         let aliases = weights(["mtp.layers.0.weight", "language_model.mtp.layers.0.weight"])
         try model().validateBeforeSanitize(weights: aliases, metadata: [:])
         #expect(throws: Qwen35.SanitizationCollisionError.self) {
             try model(mtp: 1).validateBeforeSanitize(weights: aliases, metadata: [:])
+        }
+    }
+
+    @Test("opposing MTP norm probes give the same fast-path decision regardless of insertion order")
+    func deterministicMTPNormProbe() throws {
+        let m = try model(mtp: 1)
+        let entries: [(String, MLXArray)] = [
+            ("language_model.mtp.layers.0.input_layernorm.weight", MLXArray([Float(1)])),
+            ("mtp.layers.0.input_layernorm.weight", MLXArray([Float(0)])),
+            ("language_model.model.layers.0.input_layernorm.weight", MLXArray([Float(1)])),
+            ("language_model.model.layers.0.post_attention_layernorm.weight", MLXArray([Float(1)])),
+        ]
+        for ordered in [entries, Array(entries.reversed())] {
+            let source = Dictionary(uniqueKeysWithValues: ordered)
+            let metadata = ["format": "mlx"]
+            try m.validateBeforeSanitize(weights: source, metadata: metadata)
+            let result = m.sanitize(weights: source, metadata: metadata)
+            // Both spellings survive only if validation and sanitization take
+            // the same fast path; the slow path maps them onto one key.
+            #expect(result[entries[0].0] != nil)
+            #expect(result[entries[1].0] != nil)
         }
     }
 

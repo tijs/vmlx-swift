@@ -3974,6 +3974,10 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
             if visionModel == nil && (destination.contains("visual") || destination.contains("vision_tower")) {
                 continue
             }
+            // The retained tower's sanitizer drops these keys after the base
+            // remap, so any aliases have no surviving destination. The MLX
+            // fast path returned above and does not invoke tower sanitization.
+            if visionModel != nil && destination.contains("position_ids") { continue }
             sourcesByDestination[destination, default: []].append(source)
         }
         if let collision = sourcesByDestination.sorted(by: { $0.key < $1.key }).first(where: { $0.value.count > 1 }) {
@@ -4075,7 +4079,9 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
             "mtp.pre_fc_norm_embedding.weight",
         ]
         for suffix in probeSuffixes {
-            for (key, value) in weights where value.ndim == 1 {
+            // The same probe decision is used before and during sanitization.
+            // Dictionary iteration order can differ between those two passes.
+            for (key, value) in weights.sorted(by: { $0.key < $1.key }) where value.ndim == 1 {
                 guard Self.isMTPWeightKey(key), key.hasSuffix(suffix) else {
                     continue
                 }
