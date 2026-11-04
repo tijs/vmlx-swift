@@ -19,6 +19,15 @@ extension LoadSaveError: LocalizedError {
     }
 }
 
+/// Check the callback first so an MLX diagnostic is not replaced by a generic
+/// status. Some C implementations can return failure without a callback.
+func checkedSafetensorsLoadStatus(url: URL, operation: () -> Int32) throws {
+    let status = try withError { operation() }
+    guard status == 0 else {
+        throw LoadSaveError.unableToOpen(url, "Safetensors loader returned status \(status):")
+    }
+}
+
 /// Save array to a binary file in `.npy` format.
 ///
 /// - Parameters:
@@ -133,7 +142,7 @@ public func loadArrays(url: URL, stream: StreamOrDevice = .cpu) throws -> [Strin
         defer { mlx_map_string_to_array_free(r0) }
         defer { mlx_map_string_to_string_free(r1) }
 
-        _ = try withError {
+        try checkedSafetensorsLoadStatus(url: url) {
             mlx_load_safetensors(&r0, &r1, path.cString(using: .utf8), stream.ctx)
         }
 
@@ -165,7 +174,7 @@ public func loadArraysAndMetadata(url: URL, stream: StreamOrDevice = .cpu) throw
         defer { mlx_map_string_to_array_free(r0) }
         defer { mlx_map_string_to_string_free(r1) }
 
-        _ = try withError {
+        try checkedSafetensorsLoadStatus(url: url) {
             mlx_load_safetensors(&r0, &r1, path.cString(using: .utf8), stream.ctx)
         }
 
@@ -214,7 +223,7 @@ public func loadArraysAndMetadata(
     let pointers: [UnsafePointer<CChar>?] = cStrings.map { UnsafePointer($0) }
     let path = url.path(percentEncoded: false)
 
-    _ = try withError {
+    try checkedSafetensorsLoadStatus(url: url) {
         pointers.withUnsafeBufferPointer { excluded in
             if exactTensorBuffers {
                 mlx_load_safetensors_excluding_with_options(
