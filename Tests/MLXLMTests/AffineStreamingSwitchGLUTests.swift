@@ -38,7 +38,7 @@ struct AffineStreamingSwitchGLUTests {
     }
 
     private func makeFixture(
-        numExperts: Int = 4, dimensions: Int = 32,
+        numExperts: Int = 4, dimensions: Int = 32, hiddenDimensions: Int? = nil,
         layout: AffineStreamingExpertCatalog.Layout = .qwen4,
         nonPageAligned: Bool = false, companionOverride: DType? = nil
     ) throws -> Fixture {
@@ -47,12 +47,15 @@ struct AffineStreamingSwitchGLUTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         func dense(expert: Int, projection: Int) -> MLXArray {
-            let count = dimensions * dimensions
+            let hidden = hiddenDimensions ?? dimensions
+            let input = projection == 2 ? hidden : dimensions
+            let output = projection == 2 ? dimensions : hidden
+            let count = input * output
             let values = (0 ..< count).map { index -> Float in
                 let centered = Float((index * 13 + expert * 17 + projection * 23) % 101) - 50
                 return centered / Float(200 + projection * 40)
             }
-            return MLXArray(values, [dimensions, dimensions])
+            return MLXArray(values, [output, input])
         }
 
         var tensors: [String: MLXArray] = [:]
@@ -63,7 +66,7 @@ struct AffineStreamingSwitchGLUTests {
             for expert in 0 ..< numExperts {
                 let quantized = MLX.quantized(
                     dense(expert: expert, projection: projectionIndex),
-                    groupSize: dimensions, bits: 4, mode: .affine)
+                    groupSize: layout == .qwen35 ? 64 : dimensions, bits: 4, mode: .affine)
                 weights.append(quantized.wq)
                 let companion: DType = companionOverride ?? (layout == .qwen35 ? .bfloat16 : .float16)
                 scales.append(quantized.scales.asType(companion))
@@ -702,6 +705,61 @@ struct AffineStreamingSwitchGLUTests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    @Test("Qwen35 mapped reducer matches native at realistic projection geometry")
+    func qwen35MappedRealisticGeometry() throws {
+        try MLXMetalTestLock.withLock {
+            let fixture = try makeFixture(numExperts: 8, dimensions: 2048,
+                hiddenDimensions: 512, layout: .qwen35, nonPageAligned: true)
+            defer { try? FileManager.default.removeItem(at: fixture.directory) }
+            let prefix = "language_model.model.layers.0.mlp.switch_mlp."
+            func projection(_ name: String, input: Int, output: Int) throws -> QuantizedSwitchLinear {
+                QuantizedSwitchLinear(inputDims: input, outputDims: output, numExperts: 8,
+                    weight: try #require(fixture.tensors[prefix + name + ".weight"]),
+                    scales: try #require(fixture.tensors[prefix + name + ".scales"]),
+                    biases: try #require(fixture.tensors[prefix + name + ".biases"]),
+                    groupSize: 64, bits: 4, mode: .affine)
+            }
+            let native = SwitchGLU(inputDims: 2048, hiddenDims: 512, numExperts: 8,
+                allowFusedGateUpCache: false, compileSeparatedDecode: false)
+            try native.update(modules: ModuleChildren.unflattened([
+                ("gate_proj", try projection("gate_proj", input: 2048, output: 512)),
+                ("up_proj", try projection("up_proj", input: 2048, output: 512)),
+                ("down_proj", try projection("down_proj", input: 512, output: 2048)),
+            ]), verify: .all)
+            let catalog = AffineStreamingExpertCatalog(numExperts: 8, inputDims: 2048,
+                hiddenDims: 512, layout: .qwen35)
+            try catalog.configure(modelDirectory: fixture.directory, layerCount: 1)
+            let streaming = AffineStreamingSwitchGLU(inputDims: 2048, hiddenDims: 512,
+                numExperts: 8, layerIndex: 0, catalog: catalog, cacheExpertLimit: 3)
+            let oldPolicy = SwitchLayerRuntime.propagatePromotedOutput
+            SwitchLayerRuntime.propagatePromotedOutput = false
+            defer { SwitchLayerRuntime.propagatePromotedOutput = oldPolicy }
+            for tokens in [1, 8, 16] {
+                let ids = (0 ..< tokens).flatMap { token in
+                    (0 ..< 8).map { slot in Int32((token * 3 + slot * 5) % 8) }
+                }
+                let indices = MLXArray(ids, [1, tokens, 8]).asType(.uint32)
+                let values = (0 ..< tokens * 2048).map { index in
+                    Float((index * 17) % 101 - 50) / Float(37)
+                }
+                let x = MLXArray(values, [1, tokens, 2048]).asType(.bfloat16)
+                let row: [Float] = [0.037, 0.067, 0.093, 0.111, 0.127, 0.151, 0.18, 0.234]
+                let scores = MLXArray(Array(repeating: row, count: tokens).flatMap { $0 }, [1, tokens, 8])
+                let routed = native(x, indices)
+                let expected = (routed * scores.asType(routed.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
+                let actual = try streaming.researchQwen35GroupedReduced(x, indices: indices,
+                    scores: scores, groupLimit: 32, tokenWindow: 7)
+                MLX.eval(expected, actual)
+                let difference = MLX.max(MLX.abs(expected.asType(.float32)
+                    - actual.asType(.float32))).item(Float.self)
+                print("AFFINE_MAPPED_REALISTIC tokens=\(tokens) max_abs=\(difference)")
+                #expect(actual.shape == expected.shape && actual.dtype == expected.dtype)
+                #expect(MLX.arrayEqual(actual, expected).item(Bool.self),
+                    "tokens=\(tokens) max_abs=\(difference)")
             }
         }
     }
