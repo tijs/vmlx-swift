@@ -18,6 +18,12 @@ public extension SafetensorsLoadKeyExcluding {
     var requiresResidentSafetensorsWeights: Bool { false }
 }
 
+/// Optional model-specific validation before nonthrowing weight sanitization.
+/// Models that do not conform retain the existing loading behavior.
+public protocol SafetensorsPreSanitizeValidating: AnyObject {
+    func validateBeforeSanitize(weights: [String: MLXArray], metadata: [String: String]) throws
+}
+
 private func isPreservedMTPWeightKey(_ key: String) -> Bool {
     let lower = key.lowercased()
     return lower.hasPrefix("mtp.")
@@ -745,6 +751,8 @@ public func loadWeights(
     {
         metadata[key] = value
     }
+    try (model as? any SafetensorsPreSanitizeValidating)?
+        .validateBeforeSanitize(weights: weights, metadata: metadata)
     weights = model.sanitize(weights: weights, metadata: metadata)
 
     // Bonsai 2 Prism-Hadamard transform install (default-off portability

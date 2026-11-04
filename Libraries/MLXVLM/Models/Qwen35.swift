@@ -3396,7 +3396,7 @@ enum Qwen35Language {
 // MARK: - Model
 
 public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel,
-    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping
+    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping, SafetensorsPreSanitizeValidating
 {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel?
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
@@ -3924,6 +3924,63 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         sanitize(weights: weights, isMLXFormat: false, normConvention: nil)
     }
 
+    public struct SanitizationCollisionError: Error {
+        public let destination: String
+        public let sources: [String]
+    }
+
+    /// Match the sanitizer's exact rename rules before dictionary insertion,
+    /// where aliases would otherwise silently overwrite one another.
+    private static func sanitizedWeightKey(_ source: String, loadNativeMTP: Bool) -> String {
+        var key = source
+        if key.contains("model") {
+            if key.contains("model.language_model") {
+                key = key.replacingOccurrences(of: "model.language_model", with: "language_model.model")
+            } else if key.contains("model.visual") {
+                key = key.replacingOccurrences(of: "model.visual", with: "vision_tower")
+            }
+        } else if key.contains("lm_head") {
+            key = key.replacingOccurrences(of: "lm_head", with: "language_model.lm_head")
+        }
+        if loadNativeMTP {
+            if key.hasPrefix("mtp.") {
+                key = "language_model." + key
+            } else if key.hasPrefix("model.mtp_layers.") {
+                key = key.replacingOccurrences(of: "model.mtp_layers.", with: "language_model.mtp.layers.")
+            }
+        }
+        return key
+    }
+
+    public func validateBeforeSanitize(weights: [String: MLXArray], metadata: [String: String]) throws {
+        let loadNativeMTP = config.textConfiguration.mtpNumHiddenLayers > 0
+        var remaining = loadNativeMTP ? weights : weights.filter { !Self.isMTPWeightKey($0.key) }
+        if config.textConfiguration.tieWordEmbeddings { remaining["lm_head.weight"] = nil }
+        let hasUnsanitizedConv1d = remaining.contains { $0.key.contains("conv1d.weight") && $0.value.dim(-1) != 1 }
+        let shift = NormConventionResolver.shouldApplyPlusOneShift(
+            metadataConvention: Self.normConvention(metadata),
+            configConvention: config.textConfiguration.normConvention,
+            declaredConvention: declaredNormConvention, weights: remaining,
+            probeSuffixes: [".input_layernorm.weight", ".post_attention_layernorm.weight"],
+            fallbackWhenNoProbe: { !Self.isMLXFormatLike(remaining) })
+        let mtpShift = loadNativeMTP && (shift || Self.mtpNormWeightsNeedShift(remaining))
+        let needsRemap = remaining.keys.contains { $0.contains("model.language_model") || $0.contains("model.visual") }
+        if metadata["format"]?.lowercased() == "mlx" && !hasUnsanitizedConv1d && !shift && !mtpShift && !needsRemap {
+            return
+        }
+        var sourcesByDestination: [String: [String]] = [:]
+        for source in remaining.keys.sorted() {
+            let destination = Self.sanitizedWeightKey(source, loadNativeMTP: loadNativeMTP)
+            if visionModel == nil && (destination.contains("visual") || destination.contains("vision_tower")) {
+                continue
+            }
+            sourcesByDestination[destination, default: []].append(source)
+        }
+        if let collision = sourcesByDestination.sorted(by: { $0.key < $1.key }).first(where: { $0.value.count > 1 }) {
+            throw SanitizationCollisionError(destination: collision.key, sources: collision.value)
+        }
+    }
+
     private func sanitize(
         weights: [String: MLXArray],
         isMLXFormat: Bool,
@@ -3982,25 +4039,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
             var key = key
             var value = originalValue
 
-            if key.contains("model") {
-                if key.contains("model.language_model") {
-                    key = key.replacingOccurrences(
-                        of: "model.language_model", with: "language_model.model")
-                } else if key.contains("model.visual") {
-                    key = key.replacingOccurrences(of: "model.visual", with: "vision_tower")
-                }
-            } else if key.contains("lm_head") {
-                key = key.replacingOccurrences(of: "lm_head", with: "language_model.lm_head")
-            }
-            if loadNativeMTP {
-                if key.hasPrefix("mtp.") {
-                    key = "language_model." + key
-                } else if key.hasPrefix("model.mtp_layers.") {
-                    key = key.replacingOccurrences(
-                        of: "model.mtp_layers.",
-                        with: "language_model.mtp.layers.")
-                }
-            }
+            key = Self.sanitizedWeightKey(key, loadNativeMTP: loadNativeMTP)
 
             if key.contains("conv1d.weight") && value.dim(-1) != 1 {
                 value = value.movedAxis(source: 2, destination: 1)

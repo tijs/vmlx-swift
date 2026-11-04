@@ -11,6 +11,64 @@ import MLX
 import MLXLMCommon
 
 public final class Qwen35MoE: Qwen35 {
+    /// Simulate MoE key transformations without evaluating tensors. Reject
+    /// collisions before the nonthrowing sanitizer can overwrite a tensor.
+    public override func validateBeforeSanitize(weights: [String: MLXArray], metadata: [String: String]) throws {
+        var keys = weights.filter { !$0.key.hasSuffix(".tq_bits") }
+        func insert(_ target: String, source: String, value: MLXArray) throws {
+            if keys[target] != nil {
+                throw SanitizationCollisionError(destination: target, sources: [source, target].sorted())
+            }
+            keys[target] = value
+        }
+        func stack(prefix: String, sourceProjection: String, targetProjection: String,
+                   suffix: String, streaming: Bool) throws {
+            let target = "\(prefix).switch_mlp.\(targetProjection).\(suffix)"
+            let sources = (0 ..< config.textConfiguration.numExperts).map {
+                "\(prefix).experts.\($0).\(sourceProjection).\(suffix)"
+            }
+            let present = sources.filter { keys[$0] != nil }
+            if keys[target] != nil && !present.isEmpty {
+                throw SanitizationCollisionError(destination: target, sources: ([target] + present).sorted())
+            }
+            guard let first = sources.first, let value = keys[first], keys[target] == nil else { return }
+            if streaming || present.count == sources.count {
+                for source in sources { keys.removeValue(forKey: source) }
+                if !streaming { try insert(target, source: first, value: value) }
+            }
+        }
+        for layer in 0 ..< config.textConfiguration.hiddenLayers {
+            for prefix in ["model.language_model.layers.\(layer).mlp", "language_model.model.layers.\(layer).mlp"] {
+                for (source, target) in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")] {
+                    for suffix in ["tq_packed", "tq_norms"] {
+                        try stack(prefix: prefix, sourceProjection: source, targetProjection: target,
+                            suffix: suffix, streaming: JANGTQStreamingExperts.isEnabled)
+                    }
+                }
+                let fused = "\(prefix).experts.gate_up_proj"
+                if let value = keys.removeValue(forKey: fused) {
+                    try insert("\(prefix).switch_mlp.gate_proj.weight", source: fused, value: value)
+                    try insert("\(prefix).switch_mlp.up_proj.weight", source: fused, value: value)
+                    let down = "\(prefix).experts.down_proj"
+                    if let downValue = keys.removeValue(forKey: down) {
+                        try insert("\(prefix).switch_mlp.down_proj.weight", source: down, value: downValue)
+                    }
+                }
+            }
+        }
+        for layer in 0 ..< config.textConfiguration.mtpNumHiddenLayers {
+            for prefix in ["mtp.layers.\(layer).mlp", "model.mtp_layers.\(layer).mlp"] {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    for suffix in ["weight", "scales", "biases"] {
+                        try stack(prefix: prefix, sourceProjection: projection, targetProjection: projection,
+                            suffix: suffix, streaming: false)
+                    }
+                }
+            }
+        }
+        try super.validateBeforeSanitize(weights: keys, metadata: metadata)
+    }
+
     public override func sanitize(
         weights: [String: MLXArray],
         metadata: [String: String]

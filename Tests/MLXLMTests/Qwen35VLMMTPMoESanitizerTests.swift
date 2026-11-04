@@ -70,6 +70,65 @@ struct Qwen35VLMMTPMoESanitizerTests {
             """.data(using: .utf8)!)
     }
 
+    @Test("MoE validation rejects preprocessing overwrite and remapped aliases")
+    func rejectsMoEPreprocessingCollisions() throws {
+        let model = Qwen35MoE(try tinyConfiguration())
+        let value = MLXArray.zeros([2, 8, 4])
+        let prefix = "model.language_model.layers.0.mlp"
+        #expect(throws: Qwen35.SanitizationCollisionError.self) {
+            try model.validateBeforeSanitize(weights: [
+                "\(prefix).experts.gate_up_proj": value,
+                "\(prefix).switch_mlp.gate_proj.weight": value,
+            ], metadata: [:])
+        }
+        // Fused input becomes a switch tensor before the base sanitizer
+        // canonicalizes both prefix spellings to the same destination.
+        #expect(throws: Qwen35.SanitizationCollisionError.self) {
+            try model.validateBeforeSanitize(weights: [
+                "\(prefix).experts.gate_up_proj": value,
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": value,
+            ], metadata: [:])
+        }
+        let mtp = "mtp.layers.0.mlp"
+        #expect(throws: Qwen35.SanitizationCollisionError.self) {
+            try model.validateBeforeSanitize(weights: [
+                "\(mtp).experts.0.gate_proj.weight": value,
+                "\(mtp).experts.1.gate_proj.weight": value,
+                "language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight": value,
+            ], metadata: [:])
+        }
+        // A single supported fused representation remains accepted.
+        try model.validateBeforeSanitize(weights: ["\(prefix).experts.gate_up_proj": value], metadata: [:])
+    }
+
+    @Test("partial MTP expert sources remain visible; complete sources stack")
+    func validationMatchesAffineStacking() throws {
+        try MLXMetalTestLock.withLock {
+            let model = Qwen35MoE(try tinyConfiguration())
+            let prefix = "mtp.layers.0.mlp"
+            let first = "\(prefix).experts.0.gate_proj.weight"
+            let second = "\(prefix).experts.1.gate_proj.weight"
+            let target = "language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight"
+            let value = MLXArray.zeros([8, 4], dtype: .uint32)
+            let partial = [first: value]
+            try model.validateBeforeSanitize(weights: partial, metadata: [:])
+            let partialResult = model.sanitize(weights: partial, metadata: [:])
+            #expect(partialResult["language_model.\(first)"] != nil)
+            #expect(partialResult[target] == nil)
+            let complete = [first: value, second: value]
+            try model.validateBeforeSanitize(weights: complete, metadata: [:])
+            let completeResult = model.sanitize(weights: complete, metadata: [:])
+            #expect(completeResult[target]?.shape == [2, 8, 4])
+            #expect(completeResult["language_model.\(first)"] == nil)
+            #expect(completeResult["language_model.\(second)"] == nil)
+            #expect(throws: Qwen35.SanitizationCollisionError.self) {
+                try model.validateBeforeSanitize(weights: [
+                    first: value, "\(prefix).switch_mlp.gate_proj.weight": value,
+                ], metadata: [:])
+            }
+        }
+    }
+
     @Test("per-expert affine MTP tensors become stacked switch tensors")
     func perExpertAffineMTPTensorsBecomeStackedSwitchTensors() throws {
         let model = Qwen35MoE(try tinyConfiguration())
