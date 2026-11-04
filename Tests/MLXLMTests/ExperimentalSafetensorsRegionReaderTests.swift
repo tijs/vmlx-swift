@@ -168,4 +168,44 @@ struct ExperimentalSafetensorsRegionReaderTests {
         }, drain: { _ in }, invalidate: { _ in })
     }
 
+    @Test("cancelled mapped resident survives failed drain until recovery")
+    func residentQuarantine() throws {
+        enum Injected: Error { case drain }
+        let (root, inspection) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gate = ExperimentalRequestArenaGate()
+        weak var reference: MLXArray?
+        var invalidated = false
+        do {
+            let _: Void = try gate.withRequest(operation: { arena in
+                let value = try ExperimentalSafetensorsRegionReader.read(key: resident,
+                    inspection: inspection, arena: arena, maxMappedBytes: 1 << 20)
+                reference = value
+                #expect(value.asArray(Float.self) == [1, 2, 3, 4])
+                throw CancellationError()
+            }, drain: { _ in throw Injected.drain }, invalidate: { _ in
+                invalidated = true
+            })
+            Issue.record("failed drain was accepted")
+        } catch let error as ExperimentalRequestArenaCleanupError {
+            #expect(error.primary is CancellationError)
+            #expect(error.cleanup is Injected)
+        }
+        #expect(reference != nil)
+        #expect(!invalidated)
+        #expect(throws: ExperimentalRequestArenaError.quarantined) {
+            let _: Void = try gate.withRequest(operation: { _ in .finished(()) }, drain: { _ in }, invalidate: { _ in })
+        }
+        try gate.recover(drain: { _ in
+            try MLX.Stream.cpu.experimentalSynchronize()
+            try StreamOrDevice.default.stream.experimentalSynchronize()
+            #expect(reference?.asArray(Float.self) == [1, 2, 3, 4])
+        }, invalidate: { _ in
+            #expect(reference != nil)
+            invalidated = true
+        })
+        #expect(invalidated)
+        #expect(reference == nil)
+    }
+
 }
