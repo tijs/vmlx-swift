@@ -48,6 +48,56 @@ struct Qwen35AffineFullLoaderFixtureTests {
             for (key, value) in reference.parameters().flattened() { checkpoint[key] = value }
             MLX.eval(Array(checkpoint.values))
             try save(checkpoint, in: directory)
+
+            // Capture the contracts on a separate pristine model, then use
+            // descriptors read from the actual serialized checkpoint.
+            let pristine = try model()
+            let routedPaths = (0 ..< 2).flatMap { layer in
+                ["gate_proj", "up_proj", "down_proj"].map {
+                    "language_model.model.layers.\(layer).mlp.switch_mlp.\($0)"
+                }
+            }
+            let routedWeights = Set(routedPaths.map { $0 + ".weight" })
+            let residentContract = try Qwen35AffineResidentContract.capture(model: pristine,
+                affine: [:], routed: routedWeights, tiedHead: false, layerCount: 2)
+            let policies = Dictionary(uniqueKeysWithValues: routedPaths.map {
+                ($0, Qwen35AffineRoutedContract.Policy(bits: 4, groupSize: 64))
+            })
+            let routedContract = try Qwen35AffineRoutedContract.capture(model: pristine,
+                layerCount: 2, numExperts: 2, inputDims: 64, hiddenDims: 64, policies: policies)
+            let persisted = try MLX.loadArrays(url: directory.appendingPathComponent("model.safetensors"))
+            var resident: [String: Qwen35AffineResidentContract.Tensor] = [:]
+            var routed: [String: Qwen35AffineRoutedContract.Tensor] = [:]
+            for (key, value) in persisted {
+                let dtype: String
+                if value.dtype == .uint32 { dtype = "U32" }
+                else if value.dtype == .bfloat16 { dtype = "BF16" }
+                else if value.dtype == .float16 { dtype = "F16" }
+                else if value.dtype == .float32 { dtype = "F32" }
+                else { dtype = "unsupported" }
+                if AffineStreamingExpertCatalog.isRoutedTensorKey(key, layout: .qwen35) {
+                    routed[key] = .init(shape: value.shape, dtype: dtype)
+                } else {
+                    resident[key] = .init(shape: value.shape, dtype: dtype)
+                }
+            }
+            try residentContract.validate(resident)
+            try routedContract.validate(routed)
+            var missingResident = resident
+            missingResident.removeValue(forKey: normKey)
+            #expect(throws: (any Error).self) { try residentContract.validate(missingResident) }
+            var badResident = resident
+            badResident[normKey] = .init(shape: [1], dtype: "BF16")
+            #expect(throws: (any Error).self) { try residentContract.validate(badResident) }
+            let routedWeight = routedPaths[0] + ".weight"
+            var missingRouted = routed
+            missingRouted.removeValue(forKey: routedWeight)
+            #expect(throws: (any Error).self) { try routedContract.validate(missingRouted) }
+            var badRouted = routed
+            let actualRouted = try #require(routed[routedWeight])
+            badRouted[routedWeight] = .init(shape: actualRouted.shape, dtype: "F32")
+            #expect(throws: (any Error).self) { try routedContract.validate(badRouted) }
+
             let loaded = try model()
             try loadWeights(modelDirectory: directory, model: loaded,
                 quantization: .init(groupSize: 64, bits: 4))
