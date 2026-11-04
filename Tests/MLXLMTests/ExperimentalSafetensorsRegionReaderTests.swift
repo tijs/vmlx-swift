@@ -2,6 +2,9 @@
 import Foundation
 import MLX
 import Testing
+#if canImport(Darwin) && canImport(CryptoKit)
+import CryptoKit
+#endif
 @testable import MLXLMCommon
 
 struct ExperimentalSafetensorsRegionReaderTests {
@@ -197,9 +200,9 @@ struct ExperimentalSafetensorsRegionReaderTests {
             let _: Void = try gate.withRequest(operation: { _ in .finished(()) }, drain: { _ in }, invalidate: { _ in })
         }
         try gate.recover(drain: { _ in
+            #expect(reference?.asArray(Float.self) == [1, 2, 3, 4])
             try MLX.Stream.cpu.experimentalSynchronize()
             try StreamOrDevice.default.stream.experimentalSynchronize()
-            #expect(reference?.asArray(Float.self) == [1, 2, 3, 4])
         }, invalidate: { _ in
             #expect(reference != nil)
             invalidated = true
@@ -207,5 +210,55 @@ struct ExperimentalSafetensorsRegionReaderTests {
         #expect(invalidated)
         #expect(reference == nil)
     }
+
+    #if canImport(Darwin) && canImport(CryptoKit)
+    @Test("leased cloned snapshot and resident mapping survive failed drain")
+    func leasedMappedSnapshot() throws {
+        enum Injected: Error { case drain }
+        let (source, _) = try fixture()
+        let staging = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: staging)
+        }
+        let names = ["model.safetensors", "model.safetensors.index.json"]
+        var files: [String: String] = [:]
+        for name in names {
+            let data = try Data(contentsOf: source.appendingPathComponent(name))
+            files[name] = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+        let snapshot = try Qwen35AffineResearchSnapshot.create(source: source, stagingParent: staging,
+            files: files, diskGate: { _, _ in })
+        let shard = snapshot.directory.appendingPathComponent("model.safetensors")
+        let inspection = try Qwen35AffineResearchManifest.inspect(modelDirectory: snapshot.directory,
+            selectedShards: [shard], layerCount: 1, numExperts: 1, inputDims: 64, hiddenDims: 64)
+        let gate = ExperimentalRequestArenaGate()
+        weak var reference: MLXArray?
+        do {
+            let _: Void = try gate.withRequest(operation: { arena in
+                try snapshot.retain(in: arena)
+                let value = try ExperimentalSafetensorsRegionReader.read(key: resident,
+                    inspection: inspection, arena: arena, maxMappedBytes: 1 << 20)
+                reference = value
+                throw CancellationError()
+            }, drain: { _ in throw Injected.drain }, invalidate: { _ in })
+            Issue.record("failed drain accepted")
+        } catch let error as ExperimentalRequestArenaCleanupError {
+            #expect(error.primary is CancellationError)
+        }
+        #expect(reference != nil)
+        #expect(throws: Qwen35AffineResearchSnapshot.SnapshotError.self) { try snapshot.dispose() }
+        try gate.recover(drain: { _ in
+            #expect(reference?.asArray(Float.self) == [1, 2, 3, 4])
+            try MLX.Stream.cpu.experimentalSynchronize()
+            try StreamOrDevice.default.stream.experimentalSynchronize()
+        }, invalidate: { _ in
+            #expect(throws: Qwen35AffineResearchSnapshot.SnapshotError.self) { try snapshot.dispose() }
+        })
+        #expect(reference == nil)
+        try snapshot.dispose()
+    }
+    #endif
 
 }

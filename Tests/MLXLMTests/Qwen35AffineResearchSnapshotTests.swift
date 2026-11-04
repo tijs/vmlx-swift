@@ -202,5 +202,80 @@ struct Qwen35AffineResearchSnapshotTests {
         #expect(throws: Qwen35AffineResearchSnapshot.SnapshotError.self) { try snapshot.retain(in: try #require(sealed)) }
     }
 
+    @Test("independent arenas each retain their own snapshot lease")
+    func independentArenas() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let source = root.appendingPathComponent("source")
+        let staging = root.appendingPathComponent("staging")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = Data("weight".utf8)
+        try data.write(to: source.appendingPathComponent("weights"))
+        let snapshot = try Qwen35AffineResearchSnapshot.create(source: source, stagingParent: staging,
+            files: ["weights": digest(data)], diskGate: { _, _ in })
+        let first = ExperimentalRequestArenaGate()
+        let second = ExperimentalRequestArenaGate()
+        let _: Void = try first.withRequest(operation: { arena in
+            try snapshot.retain(in: arena)
+            do {
+                let _: Void = try second.withRequest(operation: { other in
+                    try snapshot.retain(in: other)
+                    throw CancellationError()
+                }, drain: { _ in throw Failure.gate }, invalidate: { _ in })
+                Issue.record("failed drain accepted")
+            } catch is ExperimentalRequestArenaCleanupError { }
+            try second.recover(drain: { _ in }, invalidate: { _ in })
+            #expect(throws: Qwen35AffineResearchSnapshot.SnapshotError.self) { try snapshot.dispose() }
+            return .finished(())
+        }, drain: { _ in }, invalidate: { _ in })
+        try snapshot.dispose()
+    }
+
+    @Test("concurrent lease and disposal cannot both succeed")
+    func leaseDisposeRace() throws {
+        final class Race: @unchecked Sendable {
+            let snapshot: Qwen35AffineResearchSnapshot
+            let arena: ExperimentalRequestArena
+            private let lock = NSLock()
+            private(set) var leased = false
+            private(set) var disposed = false
+            init(_ snapshot: Qwen35AffineResearchSnapshot, _ arena: ExperimentalRequestArena) {
+                self.snapshot = snapshot; self.arena = arena
+            }
+            func run(_ index: Int) {
+                if index == 0 {
+                    if (try? snapshot.retain(in: arena)) != nil {
+                        lock.lock(); leased = true; lock.unlock()
+                    }
+                } else if (try? snapshot.dispose()) != nil {
+                    lock.lock(); disposed = true; lock.unlock()
+                }
+            }
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let source = root.appendingPathComponent("source")
+        let staging = root.appendingPathComponent("staging")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = Data("weight".utf8)
+        try data.write(to: source.appendingPathComponent("weights"))
+        for _ in 0..<20 {
+            let snapshot = try Qwen35AffineResearchSnapshot.create(source: source, stagingParent: staging,
+                files: ["weights": digest(data)], diskGate: { _, _ in })
+            let _: Void = try ExperimentalRequestArenaGate().withRequest(operation: { arena in
+                let race = Race(snapshot, arena)
+                DispatchQueue.concurrentPerform(iterations: 2) { race.run($0) }
+                #expect(race.leased != race.disposed)
+                if race.leased {
+                    #expect(throws: Qwen35AffineResearchSnapshot.SnapshotError.self) { try snapshot.dispose() }
+                }
+                return .finished(())
+            }, drain: { _ in }, invalidate: { _ in })
+            try snapshot.dispose()
+        }
+    }
+
 }
 #endif
