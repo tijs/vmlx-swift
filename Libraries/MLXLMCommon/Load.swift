@@ -26,27 +26,36 @@ private func isPreservedMTPWeightKey(_ key: String) -> Bool {
         || lower.contains(".mtp_layers.")
 }
 
-private func loadSafetensorsHeaderNamesForBaseLoad(_ url: URL) throws -> [String] {
+func loadSafetensorsHeaderNamesForBaseLoad(_ url: URL) throws -> [String] {
     let handle = try FileHandle(forReadingFrom: url)
     defer { try? handle.close() }
 
     guard let lengthData = try handle.read(upToCount: 8), lengthData.count == 8 else {
-        return []
+        throw TruncatedSafetensorsError(description: "Unreadable safetensors header: \(url.path)")
     }
     var headerLength: UInt64 = 0
     for (index, byte) in lengthData.enumerated() {
         headerLength |= UInt64(byte) << UInt64(index * 8)
     }
     guard headerLength > 0, headerLength <= 64 * 1024 * 1024 else {
-        return []
+        throw TruncatedSafetensorsError(description: "Invalid safetensors header length: \(url.path)")
     }
     guard let headerData = try handle.read(upToCount: Int(headerLength)),
         headerData.count == Int(headerLength),
         let header = try JSONSerialization.jsonObject(with: headerData) as? [String: Any]
     else {
-        return []
+        throw TruncatedSafetensorsError(description: "Malformed or truncated safetensors header: \(url.path)")
     }
     return header.keys.filter { $0 != "__metadata__" }
+}
+
+/// Exclusion must be decided before mapping, so an unreadable header cannot
+/// safely fall back to loading all tensors when the model owns exclusions.
+/// Such loads reject headers over the reader's 64 MiB limit. This reads names,
+/// not tensor descriptors, and does not establish immutable checkpoint identity.
+func baseLoadHeaderNames(_ url: URL, requiresExclusion: Bool) throws -> [String] {
+    if requiresExclusion { return try loadSafetensorsHeaderNamesForBaseLoad(url) }
+    return (try? loadSafetensorsHeaderNamesForBaseLoad(url)) ?? []
 }
 
 /// A bundle whose shard files are shorter than their headers declare.
@@ -566,7 +575,8 @@ public func loadWeights(
         }
         for url in allShardURLs {
             let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
-            let headerNames = (try? loadSafetensorsHeaderNamesForBaseLoad(url)) ?? []
+            let headerNames = try baseLoadHeaderNames(
+                url, requiresExclusion: modelKeyExcluder != nil || streamingRoutedExperts)
             var excludedKeys = Set<String>()
             if !headerNames.isEmpty {
                 for key in headerNames {
