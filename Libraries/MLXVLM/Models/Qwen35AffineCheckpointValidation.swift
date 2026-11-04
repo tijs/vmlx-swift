@@ -20,6 +20,7 @@ struct Qwen35AffineCheckpointValidation {
     private let directory: URL
     private let shards: [String]
     private let normConvention: String?
+    private let geometry: (layers: Int, experts: Int, input: Int, hidden: Int)
 
     init(model: Qwen35, bits: Int, groupSize: Int, directory: URL, shardNames: Set<String>,
          metadataHashes: [String: String] = [:]) throws {
@@ -47,6 +48,10 @@ struct Qwen35AffineCheckpointValidation {
             }
         }
         for (name, expected) in metadataHashes {
+            let properties = try directory.appendingPathComponent(name).resourceValues(forKeys: [.fileSizeKey])
+            guard let size = properties.fileSize, size >= 0, size <= 64 * 1024 * 1024 else {
+                throw ValidationError("metadata file exceeds size bound: \(name)")
+            }
             let handle = try FileHandle(forReadingFrom: directory.appendingPathComponent(name))
             defer { try? handle.close() }
             var digest = SHA256()
@@ -77,7 +82,7 @@ struct Qwen35AffineCheckpointValidation {
             }
         }
         if metadataHashes["model.safetensors.index.json"] != nil {
-            _ = try Qwen35AffineResearchManifest.validate(modelDirectory: directory,
+            _ = try Qwen35AffineResearchManifest.inspect(modelDirectory: directory,
                 selectedShards: shardNames.sorted().map { directory.appendingPathComponent($0) },
                 layerCount: text.hiddenLayers, numExperts: text.numExperts,
                 inputDims: text.hiddenSize, hiddenDims: text.moeIntermediateSize)
@@ -95,6 +100,7 @@ struct Qwen35AffineCheckpointValidation {
         self.directory = directory
         self.shards = shardNames.sorted()
         self.normConvention = text.normConvention
+        self.geometry = (text.hiddenLayers, text.numExperts, text.hiddenSize, text.moeIntermediateSize)
         self.resident = try Qwen35AffineResidentContract.capture(model: model, affine: [:],
             routed: Set(policies.keys.map { $0 + ".weight" }), tiedHead: text.tieWordEmbeddings,
             layerCount: text.hiddenLayers)
@@ -152,5 +158,39 @@ struct Qwen35AffineCheckpointValidation {
             }
         }
         try validate(weights: arrays, metadata: ["format": "mlx"])
+    }
+
+    enum DescriptorStatus { case requiresNormValueCheck }
+
+    /// Header-only, bounded inspection. It does not establish that norms need
+    /// no transform: that requires independently bounded value reads. It must
+    /// never be treated as model admission.
+    func validateSelectedDescriptors() throws -> DescriptorStatus {
+        guard !NormConventionResolver.usesPlusOne(normConvention) else {
+            throw ValidationError("checkpoint declares norm transformation")
+        }
+        let manifest = try Qwen35AffineResearchManifest.inspect(modelDirectory: directory,
+            selectedShards: shards.map { directory.appendingPathComponent($0) },
+            layerCount: geometry.layers, numExperts: geometry.experts,
+            inputDims: geometry.input, hiddenDims: geometry.hidden)
+        guard manifest.metadata.values.allSatisfy({ $0 == ["format": "mlx"] }) else {
+            throw ValidationError("unsupported shard metadata")
+        }
+        var residentTensors: [String: Qwen35AffineResidentContract.Tensor] = [:]
+        var routedTensors: [String: Qwen35AffineRoutedContract.Tensor] = [:]
+        for (key, value) in manifest.tensors {
+            if routedKeys.contains(key) {
+                routedTensors[key] = .init(shape: value.shape, dtype: value.dtype)
+            } else {
+                residentTensors[key] = .init(shape: value.shape, dtype: value.dtype)
+            }
+            if key.contains("conv1d.weight"),
+                value.shape.count != 3 || value.shape.last != 1 {
+                throw ValidationError("non-native convolution layout")
+            }
+        }
+        try resident.validate(residentTensors)
+        try routed.validate(routedTensors)
+        return .requiresNormValueCheck
     }
 }

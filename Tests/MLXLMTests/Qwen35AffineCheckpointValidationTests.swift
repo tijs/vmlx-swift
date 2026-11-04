@@ -135,6 +135,9 @@ struct Qwen35AffineCheckpointValidationTests {
             let validator = try Qwen35AffineCheckpointValidation(model: model(), bits: 4, groupSize: 64,
                 directory: root, shardNames: Set(names), metadataHashes: pins)
             try validator.validateSelectedFiles()
+            switch try validator.validateSelectedDescriptors() {
+            case .requiresNormValueCheck: break
+            }
             let configuration = try model().config
             let encoded = try JSONEncoder().encode(configuration)
             var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
@@ -169,6 +172,25 @@ struct Qwen35AffineCheckpointValidationTests {
             let badMetadata = try Qwen35AffineCheckpointValidation(model: model(), bits: 4, groupSize: 64,
                 directory: badRoot, shardNames: Set(names), metadataHashes: pins)
             #expect(throws: (any Error).self) { try badMetadata.validateSelectedFiles() }
+            #expect(throws: (any Error).self) { try badMetadata.validateSelectedDescriptors() }
+            let dtypeRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: dtypeRoot, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dtypeRoot) }
+            for name in names { try FileManager.default.copyItem(at: root.appendingPathComponent(name), to: dtypeRoot.appendingPathComponent(name)) }
+            try indexData.write(to: dtypeRoot.appendingPathComponent("model.safetensors.index.json"))
+            for name in names {
+                let url = dtypeRoot.appendingPathComponent(name)
+                let data = try Data(contentsOf: url)
+                let length = data.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
+                let end = 8 + Int(length)
+                let header = try #require(String(data: data.subdata(in: 8..<end), encoding: .utf8))
+                let replaced = header.replacingOccurrences(of: "\"U32\"", with: "\"F32\"")
+                var output = Data(data.prefix(8)); output.append(Data(replaced.utf8)); output.append(data.suffix(from: end))
+                try output.write(to: url)
+            }
+            let badDtype = try Qwen35AffineCheckpointValidation(model: model(), bits: 4, groupSize: 64,
+                directory: dtypeRoot, shardNames: Set(names), metadataHashes: pins)
+            #expect(throws: (any Error).self) { try badDtype.validateSelectedDescriptors() }
             #expect(throws: (any Error).self) {
                 try Qwen35AffineCheckpointValidation(model: model(), bits: 4, groupSize: 64,
                     directory: root, shardNames: Set(names), metadataHashes: ["model.safetensors.index.json": String(repeating: "0", count: 64)])

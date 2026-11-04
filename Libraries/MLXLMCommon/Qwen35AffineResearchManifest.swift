@@ -11,12 +11,38 @@ public enum Qwen35AffineResearchManifest {
         init(_ description: String) { self.description = description }
     }
 
+    public struct TensorDescriptor {
+        public let shard: String
+        public let dtype: String
+        public let shape: [Int]
+        public let byteOffset: UInt64
+        public let byteLength: UInt64
+    }
+    public struct Inspection {
+        public let tensors: [String: TensorDescriptor]
+        public let metadata: [String: [String: String]]
+    }
+
     /// Validates the exact selected shards and returns a separately configured
     /// catalog. No caller-owned catalog is mutated on failure.
     public static func validate(
         modelDirectory: URL, selectedShards: [URL], layerCount: Int,
         numExperts: Int, inputDims: Int, hiddenDims: Int
     ) throws -> AffineStreamingExpertCatalog {
+        _ = try inspect(modelDirectory: modelDirectory, selectedShards: selectedShards,
+            layerCount: layerCount, numExperts: numExperts, inputDims: inputDims, hiddenDims: hiddenDims)
+        let catalog = AffineStreamingExpertCatalog(
+            numExperts: numExperts, inputDims: inputDims, hiddenDims: hiddenDims, layout: .qwen35)
+        try catalog.configure(modelDirectory: modelDirectory, layerCount: layerCount)
+        return catalog
+    }
+
+    /// Reads only bounded index/header data; never maps or reads tensor payloads.
+    /// Offsets remain meaningful only while the caller keeps files immutable.
+    public static func inspect(
+        modelDirectory: URL, selectedShards: [URL], layerCount: Int,
+        numExperts: Int, inputDims: Int, hiddenDims: Int
+    ) throws -> Inspection {
         guard layerCount > 0, numExperts > 0, inputDims > 0, hiddenDims > 0 else {
             throw ValidationError("invalid geometry")
         }
@@ -57,6 +83,8 @@ public enum Qwen35AffineResearchManifest {
             throw ValidationError("selected shards do not match index")
         }
         var actual: [String: String] = [:]
+        var descriptors: [String: TensorDescriptor] = [:]
+        var metadata: [String: [String: String]] = [:]
         for (name, url) in selected {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
@@ -69,6 +97,12 @@ public enum Qwen35AffineResearchManifest {
                 let bytes = try handle.read(upToCount: Int(length)), bytes.count == Int(length)
             else { throw ValidationError("invalid shard header length: \(name)") }
             let header = try object(bytes, label: name)
+            if let raw = header["__metadata__"] {
+                guard let strings = raw as? [String: String] else {
+                    throw ValidationError("invalid shard metadata: \(name)")
+                }
+                metadata[name] = strings
+            } else { metadata[name] = [:] }
             let fileSize = try handle.seekToEnd()
             let dataStart = UInt64(8) + length // length is bounded above
             guard fileSize >= dataStart else { throw ValidationError("truncated shard: \(name)") }
@@ -82,12 +116,17 @@ public enum Qwen35AffineResearchManifest {
                     let start = unsignedInteger(offsets[0]), let end = unsignedInteger(offsets[1]),
                     start <= end, end <= fileSize - dataStart,
                     let byteCount = tensorByteCount(dtype: dtype, shape: shape),
+                    let alignment = tensorByteCount(dtype: dtype, shape: []),
+                    (dataStart + start) % alignment == 0,
                     byteCount == end - start
                 else { throw ValidationError("invalid tensor descriptor: \(name): \(key)") }
                 ranges.append((start, end))
                 guard actual.updateValue(name, forKey: key) == nil else {
                     throw ValidationError("duplicate tensor across shards: \(key)")
                 }
+                descriptors[key] = TensorDescriptor(shard: name, dtype: dtype,
+                    shape: shape.map { Int(unsignedInteger($0)!) },
+                    byteOffset: dataStart + start, byteLength: end - start)
             }
             ranges.sort { $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0 }
             var cursor: UInt64 = 0
@@ -116,10 +155,7 @@ public enum Qwen35AffineResearchManifest {
         // than guessing how they would be renamed by the model sanitizer.
         let routed = Set(actual.keys.filter { $0.split(separator: ".").contains("switch_mlp") })
         guard routed == expected else { throw ValidationError("routed tensor coverage or naming mismatch") }
-        let catalog = AffineStreamingExpertCatalog(
-            numExperts: numExperts, inputDims: inputDims, hiddenDims: hiddenDims, layout: .qwen35)
-        try catalog.configure(modelDirectory: root, layerCount: layerCount)
-        return catalog
+        return Inspection(tensors: descriptors, metadata: metadata)
     }
 
     /// Only byte-aligned safetensors types supported by this research path.
