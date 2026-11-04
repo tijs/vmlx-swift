@@ -145,5 +145,62 @@ struct Qwen35AffineResearchSnapshotTests {
         #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
     }
 
+    @Test("arena lease prevents disposal through failed drain and recovery")
+    func arenaLeaseQuarantine() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let source = root.appendingPathComponent("source")
+        let staging = root.appendingPathComponent("staging")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = Data("weight".utf8)
+        try data.write(to: source.appendingPathComponent("weights"))
+        let snapshot = try Qwen35AffineResearchSnapshot.create(source: source, stagingParent: staging,
+            files: ["weights": digest(data)], diskGate: { _, _ in })
+        let gate = ExperimentalRequestArenaGate()
+        do {
+            let _: Void = try gate.withRequest(operation: { arena in
+                try snapshot.retain(in: arena)
+                #expect(throws: Qwen35AffineResearchSnapshot.SnapshotError.self) { try snapshot.dispose() }
+                throw CancellationError()
+            }, drain: { _ in throw Failure.gate }, invalidate: { _ in })
+            Issue.record("failed drain accepted")
+        } catch let error as ExperimentalRequestArenaCleanupError {
+            #expect(error.primary is CancellationError)
+            #expect(error.cleanup is Failure)
+        }
+        #expect(throws: Qwen35AffineResearchSnapshot.SnapshotError.self) { try snapshot.dispose() }
+        try gate.recover(drain: { _ in
+            let stored = try Data(contentsOf: snapshot.directory.appendingPathComponent("weights"))
+            #expect(stored == data)
+        }, invalidate: { _ in
+            #expect(throws: Qwen35AffineResearchSnapshot.SnapshotError.self) { try snapshot.dispose() }
+        })
+        try snapshot.dispose()
+        #expect(!FileManager.default.fileExists(atPath: snapshot.directory.path))
+    }
+
+    @Test("registration into a sealed arena does not leak a snapshot lease")
+    func sealedArenaLease() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let source = root.appendingPathComponent("source")
+        let staging = root.appendingPathComponent("staging")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = Data("weight".utf8)
+        try data.write(to: source.appendingPathComponent("weights"))
+        let snapshot = try Qwen35AffineResearchSnapshot.create(source: source, stagingParent: staging,
+            files: ["weights": digest(data)], diskGate: { _, _ in })
+        var sealed: ExperimentalRequestArena?
+        let _: Void = try ExperimentalRequestArenaGate().withRequest(operation: { arena in
+            sealed = arena
+            return .finished(())
+        }, drain: { _ in }, invalidate: { _ in })
+        #expect(throws: ExperimentalRequestArenaError.sealed) { try snapshot.retain(in: try #require(sealed)) }
+        try snapshot.dispose()
+        #expect(throws: Qwen35AffineResearchSnapshot.SnapshotError.self) { try snapshot.retain(in: try #require(sealed)) }
+    }
+
 }
 #endif

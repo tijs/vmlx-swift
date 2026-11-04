@@ -29,6 +29,7 @@ public final class Qwen35AffineResearchSnapshot {
     public let directory: URL
     private let lock = NSLock()
     private var disposed = false
+    private var arenaLeases = 0
     private init(directory: URL) { self.directory = directory }
 
     /// `files` maps every required relative path to its independently pinned
@@ -127,11 +128,43 @@ public final class Qwen35AffineResearchSnapshot {
     }
     #endif
 
+    /// Keep this snapshot available while a request arena owns mappings. The
+    /// arena retains the lease through failed drains and invalidation. This
+    /// blocks `dispose()` only: it does not prevent mutation or path replacement
+    /// by another same-user process, or track aliases escaping the arena.
+    func retain(in arena: ExperimentalRequestArena) throws {
+        lock.lock()
+        guard !disposed, arenaLeases < Int.max else {
+            lock.unlock()
+            throw SnapshotError("snapshot disposed or lease count exhausted")
+        }
+        arenaLeases += 1
+        lock.unlock()
+        // If registration fails, deinit rolls back the reservation. The lease
+        // holds the snapshot strongly for the full arena/quarantine lifetime.
+        let lease = ArenaLease(snapshot: self)
+        try arena.retain(lease)
+    }
+
+    private final class ArenaLease {
+        let snapshot: Qwen35AffineResearchSnapshot
+        init(snapshot: Qwen35AffineResearchSnapshot) { self.snapshot = snapshot }
+        deinit { snapshot.releaseArenaLease() }
+    }
+
+    private func releaseArenaLease() {
+        lock.lock()
+        defer { lock.unlock() }
+        precondition(arenaLeases > 0)
+        arenaLeases -= 1
+    }
+
     /// Caller must first establish that no future use or mapping is possible.
     public func dispose() throws {
         lock.lock()
         defer { lock.unlock() }
         guard !disposed else { return }
+        guard arenaLeases == 0 else { throw SnapshotError("snapshot retained by an active or quarantined arena") }
         try FileManager.default.removeItem(at: directory)
         disposed = true
     }
