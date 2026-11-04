@@ -47,6 +47,7 @@
 //   No RAM doubling.
 
 import Foundation
+import CoreFoundation
 #if canImport(Darwin)
     import Darwin
 #elseif canImport(Glibc)
@@ -159,7 +160,7 @@ public final class JangPressShard: @unchecked Sendable {
             throw JangPressShardError.truncatedHeader(path)
         }
         let headerSize = baseAddress.load(as: UInt64.self).littleEndian
-        guard 8 + headerSize <= fileSize else {
+        guard headerSize <= fileSize - 8 else {
             munmap(raw, Int(fileSize))
             close(fdLocal)
             throw JangPressShardError.headerSizeOutOfBounds(path, declared: headerSize, fileSize: fileSize)
@@ -192,10 +193,15 @@ public final class JangPressShard: @unchecked Sendable {
                 let shape = Self.parseShape(entry["shape"]),
                 let offsets = entry["data_offsets"] as? [Any],
                 offsets.count == 2,
-                let startNum = (offsets[0] as? NSNumber)?.uint64Value,
-                let endNum = (offsets[1] as? NSNumber)?.uint64Value
+                let startNum = Self.unsignedInteger(offsets[0]),
+                let endNum = Self.unsignedInteger(offsets[1])
             else {
                 continue
+            }
+            guard startNum <= endNum, endNum <= fileSize - dataAreaStart else {
+                munmap(raw, Int(fileSize))
+                close(fdLocal)
+                throw JangPressShardError.malformedHeaderJSON(path, "tensor \(name) has out-of-bounds offsets")
             }
             byName[name] = TensorDescriptor(
                 name: name,
@@ -206,6 +212,14 @@ public final class JangPressShard: @unchecked Sendable {
             )
         }
         self.tensors = byName
+    }
+
+    private static func unsignedInteger(_ value: Any) -> UInt64? {
+        guard let number = value as? NSNumber,
+            CFGetTypeID(number) != CFBooleanGetTypeID(),
+            !["f", "d"].contains(String(cString: number.objCType))
+        else { return nil }
+        return UInt64(number.stringValue)
     }
 
     private static func parseShape(_ raw: Any?) -> [Int]? {
