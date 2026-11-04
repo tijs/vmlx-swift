@@ -17,6 +17,7 @@ public enum AffineStreamingExpertError: Error, CustomStringConvertible {
     case notConfigured
     case invalidExpert(layer: Int, expert: Int)
     case invalidInput(String)
+    case researchBusy
 
     public var description: String {
         switch self {
@@ -27,6 +28,7 @@ public enum AffineStreamingExpertError: Error, CustomStringConvertible {
             return "invalid affine routed tensor \(name): \(reason)"
         case .mmapFailed(let name): return "unable to mmap affine routed tensor region: \(name)"
         case .invalidInput(let reason): return "invalid affine routed input: \(reason)"
+        case .researchBusy: return "another affine streaming research call is active"
         case .notConfigured: return "affine routed expert catalog is not configured"
         case .invalidExpert(let layer, let expert):
             return "invalid routed expert \(expert) for layer \(layer)"
@@ -365,6 +367,9 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
 /// per layer. Each chunk is evaluated before returning so mappings from old
 /// routing decisions can be evicted and unpinned before the next layer runs.
 public final class AffineStreamingSwitchGLU: Module {
+    // Research calls share admission across all instances in this process.
+    // This bounds concurrent mapping activity, not total process memory.
+    private static let researchAdmission = NSLock()
     private struct CachedExpert {
         let arrays: AffineStreamingExpertCatalog.ExpertArrays
         var access: UInt64
@@ -501,26 +506,37 @@ public final class AffineStreamingSwitchGLU: Module {
 
     /// Experimental Qwen35-only reducer. It intentionally is not connected to
     /// model loading. Callers must handle validation or mapping failures.
-    /// cacheExpertLimit bounds mappings per layer, not global mapped bytes.
+    /// This path bypasses the per-layer expert cache and rejects overlapping calls.
+    /// Supply shouldCancel when work is dispatched outside the caller's Swift task.
     public func researchQwen35GroupedReduced(
         _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
-        tokenWindow: Int, observeWindow: ((Int, Int) -> Void)? = nil
+        tokenWindow: Int, shouldCancel: () -> Bool = { false },
+        observeWindow: ((Int, Int) -> Void)? = nil
     ) throws -> MLXArray {
+        if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
+        guard Self.researchAdmission.try() else { throw AffineStreamingExpertError.researchBusy }
+        defer { Self.researchAdmission.unlock() }
         #if canImport(ObjectiveC)
         return try autoreleasepool {
             try researchQwen35GroupedReducedImpl(x, indices: indices, scores: scores,
-                groupLimit: groupLimit, tokenWindow: tokenWindow, observeWindow: observeWindow)
+                groupLimit: groupLimit, tokenWindow: tokenWindow,
+                shouldCancel: shouldCancel, observeWindow: observeWindow)
         }
         #else
         return try researchQwen35GroupedReducedImpl(x, indices: indices, scores: scores,
-            groupLimit: groupLimit, tokenWindow: tokenWindow, observeWindow: observeWindow)
+            groupLimit: groupLimit, tokenWindow: tokenWindow,
+            shouldCancel: shouldCancel, observeWindow: observeWindow)
         #endif
     }
 
     private func researchQwen35GroupedReducedImpl(
         _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
-        tokenWindow: Int, observeWindow: ((Int, Int) -> Void)?
+        tokenWindow: Int, shouldCancel: () -> Bool, observeWindow: ((Int, Int) -> Void)?
     ) throws -> MLXArray {
+        func checkCancellation() throws {
+            if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
+        }
+        try checkCancellation()
         guard catalog.layout == .qwen35 else {
             throw AffineStreamingExpertError.invalidInput("Qwen35 layout required")
         }
@@ -544,6 +560,7 @@ public final class AffineStreamingSwitchGLU: Module {
         var outputs: [MLXArray] = []
         var tokenStart = 0
         while tokenStart < totalTokens {
+            try checkCancellation()
             let tokenEnd = tokenStart + min(tokenWindow, totalTokens - tokenStart)
             func reduceWindow() throws -> MLXArray {
                 let windowIndices = indicesFlat[tokenStart ..< tokenEnd, 0...]
@@ -560,12 +577,16 @@ public final class AffineStreamingSwitchGLU: Module {
                 var paddedRows = 0
                 var start = 0
                 while start < routes {
+                    try checkCancellation()
                     let expertID = Int(sortedIDs[start])
                     var end = start + 1
                     while end < routes && sortedIDs[end] == sortedIDs[start] { end += 1 }
-                    let mapped = try cachedExpert(expertID)
+                    // Avoid per-layer persistent mappings and concurrent duplicate
+                    // cache misses in this experimental process-wide lease.
+                    let mapped = try catalog.loadExpert(layer: layerIndex, expert: expertID)
                     var offset = start
                     while offset < end {
+                        try checkCancellation()
                         let stop = offset + min(groupLimit, end - offset)
                         let count = stop - offset
                         let padded = useRHS ? max(count, 16) : count
@@ -610,6 +631,7 @@ public final class AffineStreamingSwitchGLU: Module {
                 let output = (routed * windowScores.asType(routed.dtype)[.ellipsis, .newAxis])
                     .sum(axis: -2)
                 MLX.eval(output)
+                try checkCancellation()
                 return output
             }
             #if canImport(ObjectiveC)
@@ -620,7 +642,11 @@ public final class AffineStreamingSwitchGLU: Module {
             outputs.append(output)
             tokenStart = tokenEnd
         }
-        return concatenated(outputs, axis: 0).reshaped(x.shape)
+        try checkCancellation()
+        let result = concatenated(outputs, axis: 0).reshaped(x.shape)
+        MLX.eval(result)
+        try checkCancellation()
+        return result
     }
 
     private func expert(_ index: Int) -> AffineStreamingExpertCatalog.ExpertArrays {
@@ -654,9 +680,10 @@ public final class AffineStreamingSwitchGLU: Module {
             cache.removeValue(forKey: victim)
         }
         let count = cache.count
+        let loggedAccess = accessClock
         lock.unlock()
 
-        if accessClock == 2 || accessClock % 256 == 0 {
+        if loggedAccess == 2 || loggedAccess % 256 == 0 {
             FileHandle.standardError.write(Data(
                 "[Qwen4AffineExperts] layer=\(layerIndex) mapped_expert=\(index) cache=\(count)/\(cacheExpertLimit) backend=exact-mmap-region mode=affine\n".utf8))
         }
