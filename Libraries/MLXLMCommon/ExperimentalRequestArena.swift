@@ -65,7 +65,9 @@ public final class ExperimentalRequestArenaGate: @unchecked Sendable {
     public static let shared = ExperimentalRequestArenaGate()
     private let lock = NSLock()
     private var quarantine: ExperimentalRequestArena?
-    private init() {}
+    // Internal construction permits isolated tests; external research callers
+    // use the process-lifetime shared owner.
+    init() {}
 
     public func withRequest<T>(
         operation: (ExperimentalRequestArena) throws -> ExperimentalRequestArenaCompletion<T>,

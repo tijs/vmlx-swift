@@ -1451,6 +1451,15 @@ public struct ExperimentalPrefillCleanupError: Error {
     public let drain: any Error
 }
 
+/// Reference owner retained by the research request arena during decode.
+/// Callers must use it only while the associated request is admitted, never
+/// concurrently, and must not reuse an escaped reference after cleanup.
+public final class ExperimentalArenaTokenIterator {
+    private var iterator: ExperimentalThrowingTokenIterator
+    fileprivate init(_ iterator: ExperimentalThrowingTokenIterator) { self.iterator = iterator }
+    public func nextToken() throws -> Int? { try iterator.nextToken() }
+}
+
 /// Adapts a prepared TokenIterator to a throwing eager decode forward. The
 /// caller must not reuse other copies of the iterator or its mutable caches.
 /// The factory below supports a separate text-only prefill; existing prefill,
@@ -1487,6 +1496,33 @@ public struct ExperimentalThrowingTokenIterator: ExperimentalThrowingTokenSource
             maxTokens: maxTokens, experimentalPrepare: prepare, experimentalForward: forward,
             discardOnFailure: discardOnFailure)
         return ExperimentalThrowingTokenIterator(iterator: iterator, forward: forward)
+    }
+
+    /// Research-only construction inside an admitted request arena. The arena
+    /// retains the model, input and freshly created caches before prefill.
+    /// The caller must route all success and failure cleanup through the arena
+    /// gate, including draining every submitted stream and resetting model state.
+    /// This does not retain unregistered MLX temporaries, prevent aliases, or
+    /// guard other serving paths; it is not a production integration.
+    /// The returned iterator owner is also retained by the arena. Callers must
+    /// use it exclusively within the admitted operation, with no escaped use
+    /// after cleanup. `newCache` must not submit asynchronous GPU work before
+    /// returning: its caches are registered only after that call completes.
+    public static func experimentalArenaTextPrefill(
+        input: LMInput, model: any LanguageModel, arena: ExperimentalRequestArena,
+        processor: LogitProcessor?, sampler: LogitSampler, prefillStepSize: Int = 512,
+        maxTokens: Int? = nil,
+        prepare: (LMInput, [KVCache], Int) throws -> PrepareResult,
+        forward: @escaping (LMInput.Text, [KVCache]?, LMOutput.State?) throws -> LMOutput
+    ) throws -> ExperimentalArenaTokenIterator {
+        let iterator = try TokenIterator(experimentalInput: input, model: model,
+            processor: processor, sampler: sampler, prefillStepSize: prefillStepSize,
+            maxTokens: maxTokens, experimentalPrepare: prepare, experimentalForward: forward,
+            discardOnFailure: {}, arena: arena)
+        let owner = ExperimentalArenaTokenIterator(
+            ExperimentalThrowingTokenIterator(iterator: iterator, forward: forward))
+        try arena.retain(owner)
+        return owner
     }
 
     public mutating func nextToken() throws -> Int? {
@@ -2558,13 +2594,25 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// On error, that stream is drained and `discardOnFailure` must reset any
     /// model-owned per-request state. Existing model `prepare` is not assumed
     /// to be fallible internally; the caller supplies a genuinely throwing one.
+    private final class ExperimentalPrefillResources {
+        let model: any LanguageModel
+        let input: LMInput
+        let cache: [KVCache]
+        init(model: any LanguageModel, input: LMInput, cache: [KVCache]) {
+            self.model = model
+            self.input = input
+            self.cache = cache
+        }
+    }
+
     fileprivate init(
         experimentalInput input: LMInput, model: any LanguageModel,
         processor: LogitProcessor?, sampler: LogitSampler, prefillStepSize: Int = 512,
         maxTokens: Int? = nil,
         experimentalPrepare: (LMInput, [KVCache], Int) throws -> PrepareResult,
         experimentalForward: (LMInput.Text, [KVCache]?, LMOutput.State?) throws -> LMOutput,
-        discardOnFailure: () -> Void
+        discardOnFailure: () -> Void,
+        arena: ExperimentalRequestArena? = nil
     ) throws {
         guard !input.hasMediaContent, input.text.tokens.size > 0, prefillStepSize > 0,
             input.text.tokens.ndim == 1 || (input.text.tokens.ndim == 2 && input.text.tokens.dim(0) == 1),
@@ -2590,6 +2638,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.cacheInitParameters = nil
         self.mediaSalt = nil
 
+        // Register before calling either fallible operation. The arena must be
+        // owned by an active gate; registration rejects an already sealed arena.
+        if let arena {
+            try arena.retain(ExperimentalPrefillResources(model: model, input: input, cache: cache))
+        }
         do {
             self.promptPrefillTime = try measure {
                 try Task.checkCancellation()
@@ -2620,6 +2673,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
         } catch {
             let primary = error
+            // The arena gate owns drain and invalidation for this path. It
+            // retains registered resources even if that drain fails.
+            if arena != nil { throw primary }
             var drainFailure: (any Error)?
             do {
                 try MLX.withError { StreamOrDevice.default.stream.synchronize() }

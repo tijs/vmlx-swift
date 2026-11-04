@@ -15,7 +15,7 @@ struct ExperimentalRequestArenaTests {
 
     @Test("failed drain quarantines resources through failed and successful recovery")
     func failedDrain() throws {
-        let gate = ExperimentalRequestArenaGate.shared
+        let gate = ExperimentalRequestArenaGate()
         var destroyed = false
         var invalidated = false
         do {
@@ -52,7 +52,7 @@ struct ExperimentalRequestArenaTests {
 
     @Test("failed invalidation quarantines even after a successful drain")
     func failedInvalidation() throws {
-        let gate = ExperimentalRequestArenaGate.shared
+        let gate = ExperimentalRequestArenaGate()
         var destroyed = false
         do {
             let _: Int = try gate.withRequest(
@@ -70,7 +70,7 @@ struct ExperimentalRequestArenaTests {
 
     @Test("request and recovery reject reentry while admitted")
     func reentry() throws {
-        let gate = ExperimentalRequestArenaGate.shared
+        let gate = ExperimentalRequestArenaGate()
         _ = try gate.withRequest(operation: { _ in
             #expect(throws: ExperimentalRequestArenaError.busy) {
                 try gate.withRequest(operation: { _ in .finished(1) }, drain: { _ in }, invalidate: { _ in })
@@ -84,7 +84,7 @@ struct ExperimentalRequestArenaTests {
     @Test("early stop invalidates before returning its partial value")
     func earlyStop() throws {
         var events: [String] = []
-        let value = try ExperimentalRequestArenaGate.shared.withRequest(
+        let value = try ExperimentalRequestArenaGate().withRequest(
             operation: { _ in events.append("operation"); return .cancelled(4) },
             drain: { _ in events.append("drain") },
             invalidate: { _ in events.append("invalidate") })
@@ -95,7 +95,7 @@ struct ExperimentalRequestArenaTests {
     @Test("registration is sealed before cleanup and after escape")
     func sealed() throws {
         var escaped: ExperimentalRequestArena?
-        _ = try ExperimentalRequestArenaGate.shared.withRequest(
+        _ = try ExperimentalRequestArenaGate().withRequest(
             operation: { arena in escaped = arena; return .finished(1) },
             drain: { arena in
                 #expect(throws: ExperimentalRequestArenaError.sealed) {
@@ -127,7 +127,7 @@ struct ExperimentalRequestArenaTests {
 
     @Test("another thread cannot enter or recover during a request")
     func contention() throws {
-        let gate = ExperimentalRequestArenaGate.shared
+        let gate = ExperimentalRequestArenaGate()
         let state = Coordination()
         DispatchQueue.global().async {
             defer { state.done.signal() }
