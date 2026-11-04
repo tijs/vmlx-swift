@@ -1430,6 +1430,73 @@ public struct CompositeLogitProcessor: LogitProcessor {
     }
 }
 
+/// An opt-in experimental source for raw tokens whose creation or next step
+/// can fail. This is intentionally separate from `TokenIteratorProtocol`:
+/// it does not imply the existing model, parser or generation paths throw.
+public protocol ExperimentalThrowingTokenSource {
+    mutating func nextToken() throws -> Int?
+}
+
+/// The outcome passed to the experimental producer's cleanup callback.
+public enum ExperimentalTokenProducerOutcome: Sendable, Equatable {
+    case finished
+    case cancelled
+    case failed
+}
+
+/// Runs an experimental fallible raw-token source without converting failures
+/// into successful completion or cancellation. It does not parse tokens,
+/// interpret stop IDs, store caches, or implement the normal generation API.
+///
+/// This research-only stream is unbounded: a slow or absent consumer can
+/// accumulate tokens. It is not suitable for a production serving path.
+/// Cancellation is checked before construction and before and after each
+/// synchronous step. An error thrown by a step is reported as failure even
+/// if cancellation was requested while that step was running; a cancellation
+/// racing with normal completion after the last check may lose to completion.
+///
+/// The synchronous `cleanup` callback runs exactly once after the producer
+/// stops and before the producer finishes the stream. A consumer-cancelled
+/// stream can terminate before cleanup. The callback must discard partial state on
+/// `.failed`/`.cancelled` and drain any owned asynchronous work. A consumer
+/// that stops early must explicitly cancel the returned task and await it
+/// before releasing the source's resources; simply breaking from iteration
+/// does not promise to stop the producer. Stream cancellation can be observed
+/// before an in-progress synchronous `nextToken()` has returned.
+public func experimentalThrowingTokenTask(
+    makeSource: @escaping @Sendable () throws -> any ExperimentalThrowingTokenSource,
+    cleanup: @escaping @Sendable (ExperimentalTokenProducerOutcome) -> Void
+) -> (AsyncThrowingStream<Int, Error>, Task<Void, Never>) {
+    let (stream, continuation) = AsyncThrowingStream<Int, Error>.makeStream()
+    let task = Task {
+        do {
+            try Task.checkCancellation()
+            var source = try makeSource()
+            while true {
+                try Task.checkCancellation()
+                let token = try source.nextToken()
+                try Task.checkCancellation()
+                guard let token else { break }
+                if case .terminated = continuation.yield(token) {
+                    throw CancellationError()
+                }
+            }
+            cleanup(.finished)
+            continuation.finish()
+        } catch is CancellationError {
+            cleanup(.cancelled)
+            continuation.finish(throwing: CancellationError())
+        } catch {
+            cleanup(.failed)
+            continuation.finish(throwing: error)
+        }
+    }
+    continuation.onTermination = { termination in
+        if case .cancelled = termination { task.cancel() }
+    }
+    return (stream, task)
+}
+
 /// Common properties shared by token-generating iterators.
 public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
     var maxTokens: Int? { get }
