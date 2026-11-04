@@ -214,6 +214,27 @@ public final class Stream: @unchecked Sendable, Equatable {
         }
     }
 
+    /// Experimental synchronous drain of this exact stream. MLX errors
+    /// reported on the calling thread are converted to Swift errors; a nonzero
+    /// status without a callback is also rejected. A successful return only
+    /// establishes the guarantees provided by MLX's stream synchronization.
+    /// Call from a control thread, never from an MLX scheduler or Metal worker
+    /// callback. Stop all producers before draining and synchronize every
+    /// stream that may contain work; this call drains only this stream and
+    /// does not prevent further submission.
+    public func experimentalSynchronize() throws {
+        try experimentalSynchronize(using: {
+            evalLock.withLock { mlx_synchronize(ctx) }
+        })
+    }
+
+    /// Internal injection permits testing status/throw behavior without
+    /// replacing the global MLX error handler or running GPU work.
+    func experimentalSynchronize(using synchronize: () throws -> Int32) throws {
+        let status = try withError { try synchronize() }
+        guard status == 0 else { throw ExperimentalStreamDrainError.nonzeroStatus(status) }
+    }
+
     static public func defaultStream(_ device: Device) -> Stream {
         switch device.deviceType {
         case .cpu: .cpu
@@ -225,6 +246,10 @@ public final class Stream: @unchecked Sendable, Equatable {
     public static func == (lhs: Stream, rhs: Stream) -> Bool {
         mlx_stream_equal(lhs.ctx, rhs.ctx)
     }
+}
+
+public enum ExperimentalStreamDrainError: Error, Sendable, Equatable {
+    case nonzeroStatus(Int32)
 }
 
 extension Stream: CustomStringConvertible {
