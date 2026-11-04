@@ -216,19 +216,22 @@ struct Qwen35AffineCheckpointValidation {
     /// no transform: that requires independently bounded value reads. It must
     /// never be treated as model admission.
     func validateSelectedDescriptors() throws -> DescriptorStatus {
-        guard !NormConventionResolver.usesPlusOne(normConvention) else {
-            throw ValidationError("checkpoint declares norm transformation")
-        }
+        _ = try checkedSelectedDescriptors(shouldCancel: { false })
+        return .requiresNormValueCheck
+    }
+
+    private func checkedSelectedDescriptors(shouldCancel: () -> Bool) throws -> Qwen35AffineResearchManifest.Inspection {
         let manifest = try Qwen35AffineResearchManifest.inspect(modelDirectory: directory,
             selectedShards: shards.map { directory.appendingPathComponent($0) },
             layerCount: geometry.layers, numExperts: geometry.experts,
-            inputDims: geometry.input, hiddenDims: geometry.hidden)
+            inputDims: geometry.input, hiddenDims: geometry.hidden, shouldCancel: shouldCancel)
         guard manifest.metadata.values.allSatisfy({ $0 == ["format": "mlx"] }) else {
             throw ValidationError("unsupported shard metadata")
         }
         var residentTensors: [String: Qwen35AffineResidentContract.Tensor] = [:]
         var routedTensors: [String: Qwen35AffineRoutedContract.Tensor] = [:]
         for (key, value) in manifest.tensors {
+            if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
             if routedKeys.contains(key) {
                 routedTensors[key] = .init(shape: value.shape, dtype: value.dtype)
             } else {
@@ -248,6 +251,14 @@ struct Qwen35AffineCheckpointValidation {
                 throw ValidationError("unsupported quantized gate dtype: \(path)")
             }
         }
-        return .requiresNormValueCheck
+        return manifest
+    }
+
+    /// CPU-only bounded value reads, after descriptor validation. This remains
+    /// research evidence, not a loader admission or file-immutability proof.
+    func requiresNormShift(shouldCancel: () -> Bool = { false }) throws -> Bool {
+        let manifest = try checkedSelectedDescriptors(shouldCancel: shouldCancel)
+        return try Qwen35NormHeaderCheck.requiresShift(inspection: manifest,
+            modelDirectory: directory, configConvention: normConvention, shouldCancel: shouldCancel)
     }
 }

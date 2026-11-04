@@ -41,8 +41,13 @@ public enum Qwen35AffineResearchManifest {
     /// Offsets remain meaningful only while the caller keeps files immutable.
     public static func inspect(
         modelDirectory: URL, selectedShards: [URL], layerCount: Int,
-        numExperts: Int, inputDims: Int, hiddenDims: Int
+        numExperts: Int, inputDims: Int, hiddenDims: Int,
+        shouldCancel: () -> Bool = { false }
     ) throws -> Inspection {
+        func checkCancellation() throws {
+            if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
+        }
+        try checkCancellation()
         guard layerCount > 0, numExperts > 0, inputDims > 0, hiddenDims > 0 else {
             throw ValidationError("invalid geometry")
         }
@@ -61,12 +66,13 @@ public enum Qwen35AffineResearchManifest {
         guard indexData.count <= 64 * 1024 * 1024 else {
             throw ValidationError("index exceeds size limit")
         }
-        let index = try object(indexData, label: "index")
+        let index = try object(indexData, label: "index", shouldCancel: shouldCancel)
         guard let weightMap = index["weight_map"] as? [String: String] else {
             throw ValidationError("invalid weight_map")
         }
         var selected: [String: URL] = [:]
         for shard in selectedShards {
+            try checkCancellation()
             let url = shard.resolvingSymlinksInPath().standardizedFileURL
             guard url.path.hasPrefix(root.path + "/") else {
                 throw ValidationError("selected shard escapes model directory")
@@ -86,6 +92,7 @@ public enum Qwen35AffineResearchManifest {
         var descriptors: [String: TensorDescriptor] = [:]
         var metadata: [String: [String: String]] = [:]
         for (name, url) in selected {
+            try checkCancellation()
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             guard let prefix = try handle.read(upToCount: 8), prefix.count == 8 else {
@@ -96,7 +103,7 @@ public enum Qwen35AffineResearchManifest {
             guard length > 0, length <= 64 * 1024 * 1024,
                 let bytes = try handle.read(upToCount: Int(length)), bytes.count == Int(length)
             else { throw ValidationError("invalid shard header length: \(name)") }
-            let header = try object(bytes, label: name)
+            let header = try object(bytes, label: name, shouldCancel: shouldCancel)
             if let raw = header["__metadata__"] {
                 guard let strings = raw as? [String: String] else {
                     throw ValidationError("invalid shard metadata: \(name)")
@@ -108,6 +115,7 @@ public enum Qwen35AffineResearchManifest {
             guard fileSize >= dataStart else { throw ValidationError("truncated shard: \(name)") }
             var ranges: [(UInt64, UInt64)] = []
             for (key, value) in header where key != "__metadata__" {
+                try checkCancellation()
                 guard let descriptor = value as? [String: Any],
                     let dtype = descriptor["dtype"] as? String,
                     let shape = descriptor["shape"] as? [Any],
@@ -145,6 +153,7 @@ public enum Qwen35AffineResearchManifest {
         }
         var expected = Set<String>()
         for layer in 0..<layerCount {
+            try checkCancellation()
             for projection in ["gate_proj", "up_proj", "down_proj"] {
                 for suffix in ["weight", "scales", "biases"] {
                     expected.insert("language_model.model.layers.\(layer).mlp.switch_mlp.\(projection).\(suffix)")
@@ -155,6 +164,7 @@ public enum Qwen35AffineResearchManifest {
         // than guessing how they would be renamed by the model sanitizer.
         let routed = Set(actual.keys.filter { $0.split(separator: ".").contains("switch_mlp") })
         guard routed == expected else { throw ValidationError("routed tensor coverage or naming mismatch") }
+        try checkCancellation()
         return Inspection(tensors: descriptors, metadata: metadata)
     }
 
@@ -193,14 +203,17 @@ public enum Qwen35AffineResearchManifest {
 
     // JSONSerialization collapses duplicate keys. Validate duplicate object
     // members first, including escaped-equivalent keys, at every nesting level.
-    private static func object(_ data: Data, label: String) throws -> [String: Any] {
+    private static func object(_ data: Data, label: String, shouldCancel: () -> Bool = { false }) throws -> [String: Any] {
+        if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
         guard let value = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ValidationError("invalid JSON object: \(label)")
         }
+        if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
         let bytes = Array(data)
         var objectKeys: [Set<String>?] = []
         var i = 0
         while i < bytes.count {
+            if i % 65536 == 0 && (shouldCancel() || Task<Never, Never>.isCancelled) { throw CancellationError() }
             switch bytes[i] {
             case 123: objectKeys.append([]); i += 1
             case 91: objectKeys.append(nil); i += 1
@@ -209,6 +222,7 @@ public enum Qwen35AffineResearchManifest {
                 let start = i
                 i += 1
                 while i < bytes.count {
+                    if i % 65536 == 0 && (shouldCancel() || Task<Never, Never>.isCancelled) { throw CancellationError() }
                     if bytes[i] == 92 { i += 2; continue }
                     if bytes[i] == 34 { i += 1; break }
                     i += 1
