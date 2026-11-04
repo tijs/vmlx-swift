@@ -55,7 +55,15 @@ public struct Qwen35AffineResidentContract {
 
     /// Capture is intended only for a freshly constructed Qwen35, before any
     /// update. The affine policy must resolve only to native Linear/Embedding.
-    public static func capture(model: Module, affine: [String: Affine], routed: Set<String>, tiedHead: Bool) throws -> Self {
+    public static func capture(model: Module, affine: [String: Affine], routed: Set<String>, tiedHead: Bool, layerCount: Int) throws -> Self {
+        guard layerCount > 0 else { throw ContractError("invalid layer count") }
+        var expectedRouted = Set<String>()
+        for layer in 0..<layerCount {
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                expectedRouted.insert("language_model.model.layers.\(layer).mlp.switch_mlp.\(projection).weight")
+            }
+        }
+        guard routed == expectedRouted else { throw ContractError("incomplete routed layer coverage") }
         let parameters = model.parameters().flattened()
         let expected = try uniqueEntries(parameters.map { ($0.0, $0.1.shape) })
         let leaves = try uniqueEntries(model.leafModules().flattened())
