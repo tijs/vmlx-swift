@@ -21,6 +21,7 @@ struct Qwen35AffineCheckpointValidation {
     private let shards: [String]
     private let normConvention: String?
     private let geometry: (layers: Int, experts: Int, input: Int, hidden: Int)
+    private let quantizedGates: Set<String>
 
     init(model: Qwen35, bits: Int, groupSize: Int, directory: URL, shardNames: Set<String>,
          metadataHashes: [String: String] = [:]) throws {
@@ -62,6 +63,7 @@ struct Qwen35AffineCheckpointValidation {
                 throw ValidationError("metadata SHA-256 mismatch: \(name)")
             }
         }
+        var mixedOverrides: Set<String> = []
         if metadataHashes["config.json"] != nil {
             let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
             let decoded = try JSONDecoder().decode(Qwen35Configuration.self, from: data)
@@ -71,18 +73,47 @@ struct Qwen35AffineCheckpointValidation {
                 throw ValidationError("checkpoint config differs from model")
             }
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                (json["quantization"] == nil) != (json["quantization_config"] == nil),
-                let quant = (json["quantization"] ?? json["quantization_config"]) as? [String: Any],
-                Set(quant.keys).isSubset(of: ["bits", "group_size", "mode"])
+                let quant = (json["quantization"] ?? json["quantization_config"]) as? [String: Any]
             else { throw ValidationError("unsupported config quantization declaration") }
-            let quantData = try JSONSerialization.data(withJSONObject: quant)
+            if json["quantization"] != nil && json["quantization_config"] != nil {
+                guard let left = json["quantization"] as? [String: Any],
+                    let right = json["quantization_config"] as? [String: Any],
+                    (left as NSDictionary).isEqual(right as NSDictionary) else {
+                    throw ValidationError("conflicting config quantization declarations")
+                }
+            }
+            let defaults = quant.filter { ["bits", "group_size", "mode"].contains($0.key) }
+            let quantData = try JSONSerialization.data(withJSONObject: defaults)
             let declared = try JSONDecoder().decode(BaseConfiguration.Quantization.self, from: quantData)
             guard declared.bits == bits, declared.groupSize == groupSize, declared.mode == .affine else {
                 throw ValidationError("config quantization differs from pinned policy")
             }
+            mixedOverrides = Set(quant.keys).subtracting(["bits", "group_size", "mode"])
+            if !mixedOverrides.isEmpty {
+                var expected = Set<String>()
+                for layer in 0..<text.hiddenLayers {
+                    expected.insert("language_model.model.layers.\(layer).mlp.gate")
+                    expected.insert("language_model.model.layers.\(layer).mlp.shared_expert_gate")
+                }
+                guard bits == 4, groupSize == 64, mixedOverrides == expected else {
+                    throw ValidationError("unsupported mixed affine policy coverage")
+                }
+                for path in expected {
+                    guard let override = quant[path] as? [String: Any],
+                        Set(override.keys).isSubset(of: ["bits", "group_size", "mode"]) else {
+                        throw ValidationError("unsupported affine override: \(path)")
+                    }
+                    let overrideData = try JSONSerialization.data(withJSONObject: override)
+                    let value = try JSONDecoder().decode(BaseConfiguration.Quantization.self, from: overrideData)
+                    guard value.bits == 8, value.groupSize == 64, value.mode == .affine else {
+                        throw ValidationError("unsupported affine override: \(path)")
+                    }
+                }
+            }
         }
+        var inspection: Qwen35AffineResearchManifest.Inspection?
         if metadataHashes["model.safetensors.index.json"] != nil {
-            _ = try Qwen35AffineResearchManifest.inspect(modelDirectory: directory,
+            inspection = try Qwen35AffineResearchManifest.inspect(modelDirectory: directory,
                 selectedShards: shardNames.sorted().map { directory.appendingPathComponent($0) },
                 layerCount: text.hiddenLayers, numExperts: text.numExperts,
                 inputDims: text.hiddenSize, hiddenDims: text.moeIntermediateSize)
@@ -101,7 +132,19 @@ struct Qwen35AffineCheckpointValidation {
         self.shards = shardNames.sorted()
         self.normConvention = text.normConvention
         self.geometry = (text.hiddenLayers, text.numExperts, text.hiddenSize, text.moeIntermediateSize)
-        self.resident = try Qwen35AffineResidentContract.capture(model: model, affine: [:],
+        self.quantizedGates = mixedOverrides
+        var residentPolicies: [String: Qwen35AffineResidentContract.Affine] = [:]
+        if !mixedOverrides.isEmpty {
+            guard let inspection else { throw ValidationError("mixed policy requires indexed descriptors") }
+            for key in inspection.tensors.keys where key.hasSuffix(".scales") && !names.contains(key) {
+                let path = String(key.dropLast(".scales".count))
+                residentPolicies[path] = .init(bits: mixedOverrides.contains(path) ? 8 : bits, groupSize: groupSize)
+            }
+            guard mixedOverrides.isSubset(of: Set(residentPolicies.keys)) else {
+                throw ValidationError("missing quantized router or shared expert gate")
+            }
+        }
+        self.resident = try Qwen35AffineResidentContract.capture(model: model, affine: residentPolicies,
             routed: Set(policies.keys.map { $0 + ".weight" }), tiedHead: text.tieWordEmbeddings,
             layerCount: text.hiddenLayers)
         self.routed = try Qwen35AffineRoutedContract.capture(model: model, layerCount: text.hiddenLayers,
@@ -133,6 +176,13 @@ struct Qwen35AffineCheckpointValidation {
         }
         try resident.validate(residentTensors)
         try routed.validate(routedTensors)
+        for path in quantizedGates {
+            guard residentTensors[path + ".weight"]?.dtype == "U32",
+                residentTensors[path + ".scales"]?.dtype == "BF16",
+                residentTensors[path + ".biases"]?.dtype == "BF16" else {
+                throw ValidationError("unsupported quantized gate dtype: \(path)")
+            }
+        }
         guard weights.allSatisfy({ key, value in
             !key.contains("conv1d.weight") || (value.ndim == 3 && value.dim(-1) == 1)
         }) else { throw ValidationError("non-native convolution layout") }
@@ -191,6 +241,13 @@ struct Qwen35AffineCheckpointValidation {
         }
         try resident.validate(residentTensors)
         try routed.validate(routedTensors)
+        for path in quantizedGates {
+            guard residentTensors[path + ".weight"]?.dtype == "U32",
+                residentTensors[path + ".scales"]?.dtype == "BF16",
+                residentTensors[path + ".biases"]?.dtype == "BF16" else {
+                throw ValidationError("unsupported quantized gate dtype: \(path)")
+            }
+        }
         return .requiresNormValueCheck
     }
 }
