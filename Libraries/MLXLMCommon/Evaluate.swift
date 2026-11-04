@@ -1437,6 +1437,29 @@ public protocol ExperimentalThrowingTokenSource {
     mutating func nextToken() throws -> Int?
 }
 
+public enum ExperimentalDecodeError: Error, Sendable, Equatable {
+    case compiledDecodeUnsupported
+    case invalidated
+}
+
+/// Adapts a prepared TokenIterator to a throwing eager decode forward. The
+/// caller must not reuse other copies of the iterator or its mutable caches.
+/// This does not make prefill, replay or existing generation APIs fallible.
+public struct ExperimentalThrowingTokenIterator: ExperimentalThrowingTokenSource {
+    private var iterator: TokenIterator
+    private let forward: (LMInput.Text, [KVCache]?, LMOutput.State?) throws -> LMOutput
+
+    public init(iterator: TokenIterator,
+                forward: @escaping (LMInput.Text, [KVCache]?, LMOutput.State?) throws -> LMOutput) {
+        self.iterator = iterator
+        self.forward = forward
+    }
+
+    public mutating func nextToken() throws -> Int? {
+        try iterator.experimentalNextToken(forward: forward)
+    }
+}
+
 /// The outcome passed to the experimental producer's cleanup callback.
 public enum ExperimentalTokenProducerOutcome: Sendable, Equatable {
     case finished
@@ -1691,6 +1714,7 @@ func populatedCacheRequiresResetAfterCoordinatorMiss(_ cache: [KVCache]) -> Bool
 public struct TokenIterator: TokenIteratorProtocol {
 
     private static let logger = Logger(subsystem: "vmlx", category: "TokenIterator")
+    private var experimentalDecodeFailed = false
 
     private static func compiledDecodeDenied(for model: any LanguageModel) -> Bool {
         guard model.supportsWholeForwardCompilation else { return true }
@@ -3275,6 +3299,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating public func next() -> Int? {
+        // The nonthrowing legacy interface cannot report a failed experimental
+        // forward. Stop rather than continue with its partially mutated cache;
+        // production callers must use a throwing channel to report the error.
+        guard !experimentalDecodeFailed else { return nil }
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
@@ -3303,11 +3331,51 @@ public struct TokenIterator: TokenIteratorProtocol {
         return forwardedToken
     }
 
+    /// Experimental eager decode bridge for a fallible model forward. Prefill
+    /// and iterator construction still use the existing model API. The caller
+    /// must own this iterator and its caches exclusively, discard them on any
+    /// error, and drain its compute stream before releasing request resources.
+    /// Compiled decode and reuse of a failed iterator are explicitly rejected.
+    mutating func experimentalNextToken(
+        forward: (LMInput.Text, [KVCache]?, LMOutput.State?) throws -> LMOutput
+    ) throws -> Int? {
+        guard !experimentalDecodeFailed else { throw ExperimentalDecodeError.invalidated }
+        guard compiledForward == nil else {
+            // Unsupported compilation fails closed: the iterator and all
+            // shared cache aliases must be discarded, never persisted.
+            experimentalDecodeFailed = true
+            throw ExperimentalDecodeError.compiledDecodeUnsupported
+        }
+        do {
+            try Task.checkCancellation()
+            if let maxTokens, tokenCount >= maxTokens { return nil }
+            let previous = y
+            let input: LMInput.Text = previous.tokens.ndim == 1 ? previous[text: .newAxis] : previous
+            let result = try forward(input, cache.isEmpty ? nil : cache, state)
+            try Task.checkCancellation()
+            state = result.state
+            if shouldQuantizeAfterStep { maybeQuantizeCacheForStep() }
+            let token = convertToToken(logits: result.logits)
+            y = .init(tokens: token)
+            asyncEval(token)
+            tokenCount += 1
+            if tokenCount % 256 == 0 { Memory.clearCache() }
+            let forwardedToken = previous.tokens.item(Int.self)
+            try Task.checkCancellation()
+            lastForwardedTokenId = forwardedToken
+            return forwardedToken
+        } catch {
+            experimentalDecodeFailed = true
+            throw error
+        }
+    }
+
     public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
         defer { retainedPromptSnapshot = nil }
+        guard !experimentalDecodeFailed else { return }
         guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
             return
         }
