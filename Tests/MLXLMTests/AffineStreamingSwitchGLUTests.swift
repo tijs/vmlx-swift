@@ -764,6 +764,82 @@ struct AffineStreamingSwitchGLUTests {
         }
     }
 
+    #if canImport(Darwin)
+    @Test("Qwen35 mapped reducer repeated-window memory diagnostic")
+    func qwen35MappedMemoryDiagnostic() throws {
+        try MLXMetalTestLock.withLock {
+            func footprint() throws -> UInt64 {
+                var info = task_vm_info_data_t()
+                var count = mach_msg_type_number_t(
+                    MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+                let status = withUnsafeMutablePointer(to: &info) { pointer in
+                    pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+                    }
+                }
+                guard status == KERN_SUCCESS else {
+                    throw AffineStreamingExpertError.invalidInput("task_info failed: \(status)")
+                }
+                return UInt64(info.phys_footprint)
+            }
+            let directory = try makeFixture(numExperts: 8, dimensions: 2048,
+                hiddenDimensions: 512, layout: .qwen35, nonPageAligned: true).directory
+            defer { try? FileManager.default.removeItem(at: directory) }
+            MLX.Memory.clearCache()
+            let catalog = AffineStreamingExpertCatalog(numExperts: 8, inputDims: 2048,
+                hiddenDims: 512, layout: .qwen35)
+            try catalog.configure(modelDirectory: directory, layerCount: 1)
+            let reducer = AffineStreamingSwitchGLU(inputDims: 2048, hiddenDims: 512,
+                numExperts: 8, layerIndex: 0, catalog: catalog, cacheExpertLimit: 3)
+            let tokens = 64
+            let values = (0 ..< tokens * 2048).map { Float(($0 * 17) % 101 - 50) / 37 }
+            let x = MLXArray(values, [1, tokens, 2048]).asType(.bfloat16)
+            let ids = (0 ..< tokens).flatMap { token in
+                (0 ..< 8).map { slot in Int32((token * 3 + slot * 5) % 8) }
+            }
+            let indices = MLXArray(ids, [1, tokens, 8]).asType(.uint32)
+            let scores = MLXArray([Float](repeating: 0.125, count: tokens * 8), [1, tokens, 8])
+            MLX.eval(x, indices, scores)
+            do {
+                let warmup = try reducer.researchQwen35GroupedReduced(x, indices: indices,
+                    scores: scores, groupLimit: 32, tokenWindow: 8)
+                MLX.eval(warmup)
+            }
+            let baseline = try footprint()
+            MLX.Memory.peakMemory = 0
+            let started = Date()
+            var highestFootprint = baseline
+            var observedWindows = 0
+            var samplingFailure: Error?
+            let pooled = ProcessInfo.processInfo.environment["AFFINE_DIAGNOSTIC_AUTORELEASE"] == "1"
+            for iteration in 0 ..< 40 {
+                func runOne() throws {
+                    let result = try reducer.researchQwen35GroupedReduced(x, indices: indices,
+                        scores: scores, groupLimit: 32, tokenWindow: 8) { _, _ in
+                            observedWindows += 1
+                            do { highestFootprint = max(highestFootprint, try footprint()) }
+                            catch { samplingFailure = error }
+                        }
+                    MLX.eval(result)
+                    #expect(result.shape == x.shape)
+                }
+                if pooled { try autoreleasepool { try runOne() } }
+                else { try runOne() }
+                highestFootprint = max(highestFootprint, try footprint())
+                print("AFFINE_MEMORY_ITER iteration=\(iteration) footprint=\(try footprint()) "
+                    + "active=\(MLX.Memory.activeMemory) cache=\(MLX.Memory.cacheMemory) "
+                    + "peak=\(MLX.Memory.peakMemory)")
+            }
+            if let samplingFailure { throw samplingFailure }
+            #expect(observedWindows == 320)
+            print("AFFINE_MEMORY_RESULT pooled=\(pooled) baseline=\(baseline) sampled_peak=\(highestFootprint) "
+                + "active=\(MLX.Memory.activeMemory) cache=\(MLX.Memory.cacheMemory) "
+                + "peak=\(MLX.Memory.peakMemory) windows=\(observedWindows) "
+                + "elapsed_seconds=\(Date().timeIntervalSince(started))")
+        }
+    }
+    #endif
+
     @Test("Qwen35 realistic projection geometry preserves grouped native output")
     func qwen35RealisticGeometryDiagnostic() throws {
         try MLXMetalTestLock.withLock {
