@@ -11,6 +11,26 @@ import Testing
 /// A synthetic two-layer model, not a full checkpoint or memory admission test.
 @Suite("experimental Qwen35 hybrid affine forward", .serialized)
 struct Qwen35AffineResearchHybridTests {
+    private enum FixtureFailure: Error, Equatable { case prefill, decode }
+
+    /// Supplies the iterator with fresh hybrid caches while the test controls
+    /// the fallible forward explicitly.
+    private final class IteratorModel: Module, LanguageModel {
+        let language: Qwen35Language.LanguageModel
+        var kvHeads: [Int] { [1, 4] }
+
+        init(_ language: Qwen35Language.LanguageModel) { self.language = language; super.init() }
+        func newCache(parameters: GenerateParameters?) -> [KVCache] {
+            [MambaCache(), KVCacheSimple()]
+        }
+        func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+            .tokens(input.text)
+        }
+        func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+            language(inputs, cache: cache?.map { $0 as KVCache? }).logits
+        }
+    }
+
     private let limits = AffineStreamingSwitchGLU.ResearchLimits(
         maxTokens: 65_536, maxRoutesPerToken: 4, maxWindowTokens: 128,
         maxGroupSize: 64, maxMappedExpertBytes: 2 * 1024 * 1024,
@@ -179,6 +199,69 @@ struct Qwen35AffineResearchHybridTests {
                 #expect(left.shape == right.shape && left.dtype == right.dtype)
                 #expect(MLX.arrayEqual(left, right).item(Bool.self), "attention KV state")
             }
+
+            // Drive the same hybrid model through the real fallible prefill
+            // and iterator boundary, comparing sampled tokens to resident
+            // execution over multiple autoregressive steps.
+            let model = IteratorModel(language)
+            let researchLimits = limits
+            let input = LMInput(tokens: prompt)
+            let referenceCaches: [KVCache?] = [MambaCache(), KVCacheSimple()]
+            language.resetPositionState()
+            var referenceLogits = language(prompt, cache: referenceCaches).logits
+            var referenceTokens: [Int] = []
+            for _ in 0 ..< 3 {
+                let token = argMax(referenceLogits[0..., -1, 0...], axis: -1).item(Int.self)
+                referenceTokens.append(token)
+                referenceLogits = language(MLXArray([Int32(token)], [1, 1]), cache: referenceCaches).logits
+            }
+            language.resetPositionState()
+            var discardCount = 0
+            var iterator = try ExperimentalThrowingTokenIterator.experimentalTextPrefill(
+                input: input, model: model, processor: nil, sampler: ArgMaxSampler(), maxTokens: 3,
+                prepare: { input, _, _ in .tokens(input.text) },
+                forward: { text, cache, _ in
+                    try language.researchAffineForward(text.tokens, cache: cache?.map { $0 as KVCache? },
+                        reducers: reducers, limits: researchLimits, groupLimit: 16, tokenWindow: 2)
+                }, discardOnFailure: { discardCount += 1; language.resetPositionState() })
+            for expected in referenceTokens {
+                #expect(try iterator.nextToken() == expected)
+            }
+            #expect(try iterator.nextToken() == nil)
+            #expect(discardCount == 0)
+
+            // A partially completed prefill is discarded by the factory.
+            language.resetPositionState()
+            #expect(throws: FixtureFailure.prefill) {
+                _ = try ExperimentalThrowingTokenIterator.experimentalTextPrefill(
+                    input: input, model: model, processor: nil, sampler: ArgMaxSampler(),
+                    prepare: { input, cache, _ in
+                        _ = try language.researchAffineForward(input.text.tokens,
+                            cache: cache.map { $0 as KVCache? }, reducers: reducers,
+                            limits: researchLimits, groupLimit: 16, tokenWindow: 2)
+                        throw FixtureFailure.prefill
+                    }, forward: { _, _, _ in throw FixtureFailure.decode },
+                    discardOnFailure: { discardCount += 1; language.resetPositionState() })
+            }
+            #expect(discardCount == 1)
+
+            // Decode cleanup belongs to the caller: do not reuse the iterator
+            // or its caches after a forward mutates them and then fails.
+            language.resetPositionState()
+            var failing = try ExperimentalThrowingTokenIterator.experimentalTextPrefill(
+                input: input, model: model, processor: nil, sampler: ArgMaxSampler(),
+                prepare: { input, _, _ in .tokens(input.text) },
+                forward: { text, cache, _ in
+                    let result = try language.researchAffineForward(text.tokens,
+                        cache: cache?.map { $0 as KVCache? }, reducers: reducers,
+                        limits: researchLimits, groupLimit: 16, tokenWindow: 2)
+                    if text.tokens.size == 1 { throw FixtureFailure.decode }
+                    return result
+                }, discardOnFailure: { Issue.record("unexpected prefill discard") })
+            #expect(throws: FixtureFailure.decode) { try failing.nextToken() }
+            #expect(throws: ExperimentalDecodeError.invalidated) { try failing.nextToken() }
+            try MLX.withError { StreamOrDevice.default.stream.synchronize() }
+            language.resetPositionState()
         }
     }
 }
