@@ -4,6 +4,11 @@ import Cmlx
 import Foundation
 import MLX
 import MLXNN
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// Errors raised before a file-backed affine expert is admitted to the model
 /// graph. These are deliberately structural: a malformed bundle must fail at
@@ -74,7 +79,7 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
         enum CodingKeys: String, CodingKey { case weightMap = "weight_map" }
     }
 
-    private struct Region: Sendable {
+    fileprivate struct Region: Sendable {
         let url: URL
         let name: String
         let dtype: DType
@@ -83,7 +88,7 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
         let dataLength: UInt64
     }
 
-    private struct ProjectionSpec: Sendable {
+    fileprivate struct ProjectionSpec: Sendable {
         let weight: Region
         let scales: Region
         let biases: Region
@@ -91,7 +96,7 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
         let bits: Int
     }
 
-    private struct LayerSpec: Sendable {
+    fileprivate struct LayerSpec: Sendable {
         let gate: ProjectionSpec
         let up: ProjectionSpec
         let down: ProjectionSpec
@@ -278,22 +283,76 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
             "[Qwen4AffineExperts] exact-region catalog ready layers=\(layerCount) experts=\(numExperts) files=\(shards.count) indexed_file_bytes=\(mappedBytes) cache=file-backed\n".utf8))
     }
 
-    public func loadExpert(layer: Int, expert: Int) throws -> ExpertArrays {
-        guard expert >= 0, expert < numExperts else {
-            throw AffineStreamingExpertError.invalidExpert(layer: layer, expert: expert)
-        }
+    fileprivate func snapshot(layer: Int) throws -> LayerSpec {
         lock.lock()
         let layerSpec = layers[layer]
         let configured = configuredDirectory != nil
         lock.unlock()
         guard configured else { throw AffineStreamingExpertError.notConfigured }
         guard let layerSpec else {
+            throw AffineStreamingExpertError.invalidExpert(layer: layer, expert: -1)
+        }
+        return layerSpec
+    }
+
+    public func loadExpert(layer: Int, expert: Int, maxMappedBytes: UInt64? = nil) throws -> ExpertArrays {
+        guard expert >= 0, expert < numExperts else {
             throw AffineStreamingExpertError.invalidExpert(layer: layer, expert: expert)
+        }
+        return try loadExpert(snapshot: snapshot(layer: layer), expert: expert, maxMappedBytes: maxMappedBytes)
+    }
+
+    fileprivate func loadExpert(snapshot layerSpec: LayerSpec, expert: Int,
+                                maxMappedBytes: UInt64?) throws -> ExpertArrays {
+        guard expert >= 0, expert < numExperts else {
+            throw AffineStreamingExpertError.invalidInput("expert index outside catalog")
+        }
+        if let maxMappedBytes, try mappedExpertBytes(layerSpec, expert: expert) > maxMappedBytes {
+            throw AffineStreamingExpertError.invalidInput("expert mapping exceeds research byte limit")
         }
         return try ExpertArrays(
             gate: loadProjection(layerSpec.gate, expert: expert),
             up: loadProjection(layerSpec.up, expert: expert),
             down: loadProjection(layerSpec.down, expert: expert))
+    }
+
+    /// Sum of page-rounded Metal buffer lengths for one expert, not resident
+    /// bytes and not a bound on activations, allocator caches, or other work.
+    public func mappedExpertBytes(layer: Int, expert: Int) throws -> UInt64 {
+        guard expert >= 0, expert < numExperts else {
+            throw AffineStreamingExpertError.invalidExpert(layer: layer, expert: expert)
+        }
+        lock.lock()
+        let spec = layers[layer]
+        let configured = configuredDirectory != nil
+        lock.unlock()
+        guard configured else { throw AffineStreamingExpertError.notConfigured }
+        guard let spec else { throw AffineStreamingExpertError.invalidExpert(layer: layer, expert: expert) }
+        return try mappedExpertBytes(spec, expert: expert)
+    }
+
+    private func mappedExpertBytes(_ spec: LayerSpec, expert: Int) throws -> UInt64 {
+        let page = UInt64(getpagesize())
+        var total: UInt64 = 0
+        for projection in [spec.gate, spec.up, spec.down] {
+            for region in [projection.weight, projection.scales, projection.biases] {
+                let (offset, length) = try expertSlice(region, expert: expert)
+                let delta = offset % page
+                let span = delta.addingReportingOverflow(length)
+                guard !span.overflow else {
+                    throw AffineStreamingExpertError.invalidTensor(region.name, "mapping span overflow")
+                }
+                let remainder = span.partialValue % page
+                let padding = remainder == 0 ? 0 : page - remainder
+                let rounded = span.partialValue.addingReportingOverflow(padding)
+                let next = total.addingReportingOverflow(rounded.partialValue)
+                guard !rounded.overflow, !next.overflow else {
+                    throw AffineStreamingExpertError.invalidTensor(region.name, "mapping byte count overflow")
+                }
+                total = next.partialValue
+            }
+        }
+        return total
     }
 
     private func loadProjection(_ spec: ProjectionSpec, expert: Int) throws -> ProjectionArrays {
@@ -305,7 +364,7 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
             bits: spec.bits)
     }
 
-    private func mapExpertRegion(_ region: Region, expert: Int) throws -> MLXArray {
+    private func expertSlice(_ region: Region, expert: Int) throws -> (UInt64, UInt64) {
         guard region.shape.first == numExperts,
             region.dataLength % UInt64(numExperts) == 0
         else {
@@ -320,6 +379,15 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
             throw AffineStreamingExpertError.invalidTensor(region.name, "expert offset overflow")
         }
         let offset = region.dataOffset + offsetResult.partialValue
+        guard length > 0, length <= UInt64(Int.max),
+            region.shape.dropFirst().allSatisfy({ $0 >= 0 && $0 <= Int(Int32.max) }),
+            region.shape.count - 1 <= Int(Int32.max)
+        else { throw AffineStreamingExpertError.invalidTensor(region.name, "expert slice out of range") }
+        return (offset, length)
+    }
+
+    private func mapExpertRegion(_ region: Region, expert: Int) throws -> MLXArray {
+        let (offset, length) = try expertSlice(region, expert: expert)
         let shape = Array(region.shape.dropFirst())
         var cShape = shape.map(Int32.init)
         var result = mlx_array_new()
@@ -367,6 +435,48 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
 /// per layer. Each chunk is evaluated before returning so mappings from old
 /// routing decisions can be evicted and unpinned before the next layer runs.
 public final class AffineStreamingSwitchGLU: Module {
+    /// Admission geometry and per-expert mapped buffer limits for research.
+    /// These do not bound the process's total physical or GPU memory.
+    public struct ResearchLimits {
+        public let maxTokens: Int
+        public let maxRoutesPerToken: Int
+        public let maxWindowTokens: Int
+        public let maxGroupSize: Int
+        public let maxMappedExpertBytes: UInt64
+        public let maxRetainedOutputBytes: UInt64
+
+        public init(maxTokens: Int, maxRoutesPerToken: Int, maxWindowTokens: Int,
+                    maxGroupSize: Int, maxMappedExpertBytes: UInt64,
+                    maxRetainedOutputBytes: UInt64) {
+            self.maxTokens = maxTokens
+            self.maxRoutesPerToken = maxRoutesPerToken
+            self.maxWindowTokens = maxWindowTokens
+            self.maxGroupSize = maxGroupSize
+            self.maxMappedExpertBytes = maxMappedExpertBytes
+            self.maxRetainedOutputBytes = maxRetainedOutputBytes
+        }
+
+        public func validate(tokens: Int, inputDims: Int, routesPerToken: Int,
+                             window: Int, group: Int) throws {
+            guard maxTokens > 0, maxRoutesPerToken > 0, maxWindowTokens > 0,
+                maxGroupSize > 0, maxGroupSize < .max, maxWindowTokens < .max,
+                maxMappedExpertBytes > 0, maxRetainedOutputBytes > 0,
+                tokens > 0, tokens <= maxTokens, inputDims > 0,
+                routesPerToken > 0, routesPerToken <= maxRoutesPerToken,
+                window > 0, window <= maxWindowTokens, group > 0, group <= maxGroupSize
+            else { throw AffineStreamingExpertError.invalidInput("request exceeds research geometry limits") }
+            // Retained outputs and final concatenation at FP32 width. This is
+            // logical tensor storage only, not all working or physical memory.
+            let elements = UInt64(tokens).multipliedReportingOverflow(by: UInt64(inputDims))
+            let bytes = elements.partialValue.multipliedReportingOverflow(by: 8)
+            let windowRoutes = min(tokens, window).multipliedReportingOverflow(by: routesPerToken)
+            let paddedRows = windowRoutes.partialValue.multipliedReportingOverflow(by: 16)
+            guard !elements.overflow, !bytes.overflow, !windowRoutes.overflow, !paddedRows.overflow,
+                bytes.partialValue <= maxRetainedOutputBytes else {
+                throw AffineStreamingExpertError.invalidInput("request exceeds research output byte limit")
+            }
+        }
+    }
     // Research calls share admission across all instances in this process.
     // This bounds concurrent mapping activity, not total process memory.
     private static let researchAdmission = NSLock()
@@ -510,7 +620,7 @@ public final class AffineStreamingSwitchGLU: Module {
     /// Supply shouldCancel when work is dispatched outside the caller's Swift task.
     public func researchQwen35GroupedReduced(
         _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
-        tokenWindow: Int, shouldCancel: () -> Bool = { false },
+        tokenWindow: Int, limits: ResearchLimits, shouldCancel: () -> Bool = { false },
         observeWindow: ((Int, Int) -> Void)? = nil
     ) throws -> MLXArray {
         if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
@@ -519,19 +629,20 @@ public final class AffineStreamingSwitchGLU: Module {
         #if canImport(ObjectiveC)
         return try autoreleasepool {
             try researchQwen35GroupedReducedImpl(x, indices: indices, scores: scores,
-                groupLimit: groupLimit, tokenWindow: tokenWindow,
+                groupLimit: groupLimit, tokenWindow: tokenWindow, limits: limits,
                 shouldCancel: shouldCancel, observeWindow: observeWindow)
         }
         #else
         return try researchQwen35GroupedReducedImpl(x, indices: indices, scores: scores,
-            groupLimit: groupLimit, tokenWindow: tokenWindow,
+            groupLimit: groupLimit, tokenWindow: tokenWindow, limits: limits,
             shouldCancel: shouldCancel, observeWindow: observeWindow)
         #endif
     }
 
     private func researchQwen35GroupedReducedImpl(
         _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
-        tokenWindow: Int, shouldCancel: () -> Bool, observeWindow: ((Int, Int) -> Void)?
+        tokenWindow: Int, limits: ResearchLimits,
+        shouldCancel: () -> Bool, observeWindow: ((Int, Int) -> Void)?
     ) throws -> MLXArray {
         func checkCancellation() throws {
             if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
@@ -540,17 +651,20 @@ public final class AffineStreamingSwitchGLU: Module {
         guard catalog.layout == .qwen35 else {
             throw AffineStreamingExpertError.invalidInput("Qwen35 layout required")
         }
-        guard inputDims > 0, numExperts > 0, groupLimit > 0, tokenWindow > 0, tokenWindow < .max,
+        guard inputDims > 0, numExperts > 0,
             inputDims == catalog.inputDims, hiddenDims == catalog.hiddenDims,
             numExperts == catalog.numExperts,
             !x.shape.isEmpty, x.dim(-1) == inputDims,
             indices.shape.count == x.shape.count, indices.shape.dropLast() == x.shape.dropLast(),
             (indices.shape.last ?? 0) > 0, indices.shape == scores.shape,
             indices.dtype == .int32 || indices.dtype == .uint32,
-            x.size > 0
+            x.size > 0, x.dtype == .float16 || x.dtype == .bfloat16
         else { throw AffineStreamingExpertError.invalidInput("invalid shapes, dtype, or group limit") }
         let totalTokens = x.size / inputDims
         let kSlots = indices.dim(-1)
+        try limits.validate(tokens: totalTokens, inputDims: inputDims, routesPerToken: kSlots,
+                            window: tokenWindow, group: groupLimit)
+        let layerSnapshot = try catalog.snapshot(layer: layerIndex)
         let xFlat = x.reshaped([totalTokens, inputDims])
         let indicesFlat = indices.reshaped([totalTokens, kSlots])
         let scoresFlat = scores.reshaped([totalTokens, kSlots])
@@ -583,7 +697,8 @@ public final class AffineStreamingSwitchGLU: Module {
                     while end < routes && sortedIDs[end] == sortedIDs[start] { end += 1 }
                     // Avoid per-layer persistent mappings and concurrent duplicate
                     // cache misses in this experimental process-wide lease.
-                    let mapped = try catalog.loadExpert(layer: layerIndex, expert: expertID)
+                    let mapped = try catalog.loadExpert(snapshot: layerSnapshot, expert: expertID,
+                        maxMappedBytes: limits.maxMappedExpertBytes)
                     var offset = start
                     while offset < end {
                         try checkCancellation()

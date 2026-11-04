@@ -14,6 +14,11 @@ import Glibc
 
 @Suite("native affine active-expert SSD routing", .serialized)
 struct AffineStreamingSwitchGLUTests {
+    private let researchLimits = AffineStreamingSwitchGLU.ResearchLimits(
+        maxTokens: 65_536, maxRoutesPerToken: 256, maxWindowTokens: 65_536,
+        maxGroupSize: 2_048, maxMappedExpertBytes: 64 * 1024 * 1024,
+        maxRetainedOutputBytes: 2 * 1024 * 1024 * 1024)
+
     private final class ConcurrentResults: @unchecked Sendable {
         private let lock = NSLock()
         private(set) var shapes: [[Int]] = []
@@ -38,7 +43,7 @@ struct AffineStreamingSwitchGLUTests {
     }
 
     private func makeFixture(
-        numExperts: Int = 4, dimensions: Int = 32, hiddenDimensions: Int? = nil,
+        numExperts: Int = 4, dimensions: Int = 32, hiddenDimensions: Int? = nil, seedShift: Int = 0,
         layout: AffineStreamingExpertCatalog.Layout = .qwen4,
         nonPageAligned: Bool = false, companionOverride: DType? = nil
     ) throws -> Fixture {
@@ -52,7 +57,7 @@ struct AffineStreamingSwitchGLUTests {
             let output = projection == 2 ? dimensions : hidden
             let count = input * output
             let values = (0 ..< count).map { index -> Float in
-                let centered = Float((index * 13 + expert * 17 + projection * 23) % 101) - 50
+                let centered = Float((index * 13 + expert * 17 + projection * 23 + seedShift) % 101) - 50
                 return centered / Float(200 + projection * 40)
             }
             return MLXArray(values, [output, input])
@@ -605,7 +610,7 @@ struct AffineStreamingSwitchGLUTests {
                         let expected = (nativeRouted * nativeScores[.ellipsis, .newAxis])
                             .sum(axis: -2)
                         MLX.eval(expected)
-                        for groupLimit in [16, 32, 64, Int.max] {
+                        for groupLimit in [16, 32, 64, 2_048] {
                             var segments: [MLXArray] = []
                             var start = 0
                             while start < sortedIDs.count {
@@ -670,7 +675,7 @@ struct AffineStreamingSwitchGLUTests {
                             #expect(actual.dtype == expected.dtype, "\(context)")
                             #expect(exact, "\(context)")
                             let streamed = try streaming.researchQwen35GroupedReduced(
-                                x, indices: indices, scores: scores, groupLimit: groupLimit, tokenWindow: 256)
+                                x, indices: indices, scores: scores, groupLimit: groupLimit, tokenWindow: 256, limits: researchLimits)
                             MLX.eval(streamed)
                             let streamedDifference = MLX.max(MLX.abs(streamed.asType(.float32)
                                 - expected.asType(.float32))).item(Float.self)
@@ -686,7 +691,7 @@ struct AffineStreamingSwitchGLUTests {
                                     var maximumPadded = 0
                                     let windowed = try streaming.researchQwen35GroupedReduced(
                                         x, indices: indices, scores: scores, groupLimit: groupLimit,
-                                        tokenWindow: window, observeWindow: { routes, padded in
+                                        tokenWindow: window, limits: researchLimits, observeWindow: { routes, padded in
                                             observedRoutes += routes
                                             maximumPadded = max(maximumPadded, padded)
                                             #expect(routes <= min(window, tokens) * 8)
@@ -752,7 +757,7 @@ struct AffineStreamingSwitchGLUTests {
                 let routed = native(x, indices)
                 let expected = (routed * scores.asType(routed.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
                 let actual = try streaming.researchQwen35GroupedReduced(x, indices: indices,
-                    scores: scores, groupLimit: 32, tokenWindow: 7)
+                    scores: scores, groupLimit: 32, tokenWindow: 7, limits: researchLimits)
                 MLX.eval(expected, actual)
                 let difference = MLX.max(MLX.abs(expected.asType(.float32)
                     - actual.asType(.float32))).item(Float.self)
@@ -761,6 +766,76 @@ struct AffineStreamingSwitchGLUTests {
                 #expect(MLX.arrayEqual(actual, expected).item(Bool.self),
                     "tokens=\(tokens) max_abs=\(difference)")
             }
+        }
+    }
+
+    @Test("Qwen35 research limits validate 65K geometry and mapped bytes")
+    func qwen35ResearchLimits() throws {
+        try MLXMetalTestLock.withLock {
+            try researchLimits.validate(tokens: 65_536, inputDims: 2048,
+                routesPerToken: 8, window: 32, group: 32)
+            #expect(throws: AffineStreamingExpertError.self) {
+                try researchLimits.validate(tokens: 65_537, inputDims: 2048,
+                    routesPerToken: 8, window: 32, group: 32)
+            }
+            #expect(throws: AffineStreamingExpertError.self) {
+                try researchLimits.validate(tokens: 1, inputDims: .max,
+                    routesPerToken: 1, window: 1, group: 1)
+            }
+            let unbounded = AffineStreamingSwitchGLU.ResearchLimits(maxTokens: .max,
+                maxRoutesPerToken: .max, maxWindowTokens: .max, maxGroupSize: .max,
+                maxMappedExpertBytes: .max, maxRetainedOutputBytes: .max)
+            #expect(throws: AffineStreamingExpertError.self) {
+                try unbounded.validate(tokens: 1, inputDims: 64, routesPerToken: 1,
+                    window: 1, group: 1)
+            }
+            let hugeRoutes = AffineStreamingSwitchGLU.ResearchLimits(maxTokens: 2,
+                maxRoutesPerToken: .max, maxWindowTokens: 2, maxGroupSize: 1,
+                maxMappedExpertBytes: 1, maxRetainedOutputBytes: 1024)
+            #expect(throws: AffineStreamingExpertError.self) {
+                try hugeRoutes.validate(tokens: 2, inputDims: 1, routesPerToken: .max,
+                    window: 2, group: 1)
+            }
+            #expect(throws: AffineStreamingExpertError.self) {
+                try hugeRoutes.validate(tokens: 1, inputDims: 1, routesPerToken: .max,
+                    window: 1, group: 1)
+            }
+            let fixture = try makeFixture(numExperts: 4, dimensions: 64,
+                layout: .qwen35, nonPageAligned: true)
+            defer { try? FileManager.default.removeItem(at: fixture.directory) }
+            let catalog = AffineStreamingExpertCatalog(numExperts: 4, inputDims: 64,
+                hiddenDims: 64, layout: .qwen35)
+            try catalog.configure(modelDirectory: fixture.directory, layerCount: 1)
+            for expert in [0, 3] {
+                let bytes = try catalog.mappedExpertBytes(layer: 0, expert: expert)
+                #expect(bytes > 0 && bytes % UInt64(getpagesize()) == 0)
+                let beforeReject = MLX.Memory.activeMemory
+                do {
+                    _ = try catalog.loadExpert(layer: 0, expert: expert, maxMappedBytes: bytes - 1)
+                    Issue.record("expert over the mapping limit was accepted")
+                } catch AffineStreamingExpertError.invalidInput(let reason) {
+                    #expect(reason == "expert mapping exceeds research byte limit")
+                } catch { Issue.record("unexpected rejection error: \(error)") }
+                #expect(MLX.Memory.activeMemory == beforeReject)
+                let before = MLX.Memory.activeMemory
+                let loaded = try catalog.loadExpert(layer: 0, expert: expert, maxMappedBytes: bytes)
+                let after = MLX.Memory.activeMemory
+                #expect(after - before == Int(bytes))
+                #expect(loaded.gate.weight.shape == [64, 8])
+            }
+            let tight = AffineStreamingSwitchGLU.ResearchLimits(maxTokens: 8, maxRoutesPerToken: 1,
+                maxWindowTokens: 2, maxGroupSize: 4, maxMappedExpertBytes: 1,
+                maxRetainedOutputBytes: 4096)
+            let reducer = AffineStreamingSwitchGLU(inputDims: 64, hiddenDims: 64,
+                numExperts: 4, layerIndex: 0, catalog: catalog)
+            let x = MLXArray([Float](repeating: 0, count: 64), [1, 1, 64]).asType(.bfloat16)
+            let ids = MLXArray([Int32(0)], [1, 1, 1])
+            let scores = MLXArray([Float(1)], [1, 1, 1])
+            #expect(throws: AffineStreamingExpertError.self) {
+                try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
+                    groupLimit: 1, tokenWindow: 1, limits: tight)
+            }
+            #expect(reducer.cachedExpertCount == 0)
         }
     }
 
@@ -779,24 +854,64 @@ struct AffineStreamingSwitchGLUTests {
             let scores = MLXArray([Float](repeating: 1, count: 8), [1, 8, 1])
             #expect(throws: CancellationError.self) {
                 try reducer.researchQwen35GroupedReduced(x, indices: indices, scores: scores,
-                    groupLimit: 4, tokenWindow: 2, shouldCancel: { true })
+                    groupLimit: 4, tokenWindow: 2, limits: researchLimits, shouldCancel: { true })
             }
             #expect(reducer.cachedExpertCount == 0)
             var cancelled = false
             var observed = 0
             #expect(throws: CancellationError.self) {
                 try reducer.researchQwen35GroupedReduced(x, indices: indices, scores: scores,
-                    groupLimit: 4, tokenWindow: 2, shouldCancel: { cancelled }, observeWindow: { _, _ in
+                    groupLimit: 4, tokenWindow: 2, limits: researchLimits, shouldCancel: { cancelled }, observeWindow: { _, _ in
                         observed += 1
                         cancelled = true
                     })
             }
             #expect(observed == 1)
             let recovered = try reducer.researchQwen35GroupedReduced(x, indices: indices,
-                scores: scores, groupLimit: 4, tokenWindow: 2)
+                scores: scores, groupLimit: 4, tokenWindow: 2, limits: researchLimits)
             MLX.eval(recovered)
             #expect(recovered.shape == x.shape)
             #expect(reducer.cachedExpertCount <= 2)
+        }
+    }
+
+    @Test("Qwen35 research call keeps one catalog snapshot")
+    func qwen35CatalogSnapshot() throws {
+        try MLXMetalTestLock.withLock {
+            let first = try makeFixture(numExperts: 4, dimensions: 64, layout: .qwen35)
+            let second = try makeFixture(numExperts: 4, dimensions: 64, seedShift: 13, layout: .qwen35)
+            defer {
+                try? FileManager.default.removeItem(at: first.directory)
+                try? FileManager.default.removeItem(at: second.directory)
+            }
+            let catalog = AffineStreamingExpertCatalog(numExperts: 4, inputDims: 64,
+                hiddenDims: 64, layout: .qwen35)
+            let reducer = AffineStreamingSwitchGLU(inputDims: 64, hiddenDims: 64,
+                numExperts: 4, layerIndex: 0, catalog: catalog)
+            let x = MLXArray((0 ..< 4 * 64).map { Float($0 % 17) / 17 }, [1, 4, 64]).asType(.bfloat16)
+            let ids = MLXArray([Int32(0), 1, 2, 3], [1, 4, 1])
+            let scores = MLXArray([Float](repeating: 1, count: 4), [1, 4, 1])
+            try catalog.configure(modelDirectory: first.directory, layerCount: 1)
+            let expected = try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
+                groupLimit: 4, tokenWindow: 1, limits: researchLimits)
+            try catalog.configure(modelDirectory: second.directory, layerCount: 1)
+            let other = try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
+                groupLimit: 4, tokenWindow: 1, limits: researchLimits)
+            #expect(!MLX.arrayEqual(expected, other).item(Bool.self))
+            try catalog.configure(modelDirectory: first.directory, layerCount: 1)
+            var changed = false
+            var configurationError: Error?
+            let actual = try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
+                groupLimit: 4, tokenWindow: 1, limits: researchLimits, observeWindow: { _, _ in
+                    if !changed {
+                        changed = true
+                        do { try catalog.configure(modelDirectory: second.directory, layerCount: 1) }
+                        catch { configurationError = error }
+                    }
+                })
+            if let configurationError { throw configurationError }
+            #expect(changed)
+            #expect(MLX.arrayEqual(actual, expected).item(Bool.self))
         }
     }
 
@@ -817,14 +932,14 @@ struct AffineStreamingSwitchGLUTests {
             let scores = MLXArray([Float](repeating: 1, count: 4), [1, 4, 1])
             var busyCount = 0
             let result = try first.researchQwen35GroupedReduced(x, indices: indices,
-                scores: scores, groupLimit: 4, tokenWindow: 2, observeWindow: { _, _ in
+                scores: scores, groupLimit: 4, tokenWindow: 2, limits: researchLimits, observeWindow: { _, _ in
                     let overlap = ConcurrentResults()
                     let completed = DispatchSemaphore(value: 0)
                     DispatchQueue.global().async {
                         defer { completed.signal() }
                         do {
                             _ = try second.researchQwen35GroupedReduced(x, indices: indices,
-                                scores: scores, groupLimit: 4, tokenWindow: 2)
+                                scores: scores, groupLimit: 4, tokenWindow: 2, limits: researchLimits)
                             overlap.append(failure: "overlapping research call was admitted")
                         } catch AffineStreamingExpertError.researchBusy {
                             overlap.append(shape: [1])
@@ -841,20 +956,20 @@ struct AffineStreamingSwitchGLUTests {
             #expect(result.shape == x.shape)
             #expect(first.cachedExpertCount == 0 && second.cachedExpertCount == 0)
             let after = try second.researchQwen35GroupedReduced(x, indices: indices,
-                scores: scores, groupLimit: 4, tokenWindow: 2)
+                scores: scores, groupLimit: 4, tokenWindow: 2, limits: researchLimits)
             #expect(MLX.arrayEqual(result, after).item(Bool.self))
             #expect(throws: AffineStreamingExpertError.self) {
                 try second.researchQwen35GroupedReduced(x, indices: indices, scores: scores,
-                    groupLimit: 0, tokenWindow: 2)
+                    groupLimit: 0, tokenWindow: 2, limits: researchLimits)
             }
             let invalidLayer = AffineStreamingSwitchGLU(inputDims: 64, hiddenDims: 64,
                 numExperts: 4, layerIndex: 1, catalog: catalog)
             #expect(throws: AffineStreamingExpertError.self) {
                 try invalidLayer.researchQwen35GroupedReduced(x, indices: indices,
-                    scores: scores, groupLimit: 4, tokenWindow: 2)
+                    scores: scores, groupLimit: 4, tokenWindow: 2, limits: researchLimits)
             }
             let afterError = try first.researchQwen35GroupedReduced(x, indices: indices,
-                scores: scores, groupLimit: 4, tokenWindow: 2)
+                scores: scores, groupLimit: 4, tokenWindow: 2, limits: researchLimits)
             #expect(MLX.arrayEqual(result, afterError).item(Bool.self))
         }
     }
@@ -899,7 +1014,7 @@ struct AffineStreamingSwitchGLUTests {
             MLX.eval(x, indices, scores)
             do {
                 let warmup = try reducer.researchQwen35GroupedReduced(x, indices: indices,
-                    scores: scores, groupLimit: 32, tokenWindow: 8)
+                    scores: scores, groupLimit: 32, tokenWindow: 8, limits: researchLimits)
                 MLX.eval(warmup)
             }
             let baseline = try footprint()
@@ -913,7 +1028,7 @@ struct AffineStreamingSwitchGLUTests {
             for iteration in 0 ..< iterations {
                 func runOne() throws {
                     let result = try reducer.researchQwen35GroupedReduced(x, indices: indices,
-                        scores: scores, groupLimit: 32, tokenWindow: 8, observeWindow: { _, _ in
+                        scores: scores, groupLimit: 32, tokenWindow: 8, limits: researchLimits, observeWindow: { _, _ in
                             observedWindows += 1
                             do {
                                 let current = try footprint()
@@ -1058,33 +1173,33 @@ struct AffineStreamingSwitchGLUTests {
         let ids = MLXArray([Int32(0)], [1, 1, 1])
         let scores = MLXArray([Float(1)], [1, 1, 1])
         #expect(throws: AffineStreamingExpertError.self) {
-            try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 0, tokenWindow: 32)
+            try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 0, tokenWindow: 32, limits: researchLimits)
         }
         #expect(throws: AffineStreamingExpertError.self) {
             try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
-                groupLimit: 16, tokenWindow: 0)
+                groupLimit: 16, tokenWindow: 0, limits: researchLimits)
         }
         #expect(throws: AffineStreamingExpertError.self) {
             try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
-                groupLimit: 16, tokenWindow: .max)
+                groupLimit: 16, tokenWindow: .max, limits: researchLimits)
         }
         #expect(throws: AffineStreamingExpertError.self) {
             try reducer.researchQwen35GroupedReduced(x, indices: MLXArray([Int32(4)], [1, 1, 1]),
-                scores: scores, groupLimit: 16, tokenWindow: 32)
+                scores: scores, groupLimit: 16, tokenWindow: 32, limits: researchLimits)
         }
         #expect(throws: AffineStreamingExpertError.self) {
             try reducer.researchQwen35GroupedReduced(x, indices: ids,
-                scores: MLXArray([Float(1), 1], [1, 1, 2]), groupLimit: 16, tokenWindow: 32)
+                scores: MLXArray([Float(1), 1], [1, 1, 2]), groupLimit: 16, tokenWindow: 32, limits: researchLimits)
         }
         #expect(throws: AffineStreamingExpertError.self) {
-            try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 16, tokenWindow: 32)
+            try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 16, tokenWindow: 32, limits: researchLimits)
         }
         // Geometry mismatch must be rejected before trying to map an expert.
         let wrongGeometry = AffineStreamingSwitchGLU(inputDims: 64, hiddenDims: 64,
             numExperts: 5, layerIndex: 0, catalog: catalog)
         do {
             _ = try wrongGeometry.researchQwen35GroupedReduced(
-                x, indices: ids, scores: scores, groupLimit: 16, tokenWindow: 32)
+                x, indices: ids, scores: scores, groupLimit: 16, tokenWindow: 32, limits: researchLimits)
             Issue.record("mismatched catalog geometry was accepted")
         } catch AffineStreamingExpertError.invalidInput {
             // Validation precedes the unconfigured catalog lookup.
@@ -1095,7 +1210,7 @@ struct AffineStreamingSwitchGLUTests {
         let wrongLayout = AffineStreamingSwitchGLU(inputDims: 64, hiddenDims: 64,
             numExperts: 4, layerIndex: 0, catalog: qwen4)
         #expect(throws: AffineStreamingExpertError.self) {
-            try wrongLayout.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 16, tokenWindow: 32)
+            try wrongLayout.researchQwen35GroupedReduced(x, indices: ids, scores: scores, groupLimit: 16, tokenWindow: 32, limits: researchLimits)
         }
     }
 
