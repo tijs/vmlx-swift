@@ -2,7 +2,7 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXNN
 import Testing
 
@@ -11,7 +11,7 @@ import Testing
 /// A synthetic two-layer model, not a full checkpoint or memory admission test.
 @Suite("experimental Qwen35 hybrid affine forward", .serialized)
 struct Qwen35AffineResearchHybridTests {
-    private enum FixtureFailure: Error, Equatable { case prefill, decode }
+    private enum FixtureFailure: Error, Equatable { case prefill, decode, drain }
 
     /// Supplies the iterator with fresh hybrid caches while the test controls
     /// the fallible forward explicitly.
@@ -262,6 +262,76 @@ struct Qwen35AffineResearchHybridTests {
             #expect(throws: ExperimentalDecodeError.invalidated) { try failing.nextToken() }
             try MLX.withError { StreamOrDevice.default.stream.synchronize() }
             language.resetPositionState()
+
+            // Exercise arena-owned prefill and multiple decode steps against
+            // the same resident greedy reference, using fresh hybrid caches.
+            let gate = ExperimentalRequestArenaGate()
+            language.resetPositionState()
+            let arenaTokens = try gate.withRequest(operation: { arena in
+                let source = try ExperimentalThrowingTokenIterator.experimentalArenaTextPrefill(
+                    input: input, model: model, arena: arena, processor: nil,
+                    sampler: ArgMaxSampler(), maxTokens: 3,
+                    prepare: { input, _, _ in .tokens(input.text) },
+                    forward: { text, cache, _ in
+                        try language.researchAffineForward(text.tokens,
+                            cache: cache?.map { $0 as KVCache? }, reducers: reducers,
+                            limits: researchLimits, groupLimit: 16, tokenWindow: 2)
+                    })
+                var tokens: [Int] = []
+                while let token = try source.nextToken() { tokens.append(token) }
+                return .finished(tokens)
+            }, drain: { _ in
+                try MLX.withError { StreamOrDevice.default.stream.synchronize() }
+            }, invalidate: { _ in language.resetPositionState() })
+            #expect(arenaTokens == referenceTokens)
+
+            // An injected drain failure after a mutated decode must quarantine
+            // the iterator owner until a real drain and invalidation succeed.
+            language.resetPositionState()
+            weak var retainedSource: ExperimentalArenaTokenIterator?
+            var invalidated = false
+            defer {
+                try? gate.recover(drain: { _ in
+                    try MLX.withError { StreamOrDevice.default.stream.synchronize() }
+                }, invalidate: { _ in language.resetPositionState() })
+            }
+            do {
+                let _: Int = try gate.withRequest(operation: { arena in
+                    let source = try ExperimentalThrowingTokenIterator.experimentalArenaTextPrefill(
+                        input: input, model: model, arena: arena, processor: nil, sampler: ArgMaxSampler(),
+                        prepare: { input, _, _ in .tokens(input.text) },
+                        forward: { text, cache, _ in
+                            let output = try language.researchAffineForward(text.tokens,
+                                cache: cache?.map { $0 as KVCache? }, reducers: reducers,
+                                limits: researchLimits, groupLimit: 16, tokenWindow: 2)
+                            if text.tokens.size == 1 { throw FixtureFailure.decode }
+                            return output
+                        })
+                    retainedSource = source
+                    _ = try source.nextToken()
+                    return .finished(1)
+                }, drain: { _ in throw FixtureFailure.drain },
+                invalidate: { _ in invalidated = true; language.resetPositionState() })
+                Issue.record("decode and drain failures were not reported")
+            } catch let error as ExperimentalRequestArenaCleanupError {
+                #expect(error.primary as? FixtureFailure == .decode)
+                #expect(error.cleanup as? FixtureFailure == .drain)
+            }
+            #expect(retainedSource != nil)
+            #expect(!invalidated)
+            #expect(throws: ExperimentalRequestArenaError.quarantined) {
+                try gate.withRequest(operation: { _ in .finished(1) }, drain: { _ in }, invalidate: { _ in })
+            }
+            try gate.recover(drain: { _ in
+                #expect(retainedSource != nil)
+                try MLX.withError { StreamOrDevice.default.stream.synchronize() }
+            }, invalidate: { _ in
+                #expect(retainedSource != nil)
+                invalidated = true
+                language.resetPositionState()
+            })
+            #expect(invalidated)
+            #expect(retainedSource == nil)
         }
     }
 }
