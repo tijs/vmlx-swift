@@ -769,6 +769,68 @@ struct AffineStreamingSwitchGLUTests {
         }
     }
 
+    @Test("affine mmap failures throw without crossing concurrent error scopes")
+    func qwen35MappingFailures() throws {
+        try MLXMetalTestLock.withLock {
+            let first = try makeFixture(numExperts: 4, dimensions: 64, layout: .qwen35)
+            let second = try makeFixture(numExperts: 4, dimensions: 64, seedShift: 13, layout: .qwen35)
+            defer {
+                try? FileManager.default.removeItem(at: first.directory)
+                try? FileManager.default.removeItem(at: second.directory)
+            }
+            let catalogs = [first, second].map { _ in
+                AffineStreamingExpertCatalog(numExperts: 4, inputDims: 64, hiddenDims: 64, layout: .qwen35)
+            }
+            for (catalog, fixture) in zip(catalogs, [first, second]) {
+                try catalog.configure(modelDirectory: fixture.directory, layerCount: 1)
+            }
+            try FileManager.default.removeItem(at: first.directory.appendingPathComponent("model.safetensors"))
+            let truncated = try FileHandle(forWritingTo: second.directory.appendingPathComponent("model.safetensors"))
+            try truncated.truncate(atOffset: 0)
+            try truncated.close()
+            let results = ConcurrentResults()
+            DispatchQueue.concurrentPerform(iterations: 2) { index in
+                do {
+                    _ = try catalogs[index].loadExpert(layer: 0, expert: 0)
+                    results.append(failure: "missing shard was accepted")
+                } catch AffineStreamingExpertError.mmapFailed(let reason) {
+                    let path = [first, second][index].directory.path
+                    if reason.contains(path) { results.append(shape: [index]) }
+                    else { results.append(failure: "mapping error did not retain its own path: \(reason)") }
+                } catch { results.append(failure: "unexpected error: \(error)") }
+            }
+            #expect(results.failures.isEmpty)
+            #expect(Set(results.shapes.map { $0[0] }) == Set([0, 1]))
+            let partial = try makeFixture(numExperts: 4, dimensions: 64, layout: .qwen35)
+            defer { try? FileManager.default.removeItem(at: partial.directory) }
+            let indexURL = partial.directory.appendingPathComponent("model.safetensors.index.json")
+            let index = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: indexURL))
+                as? [String: Any])
+            var map = try #require(index["weight_map"] as? [String: String])
+            for key in map.keys where key.contains(".up_proj.") { map[key] = "later.safetensors" }
+            try FileManager.default.copyItem(at: partial.directory.appendingPathComponent("model.safetensors"),
+                to: partial.directory.appendingPathComponent("later.safetensors"))
+            try JSONSerialization.data(withJSONObject: ["weight_map": map], options: [.sortedKeys])
+                .write(to: indexURL)
+            let partialCatalog = AffineStreamingExpertCatalog(numExperts: 4, inputDims: 64,
+                hiddenDims: 64, layout: .qwen35)
+            try partialCatalog.configure(modelDirectory: partial.directory, layerCount: 1)
+            try FileManager.default.removeItem(at: partial.directory.appendingPathComponent("later.safetensors"))
+            let beforeFailure = MLX.Memory.activeMemory
+            #expect(throws: AffineStreamingExpertError.self) {
+                try partialCatalog.loadExpert(layer: 0, expert: 0)
+            }
+            #expect(MLX.Memory.activeMemory == beforeFailure)
+            let recovery = try makeFixture(numExperts: 4, dimensions: 64, layout: .qwen35)
+            defer { try? FileManager.default.removeItem(at: recovery.directory) }
+            let valid = AffineStreamingExpertCatalog(numExperts: 4, inputDims: 64,
+                hiddenDims: 64, layout: .qwen35)
+            try valid.configure(modelDirectory: recovery.directory, layerCount: 1)
+            let mapped = try valid.loadExpert(layer: 0, expert: 0)
+            #expect(mapped.gate.weight.shape == [64, 8])
+        }
+    }
+
     @Test("Qwen35 research limits validate 65K geometry and mapped bytes")
     func qwen35ResearchLimits() throws {
         try MLXMetalTestLock.withLock {

@@ -391,11 +391,22 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
         let shape = Array(region.shape.dropFirst())
         var cShape = shape.map(Int32.init)
         var result = mlx_array_new()
-        let rc = region.url.withUnsafeFileSystemRepresentation { path -> Int32 in
-            guard let path else { return 1 }
-            return mlx_array_new_mmap_file_region(
-                &result, path, offset, Int(length), &cShape, Int32(cShape.count),
-                region.dtype.cmlxDtype)
+        let rc: Int32
+        do {
+            // The C wrapper calls the MLX error handler before returning a
+            // failure code. Scope it so a failed mapping becomes a Swift
+            // error instead of reaching MLX's fatal default handler.
+            rc = try MLX.withError {
+                region.url.withUnsafeFileSystemRepresentation { path -> Int32 in
+                    guard let path else { return 1 }
+                    return mlx_array_new_mmap_file_region(
+                        &result, path, offset, Int(length), &cShape, Int32(cShape.count),
+                        region.dtype.cmlxDtype)
+                }
+            }
+        } catch {
+            mlx_array_free(result)
+            throw AffineStreamingExpertError.mmapFailed("\(region.name)[\(expert)]: \(error)")
         }
         guard rc == 0 else {
             mlx_array_free(result)
