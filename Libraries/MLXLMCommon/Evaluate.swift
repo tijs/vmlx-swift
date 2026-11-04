@@ -1440,11 +1440,13 @@ public protocol ExperimentalThrowingTokenSource {
 public enum ExperimentalDecodeError: Error, Sendable, Equatable {
     case compiledDecodeUnsupported
     case invalidated
+    case unsupportedPrefill
 }
 
 /// Adapts a prepared TokenIterator to a throwing eager decode forward. The
 /// caller must not reuse other copies of the iterator or its mutable caches.
-/// This does not make prefill, replay or existing generation APIs fallible.
+/// The factory below supports a separate text-only prefill; existing prefill,
+/// replay and generation APIs remain unchanged.
 public struct ExperimentalThrowingTokenIterator: ExperimentalThrowingTokenSource {
     private var iterator: TokenIterator
     private let forward: (LMInput.Text, [KVCache]?, LMOutput.State?) throws -> LMOutput
@@ -1453,6 +1455,30 @@ public struct ExperimentalThrowingTokenIterator: ExperimentalThrowingTokenSource
                 forward: @escaping (LMInput.Text, [KVCache]?, LMOutput.State?) throws -> LMOutput) {
         self.iterator = iterator
         self.forward = forward
+    }
+
+    /// Construct a text-only research iterator using fallible prefill and
+    /// decode. The owned TokenIterator is not exposed through its legacy
+    /// nonthrowing `next()` API. The model's `newCache` must return fresh,
+    /// exclusive request caches, and the closures must use the default compute
+    /// stream. `discardOnFailure` runs only if construction/prefill fails,
+    /// after that stream drains; it is not retained for later decode failures.
+    /// On decode failure or cancellation, the caller must drain the owned
+    /// stream and discard the iterator, all cache aliases and any model-owned
+    /// request state before releasing request resources.
+    public static func experimentalTextPrefill(
+        input: LMInput, model: any LanguageModel,
+        processor: LogitProcessor?, sampler: LogitSampler, prefillStepSize: Int = 512,
+        maxTokens: Int? = nil,
+        prepare: (LMInput, [KVCache], Int) throws -> PrepareResult,
+        forward: @escaping (LMInput.Text, [KVCache]?, LMOutput.State?) throws -> LMOutput,
+        discardOnFailure: () -> Void
+    ) throws -> ExperimentalThrowingTokenIterator {
+        let iterator = try TokenIterator(experimentalInput: input, model: model,
+            processor: processor, sampler: sampler, prefillStepSize: prefillStepSize,
+            maxTokens: maxTokens, experimentalPrepare: prepare, experimentalForward: forward,
+            discardOnFailure: discardOnFailure)
+        return ExperimentalThrowingTokenIterator(iterator: iterator, forward: forward)
     }
 
     public mutating func nextToken() throws -> Int? {
@@ -2513,6 +2539,82 @@ public struct TokenIterator: TokenIteratorProtocol {
             try setupCompiledDecode(
                 maxCacheLength: effectiveParameters.compiledMaxCacheLength
                     ?? Swift.max(4096, neededLength ?? 4096))
+        }
+    }
+
+    /// Research-only text prefill using explicitly fallible model operations.
+    /// The model must create fresh, exclusive request caches. This initializer
+    /// does not restore or store cache snapshots, compile decode, or support
+    /// media inputs. Both closures must use the default compute stream and
+    /// must not retain cache aliases.
+    /// On error, that stream is drained and `discardOnFailure` must reset any
+    /// model-owned per-request state. Existing model `prepare` is not assumed
+    /// to be fallible internally; the caller supplies a genuinely throwing one.
+    fileprivate init(
+        experimentalInput input: LMInput, model: any LanguageModel,
+        processor: LogitProcessor?, sampler: LogitSampler, prefillStepSize: Int = 512,
+        maxTokens: Int? = nil,
+        experimentalPrepare: (LMInput, [KVCache], Int) throws -> PrepareResult,
+        experimentalForward: (LMInput.Text, [KVCache]?, LMOutput.State?) throws -> LMOutput,
+        discardOnFailure: () -> Void
+    ) throws {
+        guard !input.hasMediaContent, input.text.tokens.size > 0, prefillStepSize > 0,
+            input.text.tokens.ndim == 1 || (input.text.tokens.ndim == 2 && input.text.tokens.dim(0) == 1),
+            maxTokens.map({ $0 >= 0 }) ?? true else {
+            throw ExperimentalDecodeError.unsupportedPrefill
+        }
+        self.model = model
+        self.y = input.text
+        self.cache = model.newCache(parameters: nil)
+        self.processor = processor
+        self.sampler = sampler
+        self.maxTokens = maxTokens
+        self.kvBits = nil
+        self.kvGroupSize = 64
+        self.quantizedKVStart = 0
+        self.kvMode = .none
+        self.cacheCoordinator = nil
+        self.disableDiskBackedRequiredToolRestore = false
+        self.skipDiskBackedToolPromptSeedBoundary = false
+        self.promptTokenIds = []
+        self.cachePrefixTokenCounts = []
+        self.originalInput = input
+        self.cacheInitParameters = nil
+        self.mediaSalt = nil
+
+        do {
+            self.promptPrefillTime = try measure {
+                try Task.checkCancellation()
+                let prepared = try experimentalPrepare(input, cache, prefillStepSize)
+                try Task.checkCancellation()
+                switch prepared {
+                case .tokens(let tokens):
+                    guard tokens.tokens.size > 0,
+                        tokens.tokens.ndim == 1
+                            || (tokens.tokens.ndim == 2 && tokens.tokens.dim(0) == 1)
+                    else { throw ExperimentalDecodeError.unsupportedPrefill }
+                    self.processor?.prompt(input.text.tokens)
+                    y = tokens
+                    let stepInput: LMInput.Text = tokens.tokens.ndim == 1
+                        ? tokens[text: .newAxis] : tokens
+                    let output = try experimentalForward(stepInput, cache.isEmpty ? nil : cache, state)
+                    try Task.checkCancellation()
+                    state = output.state
+                    y = .init(tokens: convertToToken(logits: output.logits))
+                case .logits(let result):
+                    let promptTokens = result.effectivePromptTokens.map {
+                        MLXArray($0.map { Int32($0) }).expandedDimensions(axis: 0)
+                    } ?? input.text.tokens
+                    self.processor?.prompt(promptTokens)
+                    y = .init(tokens: convertToToken(logits: result.logits))
+                }
+                asyncEval(y.tokens)
+                try Task.checkCancellation()
+            }
+        } catch {
+            StreamOrDevice.default.stream.synchronize()
+            discardOnFailure()
+            throw error
         }
     }
 
