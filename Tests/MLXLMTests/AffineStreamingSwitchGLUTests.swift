@@ -901,6 +901,51 @@ struct AffineStreamingSwitchGLUTests {
         }
     }
 
+    @Test("arena mapping slot is bounded and retains a cancelled mapping")
+    func qwen35ArenaMapping() throws {
+        try MLXMetalTestLock.withLock {
+            let fixture = try makeFixture(numExperts: 4, dimensions: 64, layout: .qwen35)
+            defer { try? FileManager.default.removeItem(at: fixture.directory) }
+            let catalog = AffineStreamingExpertCatalog(numExperts: 4, inputDims: 64, hiddenDims: 64, layout: .qwen35)
+            try catalog.configure(modelDirectory: fixture.directory, layerCount: 1)
+            let reducer = AffineStreamingSwitchGLU(inputDims: 64, hiddenDims: 64, numExperts: 4,
+                layerIndex: 0, catalog: catalog)
+            let x = MLXArray([Float](repeating: 0.25, count: 2 * 64), [1, 2, 64]).asType(.bfloat16)
+            let ids = MLXArray([Int32(0), 1], [1, 2, 1])
+            let scores = MLXArray([Float](repeating: 1, count: 2), [1, 2, 1])
+            let limit = max(try catalog.mappedExpertBytes(layer: 0, expert: 0),
+                            try catalog.mappedExpertBytes(layer: 0, expert: 1))
+            let streams = [StreamOrDevice.default.stream, MLX.Stream.cpu]
+            let gate = ExperimentalRequestArenaGate()
+            try gate.withRequest(operation: { arena in
+                let result = try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
+                    groupLimit: 2, tokenWindow: 2, limits: researchLimits,
+                    arena: arena, maxRetainedMappingBytes: limit, retainedStreams: streams)
+                #expect(result.shape == x.shape)
+                #expect(arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self)?.hasMapping == false)
+                return .finished(())
+            }, drain: { _ in for stream in streams { try stream.experimentalSynchronize() } }, invalidate: { _ in })
+            var checks = 0
+            do {
+                let _: Void = try gate.withRequest(operation: { arena in
+                    _ = try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
+                        groupLimit: 2, tokenWindow: 2, limits: researchLimits,
+                        shouldCancel: { checks += 1; return checks == 5 },
+                        arena: arena, maxRetainedMappingBytes: limit, retainedStreams: streams)
+                    return .finished(())
+                }, drain: { arena in
+                    #expect(arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self)?.hasMapping == true)
+                    throw CancellationError()
+                }, invalidate: { _ in })
+                Issue.record("failed drain was accepted")
+            } catch is ExperimentalRequestArenaCleanupError {}
+            try gate.recover(drain: { arena in
+                #expect(arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self)?.hasMapping == true)
+                for stream in streams { try stream.experimentalSynchronize() }
+            }, invalidate: { _ in })
+        }
+    }
+
     @Test("Qwen35 mapped reducer stops and recovers after cancellation")
     func qwen35MappedCancellation() throws {
         try MLXMetalTestLock.withLock {

@@ -331,7 +331,7 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
         return try mappedExpertBytes(spec, expert: expert)
     }
 
-    private func mappedExpertBytes(_ spec: LayerSpec, expert: Int) throws -> UInt64 {
+    fileprivate func mappedExpertBytes(_ spec: LayerSpec, expert: Int) throws -> UInt64 {
         let page = UInt64(getpagesize())
         var total: UInt64 = 0
         for projection in [spec.gate, spec.up, spec.down] {
@@ -445,7 +445,36 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
 /// The cache retains file mappings, not copied tensors, and is strictly bounded
 /// per layer. Each chunk is evaluated before returning so mappings from old
 /// routing decisions can be evicted and unpinned before the next layer runs.
+/// Request-scoped single mapping owner. The reducer serializes its use; the
+/// enclosing request must stop all producers and drain these exact streams.
+final class ExperimentalExpertMappingSlot {
+    let streams: [MLX.Stream]
+    let maxBytes: UInt64
+    private var owner: AnyObject?
+    var hasMapping: Bool { owner != nil }
+    init(streams: [MLX.Stream], maxBytes: UInt64) {
+        self.streams = streams; self.maxBytes = maxBytes
+    }
+    func checkCapacity(_ bytes: UInt64) throws {
+        guard owner == nil, bytes > 0, bytes <= maxBytes else {
+            throw AffineStreamingExpertError.invalidInput("expert mapping slot busy or byte limit exceeded")
+        }
+    }
+    func install(_ value: AnyObject, bytes: UInt64) throws {
+        try checkCapacity(bytes)
+        owner = value
+    }
+    func checkpoint(drain: () throws -> Void) throws {
+        try drain() // Failure leaves the current mapping strongly retained.
+        owner = nil
+    }
+}
+
 public final class AffineStreamingSwitchGLU: Module {
+    private final class RetainedExpertMapping {
+        let arrays: AffineStreamingExpertCatalog.ExpertArrays
+        init(_ arrays: AffineStreamingExpertCatalog.ExpertArrays) { self.arrays = arrays }
+    }
     public enum ResearchScorePolicy: Equatable {
         case castToRouted
         case preserveNativePromotion
@@ -633,12 +662,27 @@ public final class AffineStreamingSwitchGLU: Module {
     /// model loading. Callers must handle validation or mapping failures.
     /// This path bypasses the per-layer expert cache and rejects overlapping calls.
     /// Supply shouldCancel when work is dispatched outside the caller's Swift task.
+    /// With an arena, pass every exact stream used by the request and ensure
+    /// its gate drains the same streams after producers stop. One arena-owned
+    /// mapping slot is retired only after a successful explicit stream drain;
+    /// failure retains the slot for arena cleanup. The byte limit covers only
+    /// its current page-rounded mapping, not other arrays or retained graphs.
+    /// The legacy nil-arena research path has no such failure retention.
     public func researchQwen35GroupedReduced(
         _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
         tokenWindow: Int, limits: ResearchLimits, scorePolicy: ResearchScorePolicy = .castToRouted,
         shouldCancel: () -> Bool = { false },
-        observeWindow: ((Int, Int) -> Void)? = nil
+        observeWindow: ((Int, Int) -> Void)? = nil,
+        arena: ExperimentalRequestArena? = nil, maxRetainedMappingBytes: UInt64? = nil,
+        retainedStreams: [MLX.Stream] = []
     ) throws -> MLXArray {
+        guard (arena == nil) == (maxRetainedMappingBytes == nil) else {
+            throw AffineStreamingExpertError.invalidInput("arena and mapping byte limit must be supplied together")
+        }
+        guard arena == nil ? retainedStreams.isEmpty :
+            (!retainedStreams.isEmpty && retainedStreams.contains(StreamOrDevice.default.stream)) else {
+            throw AffineStreamingExpertError.invalidInput("arena requires all used streams including the current default")
+        }
         if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
         guard Self.researchAdmission.try() else { throw AffineStreamingExpertError.researchBusy }
         defer { Self.researchAdmission.unlock() }
@@ -646,24 +690,40 @@ public final class AffineStreamingSwitchGLU: Module {
         return try autoreleasepool {
             try researchQwen35GroupedReducedImpl(x, indices: indices, scores: scores,
                 groupLimit: groupLimit, tokenWindow: tokenWindow, limits: limits, scorePolicy: scorePolicy,
-                shouldCancel: shouldCancel, observeWindow: observeWindow)
+                shouldCancel: shouldCancel, observeWindow: observeWindow,
+                arena: arena, maxRetainedMappingBytes: maxRetainedMappingBytes, retainedStreams: retainedStreams)
         }
         #else
         return try researchQwen35GroupedReducedImpl(x, indices: indices, scores: scores,
             groupLimit: groupLimit, tokenWindow: tokenWindow, limits: limits, scorePolicy: scorePolicy,
-            shouldCancel: shouldCancel, observeWindow: observeWindow)
+            shouldCancel: shouldCancel, observeWindow: observeWindow,
+            arena: arena, maxRetainedMappingBytes: maxRetainedMappingBytes, retainedStreams: retainedStreams)
         #endif
     }
 
     private func researchQwen35GroupedReducedImpl(
         _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
         tokenWindow: Int, limits: ResearchLimits, scorePolicy: ResearchScorePolicy,
-        shouldCancel: () -> Bool, observeWindow: ((Int, Int) -> Void)?
+        shouldCancel: () -> Bool, observeWindow: ((Int, Int) -> Void)?,
+        arena: ExperimentalRequestArena?, maxRetainedMappingBytes: UInt64?, retainedStreams: [MLX.Stream]
     ) throws -> MLXArray {
         func checkCancellation() throws {
             if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
         }
         try checkCancellation()
+        let mappingSlot: ExperimentalExpertMappingSlot?
+        if let arena, let maxRetainedMappingBytes {
+            if let existing = arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self) {
+                guard existing.streams == retainedStreams, existing.maxBytes == maxRetainedMappingBytes else {
+                    throw AffineStreamingExpertError.invalidInput("request mapping slot configuration changed")
+                }
+                mappingSlot = existing
+            } else {
+                let slot = ExperimentalExpertMappingSlot(streams: retainedStreams, maxBytes: maxRetainedMappingBytes)
+                try arena.retain(slot)
+                mappingSlot = slot
+            }
+        } else { mappingSlot = nil }
         guard catalog.layout == .qwen35 else {
             throw AffineStreamingExpertError.invalidInput("Qwen35 layout required")
         }
@@ -714,8 +774,14 @@ public final class AffineStreamingSwitchGLU: Module {
                     while end < routes && sortedIDs[end] == sortedIDs[start] { end += 1 }
                     // Avoid per-layer persistent mappings and concurrent duplicate
                     // cache misses in this experimental process-wide lease.
+                    let mappedBytes: UInt64
+                    if mappingSlot != nil {
+                        mappedBytes = try catalog.mappedExpertBytes(layerSnapshot, expert: expertID)
+                    } else { mappedBytes = 0 }
+                    try mappingSlot?.checkCapacity(mappedBytes)
                     let mapped = try catalog.loadExpert(snapshot: layerSnapshot, expert: expertID,
                         maxMappedBytes: limits.maxMappedExpertBytes)
+                    try mappingSlot?.install(RetainedExpertMapping(mapped), bytes: mappedBytes)
                     var offset = start
                     while offset < end {
                         try checkCancellation()
@@ -752,6 +818,11 @@ public final class AffineStreamingSwitchGLU: Module {
                         try MLX.checkedEval(kept)
                         segments.append(kept)
                         offset = stop
+                    }
+                    if let mappingSlot {
+                        try mappingSlot.checkpoint {
+                            for stream in mappingSlot.streams { try stream.experimentalSynchronize() }
+                        }
                     }
                     start = end
                 }
