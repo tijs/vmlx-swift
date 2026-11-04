@@ -19,6 +19,7 @@ public enum Qwen35AffineResearchManifest {
         public let byteLength: UInt64
     }
     public struct Inspection {
+        public let modelDirectory: URL
         public let tensors: [String: TensorDescriptor]
         public let metadata: [String: [String: String]]
     }
@@ -165,7 +166,7 @@ public enum Qwen35AffineResearchManifest {
         let routed = Set(actual.keys.filter { $0.split(separator: ".").contains("switch_mlp") })
         guard routed == expected else { throw ValidationError("routed tensor coverage or naming mismatch") }
         try checkCancellation()
-        return Inspection(tensors: descriptors, metadata: metadata)
+        return Inspection(modelDirectory: root, tensors: descriptors, metadata: metadata)
     }
 
     /// Only byte-aligned safetensors types supported by this research path.
