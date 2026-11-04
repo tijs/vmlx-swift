@@ -1139,6 +1139,20 @@ public struct Qwen35Configuration: Codable, Sendable {
 // MARK: - Language
 
 enum Qwen35Language {
+    static func validateResearchMappingContext(
+        arena: ExperimentalRequestArena?, maxBytes: UInt64?, streams: [MLX.Stream]
+    ) throws {
+        if arena == nil {
+            guard maxBytes == nil && streams.isEmpty else {
+                throw AffineStreamingExpertError.invalidInput("incomplete research mapping ownership")
+            }
+        } else {
+            guard let maxBytes, maxBytes > 0, !streams.isEmpty,
+                streams.contains(StreamOrDevice.default.stream) else {
+                throw AffineStreamingExpertError.invalidInput("research mapping owner requires byte limit and exact streams")
+            }
+        }
+    }
     static func shouldCompileDecodeRegions(
         _ args: Qwen35Configuration.TextConfiguration,
         environment: [String: String] = ProcessInfo.processInfo.environment
@@ -2405,8 +2419,11 @@ enum Qwen35Language {
         func researchAffineForward(
             _ x: MLXArray, reducer: AffineStreamingSwitchGLU,
             limits: AffineStreamingSwitchGLU.ResearchLimits,
-            groupLimit: Int, tokenWindow: Int, shouldCancel: () -> Bool = { false }
+            groupLimit: Int, tokenWindow: Int, shouldCancel: () -> Bool = { false },
+            arena: ExperimentalRequestArena? = nil, maxRetainedMappingBytes: UInt64? = nil,
+            retainedStreams: [MLX.Stream] = []
         ) throws -> MLXArray {
+            try Qwen35Language.validateResearchMappingContext(arena: arena, maxBytes: maxRetainedMappingBytes, streams: retainedStreams)
             func checkCancellation() throws {
                 if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
             }
@@ -2434,7 +2451,8 @@ enum Qwen35Language {
             // MLX promote the weighted output; the text path casts instead.
             let routed = try reducer.researchQwen35GroupedReduced(x, indices: indices,
                 scores: scores, groupLimit: groupLimit, tokenWindow: tokenWindow,
-                limits: limits, scorePolicy: .preserveNativePromotion, shouldCancel: shouldCancel)
+                limits: limits, scorePolicy: .preserveNativePromotion, shouldCancel: shouldCancel,
+                arena: arena, maxRetainedMappingBytes: maxRetainedMappingBytes, retainedStreams: retainedStreams)
             try checkCancellation()
             let shared = sharedExpert(x)
             let gatedShared = compiledSigmoidGate(sharedExpertGate(x), shared)
@@ -2624,8 +2642,11 @@ enum Qwen35Language {
             _ x: MLXArray, attentionMask: MLXArray?, ssmMask: MLXArray?,
             cache: KVCache?, positionIds: MLXArray?, reducer: AffineStreamingSwitchGLU,
             limits: AffineStreamingSwitchGLU.ResearchLimits, groupLimit: Int,
-            tokenWindow: Int, shouldCancel: () -> Bool = { false }
+            tokenWindow: Int, shouldCancel: () -> Bool = { false },
+            arena: ExperimentalRequestArena? = nil, maxRetainedMappingBytes: UInt64? = nil,
+            retainedStreams: [MLX.Stream] = []
         ) throws -> MLXArray {
+            try Qwen35Language.validateResearchMappingContext(arena: arena, maxBytes: maxRetainedMappingBytes, streams: retainedStreams)
             if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
             guard let sparse = mlp as? SparseMoeBlock,
                 !sparse.compileDecodeRegions, !sparse.decodeEquivalentVerifierRows,
@@ -2669,7 +2690,8 @@ enum Qwen35Language {
             let h = x + attentionOutput
             let out = try sparse.researchAffineForward(postAttentionLayerNorm(h), reducer: reducer,
                 limits: limits, groupLimit: groupLimit, tokenWindow: tokenWindow,
-                shouldCancel: shouldCancel)
+                shouldCancel: shouldCancel, arena: arena, maxRetainedMappingBytes: maxRetainedMappingBytes,
+                retainedStreams: retainedStreams)
             return h + out
         }
     }
@@ -2839,8 +2861,11 @@ enum Qwen35Language {
         func researchAffineForward(
             _ inputs: MLXArray, cache: [KVCache?]?, positionIds: MLXArray?,
             reducers: [AffineStreamingSwitchGLU], limits: AffineStreamingSwitchGLU.ResearchLimits,
-            groupLimit: Int, tokenWindow: Int, shouldCancel: () -> Bool = { false }
+            groupLimit: Int, tokenWindow: Int, shouldCancel: () -> Bool = { false },
+            arena: ExperimentalRequestArena? = nil, maxRetainedMappingBytes: UInt64? = nil,
+            retainedStreams: [MLX.Stream] = []
         ) throws -> MLXArray {
+            try Qwen35Language.validateResearchMappingContext(arena: arena, maxBytes: maxRetainedMappingBytes, streams: retainedStreams)
             if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
             guard inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) > 0,
                 !layers.isEmpty, reducers.count == layers.count,
@@ -2876,7 +2901,8 @@ enum Qwen35Language {
                 hidden = try layer.researchAffineForward(hidden, attentionMask: attentionMask,
                     ssmMask: layer.isLinear ? ssmMask : nil, cache: cacheArray[index],
                     positionIds: positionIds, reducer: reducers[index], limits: limits,
-                    groupLimit: groupLimit, tokenWindow: tokenWindow, shouldCancel: shouldCancel)
+                    groupLimit: groupLimit, tokenWindow: tokenWindow, shouldCancel: shouldCancel,
+                    arena: arena, maxRetainedMappingBytes: maxRetainedMappingBytes, retainedStreams: retainedStreams)
             }
             return norm(hidden)
         }
@@ -3038,6 +3064,9 @@ enum Qwen35Language {
             ropeDeltas = nil
         }
 
+        /// Research diagnostics without exposing model-owned MLX arrays.
+        var hasResearchPositionState: Bool { precomputedPositionIds != nil || ropeDeltas != nil }
+
         fileprivate func resolvedPositionIds(
             inputs: MLXArray,
             cache: [KVCache?]?,
@@ -3193,15 +3222,19 @@ enum Qwen35Language {
         }
 
         /// Research-only text forward. On failure the caller must discard
-        /// the request's cache and every alias; position state is reset here.
+        /// the request's cache and every alias. Arena-owned position state is
+        /// reset by the owner after draining; nil-arena failures reset here.
         /// Explicit position IDs are caller-owned and must reflect the cache.
         func researchAffineForward(
             _ inputs: MLXArray, cache: [KVCache?]? = nil, mask: MLXArray? = nil,
             positionIds: MLXArray? = nil, reducers: [AffineStreamingSwitchGLU],
             limits: AffineStreamingSwitchGLU.ResearchLimits, groupLimit: Int,
-            tokenWindow: Int, shouldCancel: () -> Bool = { false }
+            tokenWindow: Int, shouldCancel: () -> Bool = { false },
+            arena: ExperimentalRequestArena? = nil, maxRetainedMappingBytes: UInt64? = nil,
+            retainedStreams: [MLX.Stream] = []
         ) throws -> LMOutput {
             do {
+                try Qwen35Language.validateResearchMappingContext(arena: arena, maxBytes: maxRetainedMappingBytes, streams: retainedStreams)
                 if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
                 guard inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) > 0,
                     !model.layers.isEmpty, model.faIdx >= 0, model.faIdx < model.layers.count,
@@ -3233,7 +3266,8 @@ enum Qwen35Language {
                     resetForMedia: false)
                 let hidden = try model.researchAffineForward(inputs, cache: cache, positionIds: positions,
                     reducers: reducers, limits: limits, groupLimit: groupLimit,
-                    tokenWindow: tokenWindow, shouldCancel: shouldCancel)
+                    tokenWindow: tokenWindow, shouldCancel: shouldCancel, arena: arena,
+                    maxRetainedMappingBytes: maxRetainedMappingBytes, retainedStreams: retainedStreams)
                 if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
                 // The returned logits must not defer an MLX error until after
                 // this method's failure handler has reset position state.
@@ -3246,7 +3280,9 @@ enum Qwen35Language {
                 if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
                 return LMOutput(logits: logits)
             } catch {
-                resetPositionState()
+                // Arena-owned requests retain state until their exact streams
+                // drain; the owner's invalidation must reset it afterward.
+                if arena == nil { resetPositionState() }
                 throw error
             }
         }

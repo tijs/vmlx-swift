@@ -360,19 +360,26 @@ struct Qwen35AffineResearchHybridTests {
             // GPU error reporting or a production inference integration.
             let streamGate = ExperimentalRequestArenaGate()
             let exactStream = StreamOrDevice.default.stream
+            let exactStreams = [exactStream, MLX.Stream.cpu]
+            var mappingBudget: UInt64 = 0
+            for layer in 0..<2 { for expert in 0..<4 {
+                mappingBudget = max(mappingBudget, try catalog.mappedExpertBytes(layer: layer, expert: expert))
+            }}
             language.resetPositionState()
             var ownedTokens: [Int] = []
             try ExperimentalOwnedStreamRequest.run(gate: streamGate,
-                streams: [ExperimentalOwnedStream(stream: exactStream)],
+                streams: exactStreams.map { ExperimentalOwnedStream(stream: $0) },
                 operation: { arena in
                     let source = try ExperimentalThrowingTokenIterator.experimentalArenaTextPrefill(
                         input: input, model: model, arena: arena, processor: nil,
                         sampler: ArgMaxSampler(), maxTokens: 3,
                         prepare: { input, _, _ in .tokens(input.text) },
-                        forward: { text, cache, _ in
-                            try language.researchAffineForward(text.tokens,
+                        forward: { [weak arena] text, cache, _ in
+                            guard let arena else { throw ExperimentalRequestArenaError.sealed }
+                            return try language.researchAffineForward(text.tokens,
                                 cache: cache?.map { $0 as KVCache? }, reducers: reducers,
-                                limits: researchLimits, groupLimit: 16, tokenWindow: 2)
+                                limits: researchLimits, groupLimit: 16, tokenWindow: 2,
+                                arena: arena, maxRetainedMappingBytes: mappingBudget, retainedStreams: exactStreams)
                         })
                     while let token = try source.nextToken() { ownedTokens.append(token) }
                 }, invalidate: { language.resetPositionState() })
@@ -396,15 +403,17 @@ struct Qwen35AffineResearchHybridTests {
                     streams: [ExperimentalOwnedStream(drain: {
                         if failDrain { throw FixtureFailure.drain }
                         try exactStream.experimentalSynchronize()
-                    })], operation: { arena in
+                    }), ExperimentalOwnedStream(stream: MLX.Stream.cpu)], operation: { arena in
                         let source = try ExperimentalThrowingTokenIterator.experimentalArenaTextPrefill(
                             input: input, model: model, arena: arena, processor: nil,
                             sampler: ArgMaxSampler(),
                             prepare: { input, _, _ in .tokens(input.text) },
-                            forward: { text, cache, _ in
+                            forward: { [weak arena] text, cache, _ in
+                                guard let arena else { throw ExperimentalRequestArenaError.sealed }
                                 let output = try language.researchAffineForward(text.tokens,
                                     cache: cache?.map { $0 as KVCache? }, reducers: reducers,
-                                    limits: researchLimits, groupLimit: 16, tokenWindow: 2)
+                                    limits: researchLimits, groupLimit: 16, tokenWindow: 2,
+                                    arena: arena, maxRetainedMappingBytes: mappingBudget, retainedStreams: exactStreams)
                                 if text.tokens.size == 1 {
                                     #expect(cache?.count == 2)
                                     #expect(cache?.allSatisfy { $0.offset == 4 } == true)
@@ -432,6 +441,58 @@ struct Qwen35AffineResearchHybridTests {
             try ExperimentalOwnedStreamRequest.recover(gate: streamGate)
             #expect(streamInvalidated)
             #expect(streamSource == nil)
+
+            // Cancel after a real expert mapping was registered, then fail
+            // outer drain. The arena must keep the real slot through recovery.
+            language.resetPositionState()
+            #expect(!language.hasResearchPositionState)
+            failDrain = true
+            weak var retainedSlot: ExperimentalExpertMappingSlot?
+            var mappingInvalidated = false
+            do {
+                try ExperimentalOwnedStreamRequest.run(gate: streamGate,
+                    streams: [ExperimentalOwnedStream(drain: {
+                        if failDrain {
+                            #expect(language.hasResearchPositionState)
+                            throw FixtureFailure.drain
+                        }
+                        try exactStream.experimentalSynchronize()
+                    }), ExperimentalOwnedStream(stream: MLX.Stream.cpu)], operation: { arena in
+                        let ssm = MambaCache()
+                        let attention = KVCacheSimple()
+                        try arena.retain(language)
+                        try arena.retain(ssm)
+                        try arena.retain(attention)
+                        defer { retainedSlot = arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self) }
+                        _ = try language.researchAffineForward(prompt, cache: [ssm, attention],
+                            reducers: reducers, limits: researchLimits, groupLimit: 16, tokenWindow: 2,
+                            shouldCancel: {
+                                arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self)?.hasMapping == true
+                            }, arena: arena, maxRetainedMappingBytes: mappingBudget, retainedStreams: exactStreams)
+                    }, invalidate: { mappingInvalidated = true; language.resetPositionState() })
+                Issue.record("mapping cancellation and drain failure were accepted")
+            } catch let error as ExperimentalRequestArenaCleanupError {
+                #expect(error.primary is CancellationError)
+            }
+            #expect(retainedSlot?.hasMapping == true)
+            #expect(language.hasResearchPositionState)
+            #expect(!mappingInvalidated)
+            failDrain = false
+            try ExperimentalOwnedStreamRequest.recover(gate: streamGate)
+            #expect(mappingInvalidated)
+            #expect(retainedSlot == nil)
+            #expect(!language.hasResearchPositionState)
+
+            let legacyCache: [KVCache?] = [MambaCache(), KVCacheSimple()]
+            let seeded = language(prompt, cache: legacyCache).logits
+            MLX.eval(seeded)
+            #expect(language.hasResearchPositionState)
+            #expect(throws: CancellationError.self) {
+                try language.researchAffineForward(prompt, cache: [MambaCache(), KVCacheSimple()],
+                    reducers: reducers, limits: researchLimits, groupLimit: 16, tokenWindow: 2,
+                    shouldCancel: { true })
+            }
+            #expect(!language.hasResearchPositionState)
         }
     }
 }
