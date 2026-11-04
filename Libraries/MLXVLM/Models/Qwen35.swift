@@ -2617,6 +2617,61 @@ enum Qwen35Language {
             }
             return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
         }
+
+        /// Research-only eager layer forward. A failure after attention may
+        /// have mutated `cache`; the request owner must discard all its aliases.
+        func researchAffineForward(
+            _ x: MLXArray, attentionMask: MLXArray?, ssmMask: MLXArray?,
+            cache: KVCache?, positionIds: MLXArray?, reducer: AffineStreamingSwitchGLU,
+            limits: AffineStreamingSwitchGLU.ResearchLimits, groupLimit: Int,
+            tokenWindow: Int, shouldCancel: () -> Bool = { false }
+        ) throws -> MLXArray {
+            if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
+            guard let sparse = mlp as? SparseMoeBlock,
+                !sparse.compileDecodeRegions, !sparse.decodeEquivalentVerifierRows,
+                !CompiledDecodeTrace.isActive, Qwen4ExpVerifyTile.rows == nil,
+                sparse.switchMLP is SwitchGLU,
+                sparse.researchLayerIndex >= 0, sparse.researchLayerIndex == reducer.layerIndex,
+                sparse.numExperts == reducer.numExperts, sparse.researchHiddenDims == reducer.hiddenDims,
+                sparse.topK > 0, sparse.topK <= sparse.numExperts,
+                sparse.gate.shape.0 == sparse.numExperts,
+                sparse.gate.shape.1 == reducer.inputDims,
+                x.ndim == 3, x.dim(0) == 1, x.dim(1) > 0, x.dim(-1) == reducer.inputDims,
+                x.dtype == .bfloat16 || x.dtype == .float16
+            else {
+                throw AffineStreamingExpertError.invalidInput("unsupported research decoder configuration")
+            }
+            try limits.validate(tokens: x.dim(1), inputDims: reducer.inputDims,
+                routesPerToken: sparse.topK, window: tokenWindow, group: groupLimit)
+            if !isLinear && x.dim(1) > 1 && attentionMask == nil {
+                throw AffineStreamingExpertError.invalidInput(
+                    "multi-token research attention requires a pre-update mask")
+            }
+            if let cache, cache is BatchKVCache || graphOffsetArray(for: cache) != nil {
+                throw AffineStreamingExpertError.invalidInput("compiled or batched research cache unsupported")
+            }
+            let attentionInput = inputLayerNorm(x)
+            let attentionOutput: MLXArray
+            if isLinear {
+                guard let linearAttn, cache == nil || cache is MambaCache else {
+                    throw AffineStreamingExpertError.invalidInput("invalid research SSM cache")
+                }
+                attentionOutput = linearAttn(attentionInput, mask: ssmMask,
+                    cache: cache as? MambaCache, recordPrefixCommitStates: false)
+            } else {
+                guard let selfAttn, !(cache is MambaCache) else {
+                    throw AffineStreamingExpertError.invalidInput("missing research attention")
+                }
+                attentionOutput = selfAttn(attentionInput, mask: attentionMask,
+                    cache: cache, positionIds: positionIds)
+            }
+            if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
+            let h = x + attentionOutput
+            let out = try sparse.researchAffineForward(postAttentionLayerNorm(h), reducer: reducer,
+                limits: limits, groupLimit: groupLimit, tokenWindow: tokenWindow,
+                shouldCancel: shouldCancel)
+            return h + out
+        }
     }
 
     final class MTPDecoderLayer: Module {
@@ -2776,6 +2831,54 @@ enum Qwen35Language {
                 inputs, inputsEmbeds: inputsEmbeds, cache: cache,
                 positionIds: positionIds, captureLayerIDs: [])
             return h
+        }
+
+        /// Research-only, text-only sequence of fallible decoder forwards.
+        /// The caller must bind reducers to the same immutable checkpoint as
+        /// the resident layers and discard cache aliases after any failure.
+        func researchAffineForward(
+            _ inputs: MLXArray, cache: [KVCache?]?, positionIds: MLXArray?,
+            reducers: [AffineStreamingSwitchGLU], limits: AffineStreamingSwitchGLU.ResearchLimits,
+            groupLimit: Int, tokenWindow: Int, shouldCancel: () -> Bool = { false }
+        ) throws -> MLXArray {
+            if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
+            guard inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) > 0,
+                !layers.isEmpty, reducers.count == layers.count,
+                (cache == nil || cache?.count == layers.count),
+                ssmIdx >= 0, ssmIdx < layers.count, faIdx >= 0, faIdx < layers.count
+            else { throw AffineStreamingExpertError.invalidInput("invalid research model inputs or caches") }
+            for (index, layer) in layers.enumerated() {
+                guard let sparse = layer.mlp as? SparseMoeBlock,
+                    sparse.switchMLP is SwitchGLU, !CompiledDecodeTrace.isActive,
+                    Qwen4ExpVerifyTile.rows == nil,
+                    !sparse.compileDecodeRegions, !sparse.decodeEquivalentVerifierRows,
+                    sparse.researchLayerIndex == index, reducers[index].layerIndex == index,
+                    sparse.numExperts == reducers[index].numExperts,
+                    sparse.researchHiddenDims == reducers[index].hiddenDims,
+                    sparse.topK > 0, sparse.topK <= sparse.numExperts,
+                    sparse.gate.shape.1 == reducers[index].inputDims
+                else { throw AffineStreamingExpertError.invalidInput("incompatible research model layer") }
+                try limits.validate(tokens: inputs.dim(1), inputDims: reducers[index].inputDims,
+                    routesPerToken: sparse.topK, window: tokenWindow, group: groupLimit)
+                if let layerCache = cache?[index] {
+                    guard !(layerCache is BatchKVCache), graphOffsetArray(for: layerCache) == nil,
+                        layer.isLinear == (layerCache is MambaCache)
+                    else { throw AffineStreamingExpertError.invalidInput("incompatible research model cache") }
+                }
+            }
+            var hidden = embedTokens(inputs)
+            let cacheArray = cache ?? Array(repeating: nil as KVCache?, count: layers.count)
+            let maskMode = createAttentionMask(h: hidden, cache: cacheArray[faIdx], returnArray: true)
+            let attentionMask: MLXArray?
+            if case .array(let mask) = maskMode { attentionMask = mask } else { attentionMask = nil }
+            let ssmMask = createSSMMask(h: hidden, cache: cacheArray[ssmIdx] as? MambaCache)
+            for (index, layer) in layers.enumerated() {
+                hidden = try layer.researchAffineForward(hidden, attentionMask: attentionMask,
+                    ssmMask: layer.isLinear ? ssmMask : nil, cache: cacheArray[index],
+                    positionIds: positionIds, reducer: reducers[index], limits: limits,
+                    groupLimit: groupLimit, tokenWindow: tokenWindow, shouldCancel: shouldCancel)
+            }
+            return norm(hidden)
         }
 
         func callAsFunctionPreNorm(
@@ -3087,6 +3190,56 @@ enum Qwen35Language {
             out = headLogits(out)
 
             return LMOutput(logits: out)
+        }
+
+        /// Research-only text forward. On failure the caller must discard
+        /// the request's cache and every alias; position state is reset here.
+        /// Explicit position IDs are caller-owned and must reflect the cache.
+        func researchAffineForward(
+            _ inputs: MLXArray, cache: [KVCache?]? = nil, mask: MLXArray? = nil,
+            positionIds: MLXArray? = nil, reducers: [AffineStreamingSwitchGLU],
+            limits: AffineStreamingSwitchGLU.ResearchLimits, groupLimit: Int,
+            tokenWindow: Int, shouldCancel: () -> Bool = { false }
+        ) throws -> LMOutput {
+            do {
+                if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
+                guard inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) > 0,
+                    !model.layers.isEmpty, model.faIdx >= 0, model.faIdx < model.layers.count,
+                    (cache == nil || cache?.count == model.layers.count),
+                    !CompiledDecodeTrace.isActive, Qwen4ExpVerifyTile.rows == nil
+                else { throw AffineStreamingExpertError.invalidInput("invalid research language inputs") }
+                if let mask {
+                    guard mask.ndim == 2, mask.dim(0) == 1, mask.dim(1) == inputs.dim(1) else {
+                        throw AffineStreamingExpertError.invalidInput("invalid research text mask")
+                    }
+                }
+                if let positionIds {
+                    guard positionIds.ndim == 3, positionIds.dim(0) == 3,
+                        positionIds.dim(1) == 1, positionIds.dim(2) == inputs.dim(1),
+                        positionIds.dtype == .int32
+                    else { throw AffineStreamingExpertError.invalidInput("invalid research position IDs") }
+                }
+                if let attentionCache = cache?[model.faIdx] {
+                    guard !(attentionCache is BatchKVCache), graphOffsetArray(for: attentionCache) == nil,
+                        !(attentionCache is MambaCache)
+                    else { throw AffineStreamingExpertError.invalidInput("unsupported research attention cache") }
+                    if attentionCache.offset > 0 && ropeDeltas == nil && positionIds == nil {
+                        throw AffineStreamingExpertError.invalidInput(
+                            "restored research cache requires explicit position IDs")
+                    }
+                }
+                let positions = resolvedPositionIds(inputs: inputs, cache: cache, mask: mask,
+                    providedPositionIds: positionIds, imageGridTHW: nil, videoGridTHW: nil,
+                    resetForMedia: false)
+                let hidden = try model.researchAffineForward(inputs, cache: cache, positionIds: positions,
+                    reducers: reducers, limits: limits, groupLimit: groupLimit,
+                    tokenWindow: tokenWindow, shouldCancel: shouldCancel)
+                if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
+                return LMOutput(logits: headLogits(hidden))
+            } catch {
+                resetPositionState()
+                throw error
+            }
         }
 
         /// Text-only `(MLXArray, [KVCache]?) -> MLXArray` forward used by
