@@ -36,6 +36,12 @@ public final class ExperimentalRequestArena {
         guard !sealed else { throw ExperimentalRequestArenaError.sealed }
         resources.append(resource)
     }
+    // Read registered owners during gate-controlled recovery.
+    func registeredResource<T>(ofType type: T.Type) -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        return resources.first { $0 is T } as? T
+    }
     fileprivate func seal() {
         lock.lock()
         defer { lock.unlock() }
