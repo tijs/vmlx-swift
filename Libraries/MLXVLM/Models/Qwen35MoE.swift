@@ -11,6 +11,9 @@ import MLX
 import MLXLMCommon
 
 public final class Qwen35MoE: Qwen35 {
+    public struct InvalidFusedExpertWeightError: Error, Equatable {
+        public let key: String
+    }
     /// Simulate MoE key transformations without evaluating tensors. Reject
     /// collisions before the nonthrowing sanitizer can overwrite a tensor.
     public override func validateBeforeSanitize(weights: [String: MLXArray], metadata: [String: String]) throws {
@@ -47,6 +50,11 @@ public final class Qwen35MoE: Qwen35 {
                 }
                 let fused = "\(prefix).experts.gate_up_proj"
                 if let value = keys.removeValue(forKey: fused) {
+                    guard value.ndim >= 2 else { throw InvalidFusedExpertWeightError(key: fused) }
+                    let split = value.dim(-2)
+                    guard split > 0, split % 2 == 0 else {
+                        throw InvalidFusedExpertWeightError(key: fused)
+                    }
                     try insert("\(prefix).switch_mlp.gate_proj.weight", source: fused, value: value)
                     try insert("\(prefix).switch_mlp.up_proj.weight", source: fused, value: value)
                     let down = "\(prefix).experts.down_proj"

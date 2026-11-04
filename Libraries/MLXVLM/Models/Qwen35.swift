@@ -3952,10 +3952,24 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         return key
     }
 
+    public struct InvalidConvolutionWeightError: Error, Equatable {
+        public let key: String
+    }
+
+    public struct InvalidVisionPatchWeightError: Error, Equatable {
+        public let key: String
+    }
+
     public func validateBeforeSanitize(weights: [String: MLXArray], metadata: [String: String]) throws {
         let loadNativeMTP = config.textConfiguration.mtpNumHiddenLayers > 0
         var remaining = loadNativeMTP ? weights : weights.filter { !Self.isMTPWeightKey($0.key) }
         if config.textConfiguration.tieWordEmbeddings { remaining["lm_head.weight"] = nil }
+        if let key = remaining.keys.sorted().first(where: {
+            guard $0.contains("conv1d.weight"), let value = remaining[$0] else { return false }
+            return value.ndim == 0 || (value.ndim < 3 && value.dim(-1) != 1)
+        }) {
+            throw InvalidConvolutionWeightError(key: key)
+        }
         let hasUnsanitizedConv1d = remaining.contains { $0.key.contains("conv1d.weight") && $0.value.dim(-1) != 1 }
         let shift = NormConventionResolver.shouldApplyPlusOneShift(
             metadataConvention: Self.normConvention(metadata),
@@ -3967,6 +3981,16 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         let needsRemap = remaining.keys.contains { $0.contains("model.language_model") || $0.contains("model.visual") }
         if metadata["format"]?.lowercased() == "mlx" && !hasUnsanitizedConv1d && !shift && !mtpShift && !needsRemap {
             return
+        }
+        if visionModel != nil {
+            for source in remaining.keys.sorted() {
+                let destination = Self.sanitizedWeightKey(source, loadNativeMTP: loadNativeMTP)
+                if !destination.contains("position_ids"),
+                    destination.contains("patch_embed.proj.weight"),
+                    remaining[source]!.ndim != 5 {
+                    throw InvalidVisionPatchWeightError(key: source)
+                }
+            }
         }
         var sourcesByDestination: [String: [String]] = [:]
         for source in remaining.keys.sorted() {
