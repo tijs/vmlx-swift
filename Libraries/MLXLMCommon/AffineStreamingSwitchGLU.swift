@@ -506,6 +506,21 @@ public final class AffineStreamingSwitchGLU: Module {
         _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
         tokenWindow: Int, observeWindow: ((Int, Int) -> Void)? = nil
     ) throws -> MLXArray {
+        #if canImport(ObjectiveC)
+        return try autoreleasepool {
+            try researchQwen35GroupedReducedImpl(x, indices: indices, scores: scores,
+                groupLimit: groupLimit, tokenWindow: tokenWindow, observeWindow: observeWindow)
+        }
+        #else
+        return try researchQwen35GroupedReducedImpl(x, indices: indices, scores: scores,
+            groupLimit: groupLimit, tokenWindow: tokenWindow, observeWindow: observeWindow)
+        #endif
+    }
+
+    private func researchQwen35GroupedReducedImpl(
+        _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
+        tokenWindow: Int, observeWindow: ((Int, Int) -> Void)?
+    ) throws -> MLXArray {
         guard catalog.layout == .qwen35 else {
             throw AffineStreamingExpertError.invalidInput("Qwen35 layout required")
         }
@@ -530,70 +545,78 @@ public final class AffineStreamingSwitchGLU: Module {
         var tokenStart = 0
         while tokenStart < totalTokens {
             let tokenEnd = tokenStart + min(tokenWindow, totalTokens - tokenStart)
-            let windowIndices = indicesFlat[tokenStart ..< tokenEnd, 0...]
-            let ids = windowIndices.flattened().asArray(Int32.self)
-            guard ids.allSatisfy({ $0 >= 0 && $0 < numExperts }) else {
-                throw AffineStreamingExpertError.invalidInput("routed expert ID out of range")
-            }
-            let windowX = xFlat[tokenStart ..< tokenEnd, 0...]
-            let expanded = expandedDimensions(windowX, axes: [-2, -3])
-            let (sortedX, sortedIndices, inverse) = gatherSort(x: expanded, indices: windowIndices)
-            let sortedIDs = sortedIndices.asArray(Int32.self)
-            let routes = sortedIDs.count
-            var segments: [MLXArray] = []
-            var paddedRows = 0
-            var start = 0
-            while start < routes {
-                let expertID = Int(sortedIDs[start])
-                var end = start + 1
-                while end < routes && sortedIDs[end] == sortedIDs[start] { end += 1 }
-                let mapped = try cachedExpert(expertID)
-                var offset = start
-                while offset < end {
-                    let stop = offset + min(groupLimit, end - offset)
-                    let count = stop - offset
-                    let padded = useRHS ? max(count, 16) : count
-                    paddedRows += padded
-                    var group = sortedX[offset ..< stop, 0..., 0...]
-                    if padded > count {
-                        let copies = (0 ..< padded - count).map { _ in
-                            sortedX[offset ..< offset + 1, 0..., 0...]
-                        }
-                        group = concatenated([group] + copies, axis: 0)
-                    }
-                    let localIDs = MLXArray([Int32](repeating: 0, count: padded)).asType(.uint32)
-                    func project(_ projection: AffineStreamingExpertCatalog.ProjectionArrays,
-                                 _ input: MLXArray) -> MLXArray {
-                        let result = MLX.gatherQuantizedMM(input,
-                            expandedDimensions(projection.weight, axis: 0),
-                            scales: expandedDimensions(projection.scales, axis: 0),
-                            biases: expandedDimensions(projection.biases, axis: 0),
-                            rhsIndices: localIDs, transpose: true, groupSize: projection.groupSize,
-                            bits: projection.bits, mode: .affine, sortedIndices: useRHS)
-                        if !SwitchLayerRuntime.propagatePromotedOutput, result.dtype != input.dtype,
-                            input.dtype == .bfloat16 || input.dtype == .float16 {
-                            return result.asType(input.dtype)
-                        }
-                        return result
-                    }
-                    let gate = project(mapped.gate, group)
-                    let up = project(mapped.up, group)
-                    let down = project(mapped.down, silu(gate) * up)
-                    let kept = down[0 ..< count, 0..., 0...]
-                    MLX.eval(kept)
-                    segments.append(kept)
-                    offset = stop
+            func reduceWindow() throws -> MLXArray {
+                let windowIndices = indicesFlat[tokenStart ..< tokenEnd, 0...]
+                let ids = windowIndices.flattened().asArray(Int32.self)
+                guard ids.allSatisfy({ $0 >= 0 && $0 < numExperts }) else {
+                    throw AffineStreamingExpertError.invalidInput("routed expert ID out of range")
                 }
-                start = end
+                let windowX = xFlat[tokenStart ..< tokenEnd, 0...]
+                let expanded = expandedDimensions(windowX, axes: [-2, -3])
+                let (sortedX, sortedIndices, inverse) = gatherSort(x: expanded, indices: windowIndices)
+                let sortedIDs = sortedIndices.asArray(Int32.self)
+                let routes = sortedIDs.count
+                var segments: [MLXArray] = []
+                var paddedRows = 0
+                var start = 0
+                while start < routes {
+                    let expertID = Int(sortedIDs[start])
+                    var end = start + 1
+                    while end < routes && sortedIDs[end] == sortedIDs[start] { end += 1 }
+                    let mapped = try cachedExpert(expertID)
+                    var offset = start
+                    while offset < end {
+                        let stop = offset + min(groupLimit, end - offset)
+                        let count = stop - offset
+                        let padded = useRHS ? max(count, 16) : count
+                        paddedRows += padded
+                        var group = sortedX[offset ..< stop, 0..., 0...]
+                        if padded > count {
+                            let copies = (0 ..< padded - count).map { _ in
+                                sortedX[offset ..< offset + 1, 0..., 0...]
+                            }
+                            group = concatenated([group] + copies, axis: 0)
+                        }
+                        let localIDs = MLXArray([Int32](repeating: 0, count: padded)).asType(.uint32)
+                        func project(_ projection: AffineStreamingExpertCatalog.ProjectionArrays,
+                                     _ input: MLXArray) -> MLXArray {
+                            let result = MLX.gatherQuantizedMM(input,
+                                expandedDimensions(projection.weight, axis: 0),
+                                scales: expandedDimensions(projection.scales, axis: 0),
+                                biases: expandedDimensions(projection.biases, axis: 0),
+                                rhsIndices: localIDs, transpose: true, groupSize: projection.groupSize,
+                                bits: projection.bits, mode: .affine, sortedIndices: useRHS)
+                            if !SwitchLayerRuntime.propagatePromotedOutput, result.dtype != input.dtype,
+                                input.dtype == .bfloat16 || input.dtype == .float16 {
+                                return result.asType(input.dtype)
+                            }
+                            return result
+                        }
+                        let gate = project(mapped.gate, group)
+                        let up = project(mapped.up, group)
+                        let down = project(mapped.down, silu(gate) * up)
+                        let kept = down[0 ..< count, 0..., 0...]
+                        MLX.eval(kept)
+                        segments.append(kept)
+                        offset = stop
+                    }
+                    start = end
+                }
+                let grouped = concatenated(segments, axis: 0)
+                observeWindow?(grouped.dim(0), paddedRows)
+                let ordered = scatterUnsort(x: grouped, invOrder: inverse, shape: windowIndices.shape)
+                let routed = squeezed(ordered, axis: -2)
+                let windowScores = scoresFlat[tokenStart ..< tokenEnd, 0...]
+                let output = (routed * windowScores.asType(routed.dtype)[.ellipsis, .newAxis])
+                    .sum(axis: -2)
+                MLX.eval(output)
+                return output
             }
-            let grouped = concatenated(segments, axis: 0)
-            observeWindow?(grouped.dim(0), paddedRows)
-            let ordered = scatterUnsort(x: grouped, invOrder: inverse, shape: windowIndices.shape)
-            let routed = squeezed(ordered, axis: -2)
-            let windowScores = scoresFlat[tokenStart ..< tokenEnd, 0...]
-            let output = (routed * windowScores.asType(routed.dtype)[.ellipsis, .newAxis])
-                .sum(axis: -2)
-            MLX.eval(output)
+            #if canImport(ObjectiveC)
+            let output = try autoreleasepool { try reduceWindow() }
+            #else
+            let output = try reduceWindow()
+            #endif
             outputs.append(output)
             tokenStart = tokenEnd
         }

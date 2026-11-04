@@ -785,13 +785,15 @@ struct AffineStreamingSwitchGLUTests {
             let directory = try makeFixture(numExperts: 8, dimensions: 2048,
                 hiddenDimensions: 512, layout: .qwen35, nonPageAligned: true).directory
             defer { try? FileManager.default.removeItem(at: directory) }
+            StreamOrDevice.default.stream.synchronize()
             MLX.Memory.clearCache()
             let catalog = AffineStreamingExpertCatalog(numExperts: 8, inputDims: 2048,
                 hiddenDims: 512, layout: .qwen35)
             try catalog.configure(modelDirectory: directory, layerCount: 1)
             let reducer = AffineStreamingSwitchGLU(inputDims: 2048, hiddenDims: 512,
                 numExperts: 8, layerIndex: 0, catalog: catalog, cacheExpertLimit: 3)
-            let tokens = 64
+            let singleLong = ProcessInfo.processInfo.environment["AFFINE_DIAGNOSTIC_LONG"] == "1"
+            let tokens = singleLong ? 1024 : 64
             let values = (0 ..< tokens * 2048).map { Float(($0 * 17) % 101 - 50) / 37 }
             let x = MLXArray(values, [1, tokens, 2048]).asType(.bfloat16)
             let ids = (0 ..< tokens).flatMap { token in
@@ -812,16 +814,25 @@ struct AffineStreamingSwitchGLUTests {
             var observedWindows = 0
             var samplingFailure: Error?
             let pooled = ProcessInfo.processInfo.environment["AFFINE_DIAGNOSTIC_AUTORELEASE"] == "1"
-            for iteration in 0 ..< 40 {
+            let iterations = singleLong ? 1 : 40
+            for iteration in 0 ..< iterations {
                 func runOne() throws {
                     let result = try reducer.researchQwen35GroupedReduced(x, indices: indices,
                         scores: scores, groupLimit: 32, tokenWindow: 8) { _, _ in
                             observedWindows += 1
-                            do { highestFootprint = max(highestFootprint, try footprint()) }
+                            do {
+                                let current = try footprint()
+                                highestFootprint = max(highestFootprint, current)
+                                if singleLong && observedWindows % 16 == 0 {
+                                    print("AFFINE_MEMORY_WINDOW window=\(observedWindows) footprint=\(current) "
+                                        + "active=\(MLX.Memory.activeMemory) cache=\(MLX.Memory.cacheMemory)")
+                                }
+                            }
                             catch { samplingFailure = error }
                         }
                     MLX.eval(result)
                     #expect(result.shape == x.shape)
+                    highestFootprint = max(highestFootprint, try footprint())
                 }
                 if pooled { try autoreleasepool { try runOne() } }
                 else { try runOne() }
@@ -831,8 +842,9 @@ struct AffineStreamingSwitchGLUTests {
                     + "peak=\(MLX.Memory.peakMemory)")
             }
             if let samplingFailure { throw samplingFailure }
-            #expect(observedWindows == 320)
-            print("AFFINE_MEMORY_RESULT pooled=\(pooled) baseline=\(baseline) sampled_peak=\(highestFootprint) "
+            #expect(observedWindows == iterations * tokens / 8)
+            print("AFFINE_MEMORY_RESULT pooled=\(pooled) tokens=\(tokens) iterations=\(iterations) "
+                + "baseline=\(baseline) sampled_peak=\(highestFootprint) "
                 + "active=\(MLX.Memory.activeMemory) cache=\(MLX.Memory.cacheMemory) "
                 + "peak=\(MLX.Memory.peakMemory) windows=\(observedWindows) "
                 + "elapsed_seconds=\(Date().timeIntervalSince(started))")
