@@ -662,8 +662,8 @@ public final class AffineStreamingSwitchGLU: Module {
     /// model loading. Callers must handle validation or mapping failures.
     /// This path bypasses the per-layer expert cache and rejects overlapping calls.
     /// Supply shouldCancel when work is dispatched outside the caller's Swift task.
-    /// With an arena, pass every exact stream used by the request and ensure
-    /// its gate drains the same streams after producers stop. One arena-owned
+    /// With an arena, pass the exact typed stream list bound to the owned
+    /// request; generic arenas and mismatched lists are rejected. One arena-owned
     /// mapping slot is retired only after a successful explicit stream drain;
     /// failure retains the slot for arena cleanup. The byte limit covers only
     /// its current page-rounded mapping, not other arrays or retained graphs.
@@ -682,6 +682,9 @@ public final class AffineStreamingSwitchGLU: Module {
         guard arena == nil ? retainedStreams.isEmpty :
             (!retainedStreams.isEmpty && retainedStreams.contains(StreamOrDevice.default.stream)) else {
             throw AffineStreamingExpertError.invalidInput("arena requires all used streams including the current default")
+        }
+        if let arena {
+            try ExperimentalOwnedStreamRequest.validateMappingStreams(arena: arena, streams: retainedStreams)
         }
         if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
         guard Self.researchAdmission.try() else { throw AffineStreamingExpertError.researchBusy }

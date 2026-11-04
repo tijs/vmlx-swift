@@ -1151,6 +1151,7 @@ enum Qwen35Language {
                 streams.contains(StreamOrDevice.default.stream) else {
                 throw AffineStreamingExpertError.invalidInput("research mapping owner requires byte limit and exact streams")
             }
+            try ExperimentalOwnedStreamRequest.validateMappingStreams(arena: arena!, streams: streams)
         }
     }
     static func shouldCompileDecodeRegions(

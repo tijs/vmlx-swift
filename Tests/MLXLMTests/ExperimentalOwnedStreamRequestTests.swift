@@ -167,4 +167,62 @@ struct ExperimentalOwnedStreamRequestTests {
         try ExperimentalOwnedStreamRequest.recover(gate: gate)
     }
 
+    @Test("mapping requires the owned request's exact typed streams")
+    func streamBinding() throws {
+        try MLXMetalTestLock.withLock {
+            let generic = ExperimentalRequestArenaGate()
+            try generic.withRequest(operation: { arena in
+                #expect(throws: ExperimentalOwnedStreamRequestError.streamContextMismatch) {
+                    try ExperimentalOwnedStreamRequest.validateMappingStreams(arena: arena, streams: [.cpu])
+                }
+                return .finished(())
+            }, drain: { _ in }, invalidate: { _ in })
+            let gate = ExperimentalRequestArenaGate()
+            try ExperimentalOwnedStreamRequest.run(gate: gate,
+                streams: [ExperimentalOwnedStream(stream: .cpu), ExperimentalOwnedStream(drain: {})],
+                operation: { arena in
+                    try ExperimentalOwnedStreamRequest.validateMappingStreams(arena: arena, streams: [.cpu])
+                    #expect(throws: ExperimentalOwnedStreamRequestError.streamContextMismatch) {
+                        try ExperimentalOwnedStreamRequest.validateMappingStreams(arena: arena, streams: [.cpu, .cpu])
+                    }
+                    #expect(throws: ExperimentalOwnedStreamRequestError.streamContextMismatch) {
+                        try ExperimentalOwnedStreamRequest.validateMappingStreams(arena: arena, streams: [])
+                    }
+                }, invalidate: {})
+        }
+    }
+
+    @Test("bound context survives cancellation and failed cleanup until recovery")
+    func bindingRecovery() throws {
+        try MLXMetalTestLock.withLock {
+            let gate = ExperimentalRequestArenaGate()
+            var failDrain = true
+            weak var savedArena: ExperimentalRequestArena?
+            do {
+                try ExperimentalOwnedStreamRequest.run(gate: gate,
+                    streams: [ExperimentalOwnedStream(stream: .cpu),
+                        ExperimentalOwnedStream(drain: { if failDrain { throw Failure.stream } })],
+                    operation: { arena in
+                        savedArena = arena
+                        try ExperimentalOwnedStreamRequest.validateMappingStreams(arena: arena, streams: [.cpu])
+                        throw CancellationError()
+                    }, invalidate: {})
+                Issue.record("failure was accepted")
+            } catch let error as ExperimentalRequestArenaCleanupError {
+                #expect(error.primary is CancellationError)
+            }
+            let retained = try #require(savedArena)
+            #expect(throws: ExperimentalOwnedStreamRequestError.streamContextMismatch) {
+                try ExperimentalOwnedStreamRequest.validateMappingStreams(arena: retained, streams: [.cpu])
+            }
+            failDrain = false
+            try ExperimentalOwnedStreamRequest.recover(gate: gate)
+            // This test deliberately retains the arena locally; registration is
+            // sealed after operation even if an external alias survives.
+            #expect(throws: ExperimentalRequestArenaError.sealed) {
+                try retained.retain(Owner {})
+            }
+        }
+    }
+
 }

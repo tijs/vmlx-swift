@@ -917,32 +917,34 @@ struct AffineStreamingSwitchGLUTests {
                             try catalog.mappedExpertBytes(layer: 0, expert: 1))
             let streams = [StreamOrDevice.default.stream, MLX.Stream.cpu]
             let gate = ExperimentalRequestArenaGate()
-            try gate.withRequest(operation: { arena in
-                let result = try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
-                    groupLimit: 2, tokenWindow: 2, limits: researchLimits,
-                    arena: arena, maxRetainedMappingBytes: limit, retainedStreams: streams)
-                #expect(result.shape == x.shape)
-                #expect(arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self)?.hasMapping == false)
-                return .finished(())
-            }, drain: { _ in for stream in streams { try stream.experimentalSynchronize() } }, invalidate: { _ in })
-            var checks = 0
-            do {
-                let _: Void = try gate.withRequest(operation: { arena in
-                    _ = try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
+            try ExperimentalOwnedStreamRequest.run(gate: gate,
+                streams: streams.map { ExperimentalOwnedStream(stream: $0) }, operation: { arena in
+                    let result = try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
                         groupLimit: 2, tokenWindow: 2, limits: researchLimits,
-                        shouldCancel: { checks += 1; return checks == 5 },
                         arena: arena, maxRetainedMappingBytes: limit, retainedStreams: streams)
-                    return .finished(())
-                }, drain: { arena in
-                    #expect(arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self)?.hasMapping == true)
-                    throw CancellationError()
-                }, invalidate: { _ in })
+                    #expect(result.shape == x.shape)
+                    #expect(arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self)?.hasMapping == false)
+                }, invalidate: {})
+            var checks = 0
+            var failDrain = true
+            weak var slot: ExperimentalExpertMappingSlot?
+            do {
+                try ExperimentalOwnedStreamRequest.run(gate: gate,
+                    streams: streams.map { ExperimentalOwnedStream(stream: $0) } + [
+                        ExperimentalOwnedStream(drain: { if failDrain { throw CancellationError() } })],
+                    operation: { arena in
+                        defer { slot = arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self) }
+                        _ = try reducer.researchQwen35GroupedReduced(x, indices: ids, scores: scores,
+                            groupLimit: 2, tokenWindow: 2, limits: researchLimits,
+                            shouldCancel: { checks += 1; return checks == 5 },
+                            arena: arena, maxRetainedMappingBytes: limit, retainedStreams: streams)
+                    }, invalidate: {})
                 Issue.record("failed drain was accepted")
             } catch is ExperimentalRequestArenaCleanupError {}
-            try gate.recover(drain: { arena in
-                #expect(arena.registeredResource(ofType: ExperimentalExpertMappingSlot.self)?.hasMapping == true)
-                for stream in streams { try stream.experimentalSynchronize() }
-            }, invalidate: { _ in })
+            #expect(slot?.hasMapping == true)
+            failDrain = false
+            try ExperimentalOwnedStreamRequest.recover(gate: gate)
+            #expect(slot == nil)
         }
     }
 

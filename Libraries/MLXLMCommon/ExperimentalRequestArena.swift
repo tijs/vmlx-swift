@@ -36,6 +36,13 @@ public final class ExperimentalRequestArena {
         guard !sealed else { throw ExperimentalRequestArenaError.sealed }
         resources.append(resource)
     }
+    // Rejects stale aliases, but is not an in-flight lease: callers must join
+    // all submitting workers before the owning operation returns or throws.
+    func isOpen() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !sealed
+    }
     // Read registered owners during gate-controlled recovery.
     func registeredResource<T>(ofType type: T.Type) -> T? {
         lock.lock()

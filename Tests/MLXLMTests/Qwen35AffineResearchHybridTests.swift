@@ -400,10 +400,8 @@ struct Qwen35AffineResearchHybridTests {
             }
             do {
                 try ExperimentalOwnedStreamRequest.run(gate: streamGate,
-                    streams: [ExperimentalOwnedStream(drain: {
-                        if failDrain { throw FixtureFailure.drain }
-                        try exactStream.experimentalSynchronize()
-                    }), ExperimentalOwnedStream(stream: MLX.Stream.cpu)], operation: { arena in
+                    streams: exactStreams.map { ExperimentalOwnedStream(stream: $0) } + [
+                        ExperimentalOwnedStream(drain: { if failDrain { throw FixtureFailure.drain } })], operation: { arena in
                         let source = try ExperimentalThrowingTokenIterator.experimentalArenaTextPrefill(
                             input: input, model: model, arena: arena, processor: nil,
                             sampler: ArgMaxSampler(),
@@ -432,7 +430,7 @@ struct Qwen35AffineResearchHybridTests {
             } catch let error as ExperimentalRequestArenaCleanupError {
                 #expect(error.primary as? FixtureFailure == .decode)
                 let failures = (error.cleanup as? ExperimentalOwnedStreamsDrainError)?.failures
-                #expect(failures?.first?.streamIndex == 0)
+                #expect(failures?.first?.streamIndex == 2)
                 #expect(failures?.first?.error as? FixtureFailure == .drain)
             }
             #expect(streamSource != nil)
@@ -451,13 +449,13 @@ struct Qwen35AffineResearchHybridTests {
             var mappingInvalidated = false
             do {
                 try ExperimentalOwnedStreamRequest.run(gate: streamGate,
-                    streams: [ExperimentalOwnedStream(drain: {
-                        if failDrain {
-                            #expect(language.hasResearchPositionState)
-                            throw FixtureFailure.drain
-                        }
-                        try exactStream.experimentalSynchronize()
-                    }), ExperimentalOwnedStream(stream: MLX.Stream.cpu)], operation: { arena in
+                    streams: exactStreams.map { ExperimentalOwnedStream(stream: $0) } + [
+                        ExperimentalOwnedStream(drain: {
+                            if failDrain {
+                                #expect(language.hasResearchPositionState)
+                                throw FixtureFailure.drain
+                            }
+                        })], operation: { arena in
                         let ssm = MambaCache()
                         let attention = KVCacheSimple()
                         try arena.retain(language)

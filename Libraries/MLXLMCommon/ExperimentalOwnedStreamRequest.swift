@@ -8,10 +8,12 @@ import MLX
 /// A successful callback does not independently prove GPU error reporting.
 public struct ExperimentalOwnedStream {
     fileprivate let drain: () throws -> Void
-    public init(drain: @escaping () throws -> Void) { self.drain = drain }
+    fileprivate let typedStream: MLX.Stream?
+    public init(drain: @escaping () throws -> Void) { self.drain = drain; self.typedStream = nil }
     /// Drains this exact MLX stream through its experimental error boundary.
     public init(stream: MLX.Stream) {
         self.drain = { try stream.experimentalSynchronize() }
+        self.typedStream = stream
     }
 }
 
@@ -27,6 +29,14 @@ public struct ExperimentalOwnedStreamsDrainError: Error {
 public enum ExperimentalOwnedStreamRequestError: Error {
     case missingStreamOwner
     case emptyStreams
+    case streamContextMismatch
+}
+
+// The initializer is private to this file: callers cannot forge a binding in a
+// generic arena or substitute callback-only drains for these exact streams.
+private final class ExperimentalBoundStreamContext {
+    let streams: [MLX.Stream]
+    init(streams: [MLX.Stream]) { self.streams = streams }
 }
 
 /// Owns callbacks and stream handles so their captures survive failed cleanup.
@@ -88,12 +98,30 @@ public enum ExperimentalOwnedStreamRequest {
         let bundle = ExperimentalStreamBundle(streams: streams, operation: operation, invalidate: invalidate)
         try gate.withRequest(operation: { arena in
             try arena.retain(bundle)
+            let typedStreams = streams.compactMap { $0.typedStream }
+            if !typedStreams.isEmpty {
+                try arena.retain(ExperimentalBoundStreamContext(streams: typedStreams))
+            }
             try Task<Never, Never>.checkCancellation()
             try bundle.operation(arena)
             try Task<Never, Never>.checkCancellation()
             return .finished(())
         }, drain: { _ in try bundle.drainAll() },
            invalidate: { _ in try bundle.invalidate() })
+    }
+
+    /// Reject generic arenas and stream lists other than the immutable typed
+    /// stream list owned and drained by this request. This does not prove that
+    /// callers submitted work only to those streams. This check is not an
+    /// in-flight operation lease: it does not prevent sealing immediately
+    /// afterward. The operation must stop and join all concurrent submitters
+    /// before returning or throwing.
+    public static func validateMappingStreams(arena: ExperimentalRequestArena, streams: [MLX.Stream]) throws {
+        guard arena.isOpen(),
+              let context = arena.registeredResource(ofType: ExperimentalBoundStreamContext.self),
+              !context.streams.isEmpty, context.streams == streams else {
+            throw ExperimentalOwnedStreamRequestError.streamContextMismatch
+        }
     }
 
     public static func recover() throws { try recover(gate: ownedGate) }
