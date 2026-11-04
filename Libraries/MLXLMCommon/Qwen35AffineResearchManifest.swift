@@ -75,12 +75,14 @@ public enum Qwen35AffineResearchManifest {
             var ranges: [(UInt64, UInt64)] = []
             for (key, value) in header where key != "__metadata__" {
                 guard let descriptor = value as? [String: Any],
-                    descriptor["dtype"] is String,
+                    let dtype = descriptor["dtype"] as? String,
                     let shape = descriptor["shape"] as? [Any],
                     shape.allSatisfy({ unsignedInteger($0).map { $0 <= UInt64(Int.max) } ?? false }),
                     let offsets = descriptor["data_offsets"] as? [Any], offsets.count == 2,
                     let start = unsignedInteger(offsets[0]), let end = unsignedInteger(offsets[1]),
-                    start <= end, end <= fileSize - dataStart
+                    start <= end, end <= fileSize - dataStart,
+                    let byteCount = tensorByteCount(dtype: dtype, shape: shape),
+                    byteCount == end - start
                 else { throw ValidationError("invalid tensor descriptor: \(name): \(key)") }
                 ranges.append((start, end))
                 guard actual.updateValue(name, forKey: key) == nil else {
@@ -118,6 +120,31 @@ public enum Qwen35AffineResearchManifest {
             numExperts: numExperts, inputDims: inputDims, hiddenDims: hiddenDims, layout: .qwen35)
         try catalog.configure(modelDirectory: root, layerCount: layerCount)
         return catalog
+    }
+
+    /// Only byte-aligned safetensors types supported by this research path.
+    /// Unknown or sub-byte formats must not be guessed.
+    private static func tensorByteCount(dtype: String, shape: [Any]) -> UInt64? {
+        let size: UInt64
+        switch dtype {
+        case "BOOL", "U8", "I8", "F8_E5M2", "F8_E4M3", "F8_E4M3FN",
+            "F8_E4M3FNUZ", "F8_E5M2FNUZ", "F8_E8M0": size = 1
+        case "U16", "I16", "F16", "BF16": size = 2
+        case "U32", "I32", "F32": size = 4
+        case "U64", "I64", "F64", "C64": size = 8
+        case "C128": size = 16
+        default: return nil
+        }
+        let dimensions = shape.compactMap(unsignedInteger)
+        guard dimensions.count == shape.count else { return nil }
+        if dimensions.contains(0) { return 0 }
+        var count = size
+        for dimension in dimensions {
+            let result = count.multipliedReportingOverflow(by: dimension)
+            guard !result.overflow else { return nil }
+            count = result.partialValue
+        }
+        return count
     }
 
     private static func unsignedInteger(_ value: Any) -> UInt64? {

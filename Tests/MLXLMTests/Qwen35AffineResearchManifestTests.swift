@@ -166,4 +166,34 @@ struct Qwen35AffineResearchManifestTests {
             }
         }
     }
+
+    @Test("non-routed descriptors require supported dtype and exact shape bytes")
+    func nonRoutedShapeBytes() throws {
+        for (dtype, shape, shouldPass) in [
+            ("F32", [0], true), ("F32", [1], false),
+            ("UNKNOWN", [0], false), ("U64", [Int.max, 2], false),
+        ] {
+            let (root, shard, index) = try fixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let data = try Data(contentsOf: shard)
+            let length = data.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
+            let end = 8 + Int(length)
+            var header = try #require(JSONSerialization.jsonObject(with: data.subdata(in: 8..<end)) as? [String: Any])
+            let key = "language_model.model.embed_tokens.weight"
+            header[key] = ["dtype": dtype, "shape": shape, "data_offsets": [0, 0]] as [String: Any]
+            var updatedIndex = index
+            updatedIndex[key] = shard.lastPathComponent
+            var json = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+            json.append(Data(repeating: 32, count: (8 - (json.count + 8) % 8) % 8))
+            var headerLength = UInt64(json.count).littleEndian
+            var rewritten = Data(bytes: &headerLength, count: 8)
+            rewritten.append(json)
+            rewritten.append(data.suffix(from: end))
+            try rewritten.write(to: shard)
+            try JSONSerialization.data(withJSONObject: ["weight_map": updatedIndex])
+                .write(to: root.appendingPathComponent("model.safetensors.index.json"))
+            if shouldPass { try validate(root, [shard]) }
+            else { #expect(throws: (any Error).self) { try validate(root, [shard]) } }
+        }
+    }
 }
