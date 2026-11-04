@@ -2430,16 +2430,11 @@ enum Qwen35Language {
             if normTopkProb {
                 scores = scores / scores.sum(axis: -1, keepDims: true)
             }
-            // The eager VLM path multiplies without first casting router
-            // scores. The research reducer currently casts to the routed
-            // activation dtype, so reject potential lossy mixed-dtype cases.
-            guard scores.dtype == x.dtype else {
-                throw AffineStreamingExpertError.invalidInput(
-                    "experimental Qwen35 affine forward does not support mixed router/activation dtypes")
-            }
+            // The eager VLM path preserves the router score dtype and lets
+            // MLX promote the weighted output; the text path casts instead.
             let routed = try reducer.researchQwen35GroupedReduced(x, indices: indices,
                 scores: scores, groupLimit: groupLimit, tokenWindow: tokenWindow,
-                limits: limits, shouldCancel: shouldCancel)
+                limits: limits, scorePolicy: .preserveNativePromotion, shouldCancel: shouldCancel)
             try checkCancellation()
             let shared = sharedExpert(x)
             let gatedShared = compiledSigmoidGate(sharedExpertGate(x), shared)

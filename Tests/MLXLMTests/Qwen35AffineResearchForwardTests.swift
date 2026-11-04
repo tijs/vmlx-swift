@@ -96,7 +96,7 @@ struct Qwen35AffineResearchForwardTests {
         return block
     }
 
-    @Test("eager router and shared expert match resident block; mixed dtype and cancellation reject")
+    @Test("eager router and shared expert match resident block across score dtypes")
     func parityAndFailures() throws {
         try MLXMetalTestLock.withLock {
             let (directory, tensors) = try fixture()
@@ -110,13 +110,20 @@ struct Qwen35AffineResearchForwardTests {
                 let block = try makeBlock(tensors, normalize: normalize)
                 let probe = MLXArray([Float](repeating: 0.25, count: 64), [1, 1, 64]).asType(.bfloat16)
                 #expect(block.gate(probe).dtype == .float32)
-                do {
-                    _ = try block.researchAffineForward(probe, reducer: reducer, limits: limits,
+                for tokens in [1, 8, 33, 128] {
+                    let values = (0 ..< tokens * 64).map { Float(($0 * 17) % 101 - 50) / 37 }
+                    let mixed = MLXArray(values, [1, tokens, 64]).asType(.bfloat16)
+                    let expectedMixed = block(mixed)
+                    let actualMixed = try block.researchAffineForward(mixed, reducer: reducer, limits: limits,
                         groupLimit: 16, tokenWindow: 8)
-                    Issue.record("mixed router dtype was accepted")
-                } catch AffineStreamingExpertError.invalidInput(let reason) {
-                    #expect(reason.contains("mixed router/activation dtypes"))
-                } catch { Issue.record("unexpected error: \(error)") }
+                    MLX.eval(expectedMixed, actualMixed)
+                    let mixedError = MLX.max(MLX.abs(expectedMixed.asType(.float32)
+                        - actualMixed.asType(.float32))).item(Float.self)
+                    print("QWEN35_VLM_MIXED_PARITY norm=\(normalize) tokens=\(tokens) max_abs=\(mixedError)")
+                    #expect(actualMixed.dtype == expectedMixed.dtype && actualMixed.shape == expectedMixed.shape)
+                    #expect(MLX.arrayEqual(actualMixed, expectedMixed).item(Bool.self),
+                        "mixed norm=\(normalize) tokens=\(tokens) max_abs=\(mixedError)")
+                }
                 try block.gate.update(parameters: ModuleParameters.unflattened([
                     "weight": block.gate.weight.asType(.bfloat16)
                 ]), verify: .all)

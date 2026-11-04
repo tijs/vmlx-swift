@@ -435,6 +435,10 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
 /// per layer. Each chunk is evaluated before returning so mappings from old
 /// routing decisions can be evicted and unpinned before the next layer runs.
 public final class AffineStreamingSwitchGLU: Module {
+    public enum ResearchScorePolicy: Equatable {
+        case castToRouted
+        case preserveNativePromotion
+    }
     /// Admission geometry and per-expert mapped buffer limits for research.
     /// These do not bound the process's total physical or GPU memory.
     public struct ResearchLimits {
@@ -620,7 +624,8 @@ public final class AffineStreamingSwitchGLU: Module {
     /// Supply shouldCancel when work is dispatched outside the caller's Swift task.
     public func researchQwen35GroupedReduced(
         _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
-        tokenWindow: Int, limits: ResearchLimits, shouldCancel: () -> Bool = { false },
+        tokenWindow: Int, limits: ResearchLimits, scorePolicy: ResearchScorePolicy = .castToRouted,
+        shouldCancel: () -> Bool = { false },
         observeWindow: ((Int, Int) -> Void)? = nil
     ) throws -> MLXArray {
         if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
@@ -629,19 +634,19 @@ public final class AffineStreamingSwitchGLU: Module {
         #if canImport(ObjectiveC)
         return try autoreleasepool {
             try researchQwen35GroupedReducedImpl(x, indices: indices, scores: scores,
-                groupLimit: groupLimit, tokenWindow: tokenWindow, limits: limits,
+                groupLimit: groupLimit, tokenWindow: tokenWindow, limits: limits, scorePolicy: scorePolicy,
                 shouldCancel: shouldCancel, observeWindow: observeWindow)
         }
         #else
         return try researchQwen35GroupedReducedImpl(x, indices: indices, scores: scores,
-            groupLimit: groupLimit, tokenWindow: tokenWindow, limits: limits,
+            groupLimit: groupLimit, tokenWindow: tokenWindow, limits: limits, scorePolicy: scorePolicy,
             shouldCancel: shouldCancel, observeWindow: observeWindow)
         #endif
     }
 
     private func researchQwen35GroupedReducedImpl(
         _ x: MLXArray, indices: MLXArray, scores: MLXArray, groupLimit: Int,
-        tokenWindow: Int, limits: ResearchLimits,
+        tokenWindow: Int, limits: ResearchLimits, scorePolicy: ResearchScorePolicy,
         shouldCancel: () -> Bool, observeWindow: ((Int, Int) -> Void)?
     ) throws -> MLXArray {
         func checkCancellation() throws {
@@ -658,7 +663,8 @@ public final class AffineStreamingSwitchGLU: Module {
             indices.shape.count == x.shape.count, indices.shape.dropLast() == x.shape.dropLast(),
             (indices.shape.last ?? 0) > 0, indices.shape == scores.shape,
             indices.dtype == .int32 || indices.dtype == .uint32,
-            x.size > 0, x.dtype == .float16 || x.dtype == .bfloat16
+            x.size > 0, x.dtype == .float16 || x.dtype == .bfloat16,
+            scores.dtype == .float16 || scores.dtype == .bfloat16 || scores.dtype == .float32
         else { throw AffineStreamingExpertError.invalidInput("invalid shapes, dtype, or group limit") }
         let totalTokens = x.size / inputDims
         let kSlots = indices.dim(-1)
@@ -743,7 +749,9 @@ public final class AffineStreamingSwitchGLU: Module {
                 let ordered = scatterUnsort(x: grouped, invOrder: inverse, shape: windowIndices.shape)
                 let routed = squeezed(ordered, axis: -2)
                 let windowScores = scoresFlat[tokenStart ..< tokenEnd, 0...]
-                let output = (routed * windowScores.asType(routed.dtype)[.ellipsis, .newAxis])
+                let weightedScores = scorePolicy == .castToRouted
+                    ? windowScores.asType(routed.dtype) : windowScores
+                let output = (routed * weightedScores[.ellipsis, .newAxis])
                     .sum(axis: -2)
                 MLX.eval(output)
                 try checkCancellation()
