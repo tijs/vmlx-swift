@@ -2261,6 +2261,8 @@ enum Qwen35Language {
         let normTopkProb: Bool
         let numExperts: Int
         let topK: Int
+        let researchLayerIndex: Int
+        let researchHiddenDims: Int
         let compileDecodeRegions: Bool
         let decodeEquivalentVerifierRows: Bool
 
@@ -2280,6 +2282,8 @@ enum Qwen35Language {
             self.normTopkProb = args.normTopkProb
             self.numExperts = args.numExperts
             self.topK = args.numExpertsPerTok
+            self.researchLayerIndex = layerIdx
+            self.researchHiddenDims = args.moeIntermediateSize
             self.compileDecodeRegions = compileDecodeRegions
             self.decodeEquivalentVerifierRows = decodeEquivalentVerifierRows
 
@@ -2393,6 +2397,54 @@ enum Qwen35Language {
                 Data(
                     "[Qwen4Exp] moe_verify_rows=decode_equivalent topology=q4g64\n"
                         .utf8))
+        }
+
+        /// Experimental fallible affine route. This is not selected by the
+        /// loader or serving path and does not support compiled/verifier rows.
+        /// Its caller must discard any request cache mutated before an error.
+        func researchAffineForward(
+            _ x: MLXArray, reducer: AffineStreamingSwitchGLU,
+            limits: AffineStreamingSwitchGLU.ResearchLimits,
+            groupLimit: Int, tokenWindow: Int, shouldCancel: () -> Bool = { false }
+        ) throws -> MLXArray {
+            func checkCancellation() throws {
+                if shouldCancel() || Task<Never, Never>.isCancelled { throw CancellationError() }
+            }
+            try checkCancellation()
+            guard !compileDecodeRegions, !decodeEquivalentVerifierRows,
+                !CompiledDecodeTrace.isActive, switchMLP is SwitchGLU,
+                topK > 0, topK <= numExperts, reducer.numExperts == numExperts,
+                researchLayerIndex >= 0, reducer.layerIndex == researchLayerIndex,
+                reducer.hiddenDims == researchHiddenDims,
+                gate.shape.0 == numExperts, gate.shape.1 == reducer.inputDims,
+                !x.shape.isEmpty, x.dim(-1) == reducer.inputDims
+            else {
+                throw AffineStreamingExpertError.invalidInput(
+                    "experimental Qwen35 affine forward requires eager compatible MoE")
+            }
+            var gates = gate(x)
+            gates = MLX.softmax(gates, axis: -1, precise: true)
+            let kth = gates.dim(-1) - topK
+            let indices = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
+            var scores = MLX.takeAlong(gates, indices, axis: -1)
+            if normTopkProb {
+                scores = scores / scores.sum(axis: -1, keepDims: true)
+            }
+            // The eager VLM path multiplies without first casting router
+            // scores. The research reducer currently casts to the routed
+            // activation dtype, so reject potential lossy mixed-dtype cases.
+            guard scores.dtype == x.dtype else {
+                throw AffineStreamingExpertError.invalidInput(
+                    "experimental Qwen35 affine forward does not support mixed router/activation dtypes")
+            }
+            let routed = try reducer.researchQwen35GroupedReduced(x, indices: indices,
+                scores: scores, groupLimit: groupLimit, tokenWindow: tokenWindow,
+                limits: limits, shouldCancel: shouldCancel)
+            try checkCancellation()
+            let shared = sharedExpert(x)
+            let gatedShared = compiledSigmoidGate(sharedExpertGate(x), shared)
+            try checkCancellation()
+            return routed + gatedShared
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
