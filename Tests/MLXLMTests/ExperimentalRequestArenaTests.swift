@@ -156,4 +156,55 @@ struct ExperimentalRequestArenaTests {
         state.done.wait()
     }
 
+    @Test("recovery holds exclusive admission until resource release")
+    func recoveryContention() throws {
+        let gate = ExperimentalRequestArenaGate()
+        let state = Coordination()
+        final class Lifetime: @unchecked Sendable {
+            private let lock = NSLock()
+            private var released = false
+            func markReleased() { lock.lock(); released = true; lock.unlock() }
+            func isReleased() -> Bool { lock.lock(); defer { lock.unlock() }; return released }
+        }
+        let lifetime = Lifetime()
+        do {
+            let _: Int = try gate.withRequest(operation: { arena in
+                try arena.retain(Resource { lifetime.markReleased() })
+                return .finished(1)
+            }, drain: { _ in throw Failure.drain }, invalidate: { _ in })
+            Issue.record("failed drain was accepted")
+        } catch is ExperimentalRequestArenaCleanupError {}
+        #expect(!lifetime.isReleased())
+        DispatchQueue.global().async {
+            defer { state.done.signal() }
+            do {
+                try gate.recover(drain: { _ in
+                    state.entered.signal()
+                    if state.release.wait(timeout: .now() + 5) == .timedOut {
+                        throw Failure.drain
+                    }
+                }, invalidate: { _ in })
+            } catch { state.record(error) }
+        }
+        defer { state.release.signal() }
+        guard state.entered.wait(timeout: .now() + 5) == .success else {
+            Issue.record("recovery did not start in time")
+            return
+        }
+        #expect(!lifetime.isReleased())
+        #expect(throws: ExperimentalRequestArenaError.busy) {
+            try gate.recover(drain: { _ in }, invalidate: { _ in })
+        }
+        #expect(throws: ExperimentalRequestArenaError.busy) {
+            try gate.withRequest(operation: { _ in .finished(1) }, drain: { _ in }, invalidate: { _ in })
+        }
+        state.release.signal()
+        guard state.done.wait(timeout: .now() + 5) == .success else {
+            Issue.record("recovery did not finish in time")
+            return
+        }
+        if let error = state.error() { Issue.record("recovery failed: \(error)") }
+        #expect(lifetime.isReleased())
+    }
+
 }
