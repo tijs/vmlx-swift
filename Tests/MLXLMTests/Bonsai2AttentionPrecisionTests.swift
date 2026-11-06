@@ -180,7 +180,7 @@ struct Bonsai2AttentionPrecisionTests {
                     : CompilableKVCache(from: seed, maxLength: 32)
                 let eager = cache.copy()
                 MLX.eval(cache, eager)
-                let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+                let forward: ([MLXArray]) -> [MLXArray] = compile(
                     inputs: [cache], outputs: [cache]
                 ) { args in
                     CompiledDecodeTrace.withActive {

@@ -17,7 +17,7 @@ import MLXNN
 /// repo-wide pre-write hook (which rightly guards against JS-style
 /// `eval()` on substring) from tripping on every `MLX.eval(...)` call.
 @inline(__always)
-private func materialize(_ arrays: MLXArray...) {
+private func evaluateSpecDecArrays(_ arrays: MLXArray...) {
     for a in arrays { MLX.eval(a) }
 }
 
@@ -158,7 +158,7 @@ public enum SpecDecRuntimeLinear {
             args.inputIds,
             cache: useRollbackFastPath ? targetCache : nil,
             captureLayerIDs: targetLayerSet)
-        materialize(prefillLogits)
+        evaluateSpecDecArrays(prefillLogits)
 
         // After prefill, opt into TurboQuant / affine KV compression on
         // the fast path. The compressed-cache classes stay trimmable so
@@ -173,7 +173,7 @@ public enum SpecDecRuntimeLinear {
         // yet have a drafter KV cache.
         var accumulatedHidden = extractContextFeature(
             captured: prefillHidden, targetLayerIDs: args.targetBlockIDs)
-        materialize(accumulatedHidden)
+        evaluateSpecDecArrays(accumulatedHidden)
 
         var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
         tokens.append(bonus)
@@ -219,7 +219,7 @@ public enum SpecDecRuntimeLinear {
             let drafterLogits = args.target.projectToLogits(drafterTail)
             let drafterPredArr: MLXArray =
                 argMax(drafterLogits, axis: -1).asType(.int32)
-            materialize(drafterPredArr)
+            evaluateSpecDecArrays(drafterPredArr)
             let drafterPredictions = drafterPredArr.asArray(Int32.self)
 
             for i in 0..<(blockSize - 1) {
@@ -252,13 +252,13 @@ public enum SpecDecRuntimeLinear {
                     verifyArray, cache: nil, captureLayerIDs: targetLayerSet)
                 blockStartIdx = verifyInput.count - blockSize
             }
-            materialize(verifyLogits)
+            evaluateSpecDecArrays(verifyLogits)
 
             // Posterior over the block positions.
             let verifyLogitsBlock = verifyLogits[0..., blockStartIdx..., 0...]
             let posteriorArr: MLXArray =
                 argMax(verifyLogitsBlock, axis: -1).asType(.int32)
-            materialize(posteriorArr)
+            evaluateSpecDecArrays(posteriorArr)
             let posterior = posteriorArr.asArray(Int32.self)
 
             // Acceptance length: longest prefix where
@@ -302,7 +302,7 @@ public enum SpecDecRuntimeLinear {
                 0..., hiddenStart..<(hiddenStart + commitCount), 0...]
             accumulatedHidden = concatenated(
                 [accumulatedHidden, commitHidden], axis: 1)
-            materialize(accumulatedHidden)
+            evaluateSpecDecArrays(accumulatedHidden)
 
             // Roll back the target cache by `rejectedCount` positions so
             // the next round's forward starts from the committed prefix.
@@ -343,7 +343,7 @@ public enum SpecDecRuntimeLinear {
             fatalError("unexpected logits shape: ndim=\(logits.ndim)")
         }
         let idx = argMax(last, axis: -1).asType(.int32)
-        materialize(idx)
+        evaluateSpecDecArrays(idx)
         return idx.item(Int32.self)
     }
 }
@@ -458,10 +458,10 @@ public enum SpecDecRuntimeDDTree {
         // Prefill.
         let (prefillLogits, prefillHidden) = args.target(
             args.inputIds, cache: nil, captureLayerIDs: targetLayerSet)
-        materialize(prefillLogits)
+        evaluateSpecDecArrays(prefillLogits)
         var targetHidden = extractContextFeature(
             captured: prefillHidden, targetLayerIDs: args.targetBlockIDs)
-        materialize(targetHidden)
+        evaluateSpecDecArrays(targetHidden)
 
         var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
         tokens.append(bonus)
@@ -499,7 +499,7 @@ public enum SpecDecRuntimeDDTree {
             // Last block-1 positions go through target LM head.
             let drafterTail = drafterOut[0..., 1..., 0...]
             let drafterLogits = args.target.projectToLogits(drafterTail)
-            materialize(drafterLogits)
+            evaluateSpecDecArrays(drafterLogits)
             // TreeBuilder expects (L, vocab) not (1, L, vocab).
             let logits2D = drafterLogits[0, 0..., 0...]
 
@@ -514,13 +514,13 @@ public enum SpecDecRuntimeDDTree {
                 let nextInput = MLXArray(tokens).reshaped(1, tokens.count)
                 let (nextLogits, nextHidden) = args.target(
                     nextInput, cache: nil, captureLayerIDs: targetLayerSet)
-                materialize(nextLogits)
+                evaluateSpecDecArrays(nextLogits)
                 bonus = sampleArgmax(nextLogits, temperature: args.temperature)
                 tokens.append(bonus)
                 onCommitted?([bonus])
                 targetHidden = extractContextFeature(
                     captured: nextHidden, targetLayerIDs: args.targetBlockIDs)
-                materialize(targetHidden)
+                evaluateSpecDecArrays(targetHidden)
                 continue
             }
 
@@ -569,7 +569,7 @@ public enum SpecDecRuntimeDDTree {
             let feature = extractContextFeature(
                 captured: reprefillHidden, targetLayerIDs: args.targetBlockIDs)
             targetHidden = feature
-            materialize(targetHidden)
+            evaluateSpecDecArrays(targetHidden)
         }
 
         let filtered = tokens.filter { $0 != args.maskTokenID }
@@ -596,7 +596,7 @@ public enum SpecDecRuntimeDDTree {
             fatalError("unexpected logits shape: ndim=\(logits.ndim)")
         }
         let idx = argMax(last, axis: -1).asType(.int32)
-        materialize(idx)
+        evaluateSpecDecArrays(idx)
         return idx.item(Int32.self)
     }
 }

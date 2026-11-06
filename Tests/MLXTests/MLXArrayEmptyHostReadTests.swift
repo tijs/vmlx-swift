@@ -3,7 +3,9 @@ import Dispatch
 import Metal
 import Testing
 
-@Suite("MLXArray empty host reads")
+// The cases share the process-wide stream lock; concurrency is exercised
+// explicitly inside the race tests, not by racing their orchestration.
+@Suite("MLXArray empty host reads", .serialized)
 struct MLXArrayEmptyHostReadTests {
     @Test("asArray returns an empty Swift array for a zero-element tensor")
     func emptyAsArray() {

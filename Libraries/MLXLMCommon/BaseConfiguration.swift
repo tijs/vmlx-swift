@@ -429,33 +429,7 @@ public struct BaseConfiguration: Codable, Sendable {
             }
         }
 
-        /// True when `other` describes exactly the same quantization plan:
-        /// the same default and an identical per-layer override map.
-        ///
-        /// Used to accept `quantization_config` as a drop-in alias for
-        /// `quantization` only when the two are provably identical. A bundle
-        /// that disagrees with itself (the same spelling declared twice with
-        /// different widths) is rejected at decode time rather than silently
-        /// resolved by key order.
-        func isEquivalent(to other: QuantizationContainer) -> Bool {
-            guard quantization.asTuple == other.quantization.asTuple else { return false }
-            let mine = perLayerQuantization.perLayerQuantization
-            let theirs = other.perLayerQuantization.perLayerQuantization
-            guard mine.count == theirs.count else { return false }
 
-            for (key, option) in mine {
-                guard let otherOption = theirs[key] else { return false }
-                switch (option, otherOption) {
-                case (.skip, .skip):
-                    continue
-                case (.quantize(let a), .quantize(let b)):
-                    guard a.asTuple == b.asTuple else { return false }
-                default:
-                    return false
-                }
-            }
-            return true
-        }
     }
 
     public var quantizationContainer: QuantizationContainer?

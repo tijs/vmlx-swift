@@ -1,10 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
 import Cmlx
-// Preserve the core's default accumulation dtype when no override is supplied.
-func mlx_optional_dtype(_ dtype: DType?) -> mlx_optional_dtype {
-    .init(value: dtype?.cmlxDtype ?? MLX_FLOAT16, has_value: dtype != nil)
-}
 import Foundation
 
 // return a +1 mlx_vector_array containing the given arrays
@@ -182,4 +178,8 @@ func new_mlx_kwargs_closure(keys: [String], _ f: @escaping ([MLXArray]) -> [MLXA
     }
 
     return mlx_closure_kwargs_new_func_payload(trampoline, payload, free)
+}
+
+func mlx_optional_dtype(_ dtype: DType?) -> mlx_optional_dtype {
+    .init(value: dtype?.cmlxDtype ?? MLX_FLOAT16, has_value: dtype != nil)
 }

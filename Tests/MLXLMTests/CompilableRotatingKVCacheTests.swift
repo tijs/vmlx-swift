@@ -98,7 +98,7 @@ class CompilableRotatingKVCacheTests: XCTestCase {
 
         let capturedModel = model
         let captured = caches.compiled
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let result = capturedModel(
@@ -145,7 +145,7 @@ class CompilableRotatingKVCacheTests: XCTestCase {
 
         let capturedModel = model
         let captured = caches.compiled
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let result = capturedModel(
@@ -206,7 +206,7 @@ class CompilableRotatingKVCacheTests: XCTestCase {
 
         let capturedModel = model
         let captured = caches.compiled
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let result = capturedModel(

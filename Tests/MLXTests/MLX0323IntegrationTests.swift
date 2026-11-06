@@ -31,7 +31,7 @@ final class MLX0323IntegrationTests: XCTestCase {
 
     func testCompiledConstantsPreserveFloatBits() {
         for value: Float in [0.33333334, 1.2345678, 0.000012345678, -1234.5677] {
-            let constant = MLXArray(value)
+            let constant = MLXArray(value).materialized()
             let compiled = compile { (x: MLXArray) in x * constant }
             let input = MLXArray.ones([4], dtype: .float32)
             let actual = compiled(input)

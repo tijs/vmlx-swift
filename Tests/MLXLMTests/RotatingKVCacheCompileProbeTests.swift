@@ -70,7 +70,7 @@ class RotatingKVCacheCompileProbeTests: XCTestCase {
 
         let capturedModel = model
         let captured = compiledCache
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let result = capturedModel(
@@ -168,7 +168,7 @@ class RotatingKVCacheCompileProbeTests: XCTestCase {
         // Compiled: same 10 decode steps through the compiled closure.
         let capturedModel = model
         let captured = compiledCache
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let result = capturedModel(
@@ -277,7 +277,7 @@ class RotatingKVCacheCompileProbeTests: XCTestCase {
 
         let capturedModel = model
         let captured = compiledCache
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let result = capturedModel(
@@ -347,7 +347,7 @@ class RotatingKVCacheCompileProbeTests: XCTestCase {
 
         let capturedModel = model
         let captured = cache
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let result = capturedModel(

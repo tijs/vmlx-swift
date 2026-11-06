@@ -262,7 +262,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// a fixed shape; the adaptive controller below moves between a small
     /// set of sizes, so at most a handful of traces are ever built. Tail
     /// blocks and the AR fallback keep the eager path.
-    private var compiledVerify: [Int: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledVerify: [Int: ([MLXArray]) -> [MLXArray]] = [:]
     private var stagedWarmedSizes: Set<Int> = []
 
     // MARK: adaptive block size

@@ -4,6 +4,42 @@ import Cmlx
 
 public enum MLXFast {
 
+    /// Chunked gated delta network forward pass.
+    ///
+    /// - Parameters:
+    ///   - queries: shape (B, T, Hk, Dk)
+    ///   - keys: shape (B, T, Hk, Dk)
+    ///   - values: shape (B, T, Hv, Dv)
+    ///   - gamma: decay rate in linear space (B, T, Hv)
+    ///   - beta: delta update rates (B, T, Hv)
+    ///   - initialState: initial hidden state (B, Hv, Dv, Dk), zeros if not given
+    ///   - mask: optional boolean mask (B, T); masked steps leave the state unchanged
+    ///   - stream: stream or device to evaluate on
+    /// - Returns: `output` (B, T, Hv, Dv) and the final `state` (B, Hv, Dv, Dk)
+    public static func gatedDeltaUpdate(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        gamma: MLXArray,
+        beta: MLXArray,
+        initialState: MLXArray? = nil,
+        mask: MLXArray? = nil,
+        stream: StreamOrDevice = .default
+    ) -> (output: MLXArray, state: MLXArray) {
+        var result = mlx_vector_array_new()
+        defer { mlx_vector_array_free(result) }
+        mlx_fast_gated_delta_update(
+            &result,
+            queries.ctx, keys.ctx, values.ctx,
+            gamma.ctx, beta.ctx,
+            (initialState ?? .mlxNone).ctx,
+            (mask ?? .mlxNone).ctx,
+            stream.ctx)
+
+        let tuple = mlx_vector_array_values(result)
+        return (output: tuple[0], state: tuple[1])
+    }
+
     /// Optimized implementation of `NN.RoPE`.
     ///
     /// Used like this:
@@ -114,11 +150,14 @@ public enum MLXFast {
     ///   - mask: mask array
     ///   - sinks: optional array of attention sinks
     ///   - memoryEfficientThreshold: unused
+    ///   - forceFused: If `true` use a fused kernel regardless of the heuristic choice.  This
+    ///     can result in slower kernels in some case but can also reduce memory consumption
     ///   - stream: stream to evaluate on
     public static func scaledDotProductAttention(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, mask: MLXArray?,
         sinks: MLXArray? = nil,
-        memoryEfficientThreshold: Int? = nil, forceFused: Bool = false,
+        memoryEfficientThreshold: Int? = nil,
+        forceFused: Bool = false,
         stream: StreamOrDevice = .default
     ) -> MLXArray {
         var result = mlx_array_new()
@@ -201,6 +240,8 @@ public enum MLXFast {
     ///   - scale: scale for queries, typically `1 / sqrt(q.dim(-1))`
     ///   - mask: a ``ScaledDotProductAttentionMaskMode``
     ///   - sinks: optional array of attention sinks
+    ///   - forceFused: If `true` use a fused kernel regardless of the heuristic choice.  This
+    ///     can result in slower kernels in some case but can also reduce memory consumption
     ///   - stream: stream to evaluate on
     public static func scaledDotProductAttention(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
@@ -263,6 +304,22 @@ public enum MLXFast {
         return MLXArray(result)
     }
 
+    /// Cross entropy loss with class indices as targets.
+    ///
+    /// - Parameters:
+    ///   - logits: The unnormalized logits. The loss is computed over the last axis.
+    ///   - targets: Class indices. The shape should match the shape of `logits` with the last axis removed.
+    ///     The indices must be in `0 ..< logits.dim(-1)`.
+    ///   - stream: stream or device to evaluate on
+    public static func crossEntropy(
+        logits: MLXArray, targets: MLXArray,
+        stream: StreamOrDevice = .default
+    ) -> MLXArray {
+        var result = mlx_array_new()
+        mlx_fast_cross_entropy(
+            &result, logits.ctx, targets.ctx, stream.ctx)
+        return MLXArray(result)
+    }
 }
 
 /// Optimized implementation of `NN.RoPE`.
@@ -371,3 +428,5 @@ public func layerNorm(
 ) -> MLXArray {
     return MLXFast.layerNorm(x, weight: weight, bias: bias, eps: eps, stream: stream)
 }
+
+// Note: crossEntropy() requires MLXFast.crossEntropy() to avoid collision with MLXNN

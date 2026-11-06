@@ -40,6 +40,8 @@ Cmlx (C/C++ bindings, Metal GPU)
 | Purpose | File Path |
 |---------|-----------|
 | Core array | Source/MLX/MLXArray.swift |
+| Materialized (Sendable) array | Source/MLX/MaterializedArray.swift |
+| Materialized (Sendable) module | Source/MLXNN/MaterializedModule.swift |
 | Operations | Source/MLX/Ops.swift |
 | Transforms | Source/MLX/Transforms.swift |
 | Factory methods | Source/MLX/Factory.swift |
@@ -49,6 +51,8 @@ Cmlx (C/C++ bindings, Metal GPU)
 | Custom kernels | Source/MLX/MLXFastKernel.swift |
 | Wired memory coordinator | Source/MLX/WiredMemory.swift |
 | GPU working-set helper | Source/MLX/GPU+Metal.swift |
+| DType & numeric limits (finfo) | Source/MLX/DType.swift |
+| Attention mask fill | Source/MLX/MLXArray+maskFill.swift |
 
 ## Quick Start
 
@@ -60,8 +64,12 @@ import MLX
 // Create arrays
 let a = MLXArray([1, 2, 3, 4])
 let b = MLXArray(0 ..< 12, [3, 4])  // Shape [3, 4]
-let c = MLXArray.zeros([2, 3])
-let d = MLXArray.ones([4, 4], dtype: .float32)
+
+// Nested arrays give the shape directly (any depth)
+let c = MLXArray([[1, 2, 3], [4, 5, 6]])  // Shape [2, 3]
+
+let d = MLXArray.zeros([2, 3])
+let e = MLXArray.ones([4, 4], dtype: .float32)
 
 // Random arrays (use MLXRandom namespace or free functions)
 let uniform = MLXRandom.uniform(0.0 ..< 1.0, [3, 3])
@@ -78,6 +86,38 @@ array.size     // 12
 array.dtype    // .int64
 array.count    // 3 (first dimension)
 ```
+
+### DType Numeric Limits (`finfo`)
+
+Floating-point limits for a `DType`, analogous to `numpy.finfo`. `finfo` is **optional** — `nil` for non-floating-point dtypes, so integer dtypes are rejected safely instead of returning a bogus value:
+
+```swift
+if let info = DType.float16.finfo {   // FInfo? — nil for non-float dtypes
+    info.max               // 65504.0   (largest finite value)
+    info.min               // -65504.0  (== -max)
+    info.eps               // ulp of 1.0   (float16: 2^-10)
+    info.smallestNormal    //              (float16: 2^-14)
+    info.smallestSubnormal //              (float16: 2^-24)
+}
+
+DType.int32.finfo          // nil
+```
+
+When the dtype is statically known to be floating point, use the non-optional `greatestFiniteMagnitude` (mirrors `Float.greatestFiniteMagnitude`; **traps** on a non-float dtype):
+
+```swift
+let bound = DType.float16.greatestFiniteMagnitude   // 65504.0 (Double)
+```
+
+### Attention Mask Fill (`maskFill`)
+
+`MLXArray.maskFill(for:)` builds the value for masked-out positions before a softmax — `-finfo(dtype).max`, constructed directly in `dtype` so masked scores vanish under softmax with no `asType` to forget:
+
+```swift
+scores = MLX.where(causalMask, scores, MLXArray.maskFill(for: scores.dtype))
+```
+
+Requires a floating-point dtype (traps otherwise) — attention scores are float even when the KV cache is quantized.
 
 ### Basic Operations
 
@@ -306,8 +346,12 @@ let compiledOp = compile { (a: MLXArray, b: MLXArray) -> MLXArray in
 // Use compiled version
 let output = compiledOp(arrayA, arrayB)
 
-// Note: compile() works best with pure MLXArray functions.
-// For models, call model methods directly (they can use internal compilation).
+// compile() also supports compiling a Module/Optimizer training step: pass
+// them via inputs:/outputs: (they conform to Updatable) so compile observes
+// in-place updates (e.g. optimizer.update(model:gradients:), LoRA weight swaps).
+// If a captured Module/Optimizer is left out of inputs:/outputs:, compile()
+// silently freezes its parameter values at trace time -- see
+// references/transforms.md for the full pitfall and example.
 ```
 
 ## Quaternary Workflow: Wired Memory Coordination
@@ -345,7 +389,7 @@ _ = await weightsTicket.end()
 
 ### DON'T
 
-- **Don't share MLXArrays across tasks**: MLXArray is NOT Sendable by design.
+- **Don't share MLXArrays across tasks**: MLXArray is NOT Sendable by design — materialize a Sendable snapshot with `array.materialized()` (or wrap a model in `MaterializedModule`) when you must cross a boundary.
 - **Don't use deprecated module imports**: Use `import MLX` not `import MLXRandom`.
 - **Don't forget to eval()**: Unevaluated arrays can accumulate large compute graphs.
 - **Don't mutate arrays directly**: Use operations that return new arrays.
@@ -373,6 +417,7 @@ See [deprecated.md](references/deprecated.md) for the complete migration guide.
 MLX has specific concurrency behavior:
 
 - **MLXArray is NOT Sendable**: This is intentional. Arrays contain references to compute graphs.
+- **Materialize to cross boundaries**: `array.materialized()` / `materialize(_:)` returns a `Sendable` `MaterializedArray` snapshot; `MaterializedModule` does the same for a whole model.
 - **evalLock protects eval/stream creation**: The global lock serializes evaluation and stream operations.
 - **Lazy operations are NOT thread-safe**: Don't share arrays across tasks without proper synchronization.
 - **Use actors to encapsulate MLX state**: Create and use MLXArrays within the same actor.

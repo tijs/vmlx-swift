@@ -1,0 +1,286 @@
+import Foundation
+import PackagePlugin
+
+@main
+struct CudaBuild: BuildToolPlugin {
+
+    struct CodeGeneration: Codable {
+        var tool: String
+        var inputs: [String] = []
+        var outputs: [String] = []
+    }
+
+    struct Settings: Codable {
+        var headerSearchPaths: [String] = []
+        var exclude: [String] = []
+        var cppLanguageStandard: String? = nil
+        var verbose: Bool = false
+        var codeGeneration: [CodeGeneration] = []
+        var hostCompiler: String? = nil
+
+        init() {}
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            headerSearchPaths =
+                try c.decodeIfPresent([String].self, forKey: .headerSearchPaths) ?? []
+            exclude = try c.decodeIfPresent([String].self, forKey: .exclude) ?? []
+            cppLanguageStandard = try c.decodeIfPresent(String.self, forKey: .cppLanguageStandard)
+            verbose = try c.decodeIfPresent(Bool.self, forKey: .verbose) ?? false
+            codeGeneration =
+                try c.decodeIfPresent([CodeGeneration].self, forKey: .codeGeneration) ?? []
+            hostCompiler = try c.decodeIfPresent(String.self, forKey: .hostCompiler)
+        }
+    }
+
+    /// Host compiler nvcc should use, in priority order: the
+    /// `MLX_CUDA_HOST_COMPILER` environment variable, the `hostCompiler` key in
+    /// CudaBuild.json, then the toolchain's own clang++.
+    ///
+    /// It must still be a clang: nvcc preprocesses with it and SwiftPM compiles
+    /// the generated `.cpp`, so a GCC-preprocessed translation unit will not build.
+    func resolveHostCompiler(context: PluginContext, settings: Settings) -> String {
+        if let env = ProcessInfo.processInfo.environment["MLX_CUDA_HOST_COMPILER"], !env.isEmpty {
+            return env
+        }
+        if let configured = settings.hostCompiler, !configured.isEmpty {
+            return configured
+        }
+        guard let clangUrl = try? context.tool(named: "clang++") else {
+            fatalError("clang++ not found")
+        }
+        return clangUrl.url.path
+    }
+
+    func createBuildCommands(context: PluginContext, target: Target) async throws -> [Command] {
+
+        print("CUDA Build Plugin")
+
+        guard isCudaEnabled() else {
+            print("CUDA is disabled")
+            return []
+        }
+
+        let sourceDir = target.directoryURL
+
+        print("Source directory: \(sourceDir.path)")
+
+        // Read settings from CudaBuild.json if it exists
+
+        let settingsFile = sourceDir.appendingPathComponent("CudaBuild.json")
+        let settings: Settings
+        if let data = try? Data(contentsOf: settingsFile) {
+            print("Found settings file: \(settingsFile.path)")
+            settings = try JSONDecoder().decode(Settings.self, from: data)
+        } else {
+            settings = Settings()
+        }
+
+        let hostCompiler = resolveHostCompiler(context: context, settings: settings)
+
+        print("Use clang++ at: \(hostCompiler)")
+
+        // Scan source directory for .cu files
+
+        let sourceDirPath = sourceDir.path.hasSuffix("/") ? sourceDir.path : sourceDir.path + "/"
+        var sourceCuFiles: [URL] = []
+        if let enumerator = FileManager.default.enumerator(
+            at: sourceDir, includingPropertiesForKeys: nil)
+        {
+            while let inputUrl = enumerator.nextObject() as? URL {
+                if inputUrl.pathExtension == "cu" {
+                    guard inputUrl.path.hasPrefix(sourceDirPath) else {
+                        fatalError(
+                            "Input file \(inputUrl.path) is not under source directory \(sourceDirPath)"
+                        )
+                    }
+                    let relativePath = String(inputUrl.path.dropFirst(sourceDirPath.count))
+                    if isExcluded(settings: settings, relativePath: relativePath) {
+                        print("Excluding \(relativePath)")
+                        continue
+                    }
+                    sourceCuFiles.append(URL(string: relativePath, relativeTo: sourceDir)!)
+                }
+            }
+        }
+
+        sourceCuFiles.sort { $0.path < $1.path }  // make it deterministic
+
+        print("Source files: \(sourceCuFiles.map { $0.relativePath })")
+
+        let outputDir = context.pluginWorkDirectoryURL
+
+        var commands: [Command] = []
+
+        // Invoke code generation tools
+
+        var generatedCuFiles: [URL] = []
+
+        for (index, codeGen) in settings.codeGeneration.enumerated() {
+            let tool = try context.tool(named: codeGen.tool)
+            let codeGenOutputDir = outputDir.appendingPathComponent("gen\(index)-\(codeGen.tool)")
+            try FileManager.default.createDirectory(
+                at: codeGenOutputDir, withIntermediateDirectories: true)
+            let inputUrls = codeGen.inputs.map { sourceDir.appendingPathComponent($0) }
+            let outputUrls = codeGen.outputs.map { codeGenOutputDir.appendingPathComponent($0) }
+            commands.append(
+                .buildCommand(
+                    displayName: "Running \(codeGen.tool)",
+                    executable: tool.url,
+                    arguments: inputUrls.map { $0.path } + outputUrls.flatMap { ["-o", $0.path] },
+                    inputFiles: inputUrls,
+                    outputFiles: outputUrls
+                )
+            )
+            generatedCuFiles += outputUrls.filter { $0.pathExtension == "cu" }
+        }
+
+        print("Generated source files: \(generatedCuFiles.map { $0.relativePath })")
+
+        // Ask encuda to skip work if the output is already up to date.
+        // This should normally be handled by the build system, but apparently it is not.
+
+        let incrementalFlag = ["--incremental"]
+
+        // Invoke `encuda compile` to compile each .cu file to .cpp
+
+        let encuda = try context.tool(named: "encuda")
+        let verboseFlag = settings.verbose ? ["-v"] : []
+        let headerSearchPathArgs = settings.headerSearchPaths.flatMap {
+            ["-I", sourceDirPath + $0]
+        }
+        let stdArgs = settings.cppLanguageStandard.map { ["--std", $0] } ?? []
+
+        // Include roots that live outside the package: the CCCL copy to compile
+        // device code against, plus anything named in MLX_CUDA_INCLUDE_PATHS
+        // (cudnn-frontend, CUTLASS). Kept in step with Package.swift, which
+        // applies the same roots to the C++ sources.
+        let environment = ProcessInfo.processInfo.environment
+        var externalIncludeRoots: [String] = []
+        if let ccclDir = environment["MLX_CCCL_DIR"] {
+            externalIncludeRoots.append(ccclDir)
+        }
+        let extraRoots = environment["MLX_CUDA_INCLUDE_PATHS"] ?? ""
+        externalIncludeRoots += extraRoots.split(separator: ":").map(String.init)
+        let externalIncludeArgs: [String] =
+            externalIncludeRoots
+            .filter { !$0.isEmpty }
+            .flatMap { ["-I", $0] }
+
+        for inputFile in sourceCuFiles + generatedCuFiles {
+            let outputCpp = URL(string: inputFile.relativePath, relativeTo: outputDir)!
+                .deletingPathExtension().appendingPathExtension("cpp")
+            commands.append(
+                .buildCommand(
+                    displayName:
+                        "Compiling \(inputFile.lastPathComponent) to \(outputCpp.lastPathComponent)",
+                    executable: encuda.url,
+                    arguments: compileArguments(
+                        clangpp: hostCompiler,
+                        sourceDir: sourceDir.path,
+                        verboseFlag: verboseFlag,
+                        stdArgs: stdArgs,
+                        incrementalFlag: incrementalFlag,
+                        headerSearchPathArgs: headerSearchPathArgs,
+                        externalIncludeArgs: externalIncludeArgs,
+                        input: inputFile.path,
+                        output: outputCpp.path
+                    ),
+                    inputFiles: [inputFile],
+                    outputFiles: [outputCpp]
+                )
+            )
+        }
+
+        // Invoke `encuda link` with all .cpp files
+
+        let outputCpps = (sourceCuFiles + generatedCuFiles).map { inputFile in
+            URL(string: inputFile.relativePath, relativeTo: outputDir)!
+                .deletingPathExtension()
+                .appendingPathExtension("cpp")
+        }
+
+        let linkOutput = outputDir.appendingPathComponent("__cuda_link.cpp")
+
+        commands.append(
+            .buildCommand(
+                displayName: "Linking CUDA objects",
+                executable: encuda.url,
+                arguments: linkArguments(
+                    clangpp: hostCompiler,
+                    verboseFlag: verboseFlag,
+                    stdArgs: stdArgs,
+                    incrementalFlag: incrementalFlag,
+                    inputs: outputCpps.map { $0.path },
+                    output: linkOutput.path
+                ),
+                inputFiles: outputCpps,
+                outputFiles: [linkOutput]
+            )
+        )
+
+        return commands
+    }
+
+    /// Assembled in steps rather than as one `+` chain, which is expensive to
+    /// type-check and gets more so with each argument added.
+    func compileArguments(
+        clangpp: String,
+        sourceDir: String,
+        verboseFlag: [String],
+        stdArgs: [String],
+        incrementalFlag: [String],
+        headerSearchPathArgs: [String],
+        externalIncludeArgs: [String],
+        input: String,
+        output: String
+    ) -> [String] {
+        var arguments: [String] = ["compile"]
+        arguments += verboseFlag
+        arguments += stdArgs
+        arguments += incrementalFlag
+        arguments += ["--clangpp", clangpp]
+        arguments += ["-I", sourceDir]
+        arguments += headerSearchPathArgs
+        arguments += externalIncludeArgs
+        arguments += [input]
+        arguments += ["-o", output]
+        return arguments
+    }
+
+    /// See `compileArguments` for why this is not a single expression.
+    func linkArguments(
+        clangpp: String,
+        verboseFlag: [String],
+        stdArgs: [String],
+        incrementalFlag: [String],
+        inputs: [String],
+        output: String
+    ) -> [String] {
+        var arguments: [String] = ["link"]
+        arguments += verboseFlag
+        arguments += stdArgs
+        arguments += incrementalFlag
+        arguments += ["--clangpp", clangpp]
+        arguments += inputs
+        arguments += ["-o", output]
+        return arguments
+    }
+
+    func isExcluded(settings: Settings, relativePath: String) -> Bool {
+        func isInFolder(path: String, folderPath: String) -> Bool {
+            let prefix = folderPath.hasSuffix("/") ? folderPath : (folderPath + "/")
+            return path.hasPrefix(prefix)
+        }
+        return settings.exclude.contains(relativePath)
+            || settings.exclude.contains { isInFolder(path: relativePath, folderPath: $0) }
+    }
+
+    func isCudaEnabled() -> Bool {
+        #if os(Linux)
+            return ProcessInfo.processInfo.environment["SPM_CUDA"] != "0"
+        #else
+            return false
+        #endif
+    }
+}

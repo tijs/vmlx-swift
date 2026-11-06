@@ -45,7 +45,7 @@ struct Spark25DualProjectionTests {
     @Test func compiledFallbackParity() {
         let g=layer(seed:41),u=layer(seed:43)
         let x=MLXRandom.normal([1,1,2560]).asType(.bfloat16)
-        let f=compile { (x:MLXArray) in Spark25DualProjection.apply(x,gate:g,up:u) ?? gelu(g(x))*u(x) }
+        let f=compile(inputs: [], outputs: []) { (x:MLXArray) in Spark25DualProjection.apply(x,gate:g,up:u) ?? gelu(g(x))*u(x) }
         let expected=gelu(g(x))*u(x),actual=f(x)
         eval(expected,actual)
         #expect((expected .== actual).all().item(Bool.self))

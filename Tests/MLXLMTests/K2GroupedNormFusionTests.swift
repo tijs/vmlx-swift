@@ -230,7 +230,7 @@ final class K2GroupedNormFusionTests: XCTestCase {
         MLXMetalTestLock.withLock {
             let x = MLXRandom.normal([1, 1, 4096], key: MLXRandom.key(113)).asType(.bfloat16)
             let weight = MLXRandom.normal([4096], key: MLXRandom.key(127)).asType(.bfloat16)
-            let compiled = compile { (a: MLXArray, w: MLXArray) in
+            let compiled = compile(inputs: [], outputs: []) { (a: MLXArray, w: MLXArray) in
                 K2GroupedNormFusion.apply(a, weight: w, groups: 4, eps: 1e-6)
                     ?? self.reference(a, weight: w)
             }

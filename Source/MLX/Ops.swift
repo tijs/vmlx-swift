@@ -406,7 +406,7 @@ public func bartlett(
     _ m: Int, stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
-    mlx_bartlett(&result, Int32(m), stream.ctx)
+    mlx_bartlett(&result, m.int32, stream.ctx)
     return MLXArray(result)
 }
 
@@ -423,7 +423,7 @@ public func blackman(
     _ m: Int, stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
-    mlx_blackman(&result, Int32(m), stream.ctx)
+    mlx_blackman(&result, m.int32, stream.ctx)
     return MLXArray(result)
 }
 
@@ -1002,8 +1002,11 @@ public func convolve(
         if weightSize % 2 == 1 {
             padding = weightSize / 2
         } else {
+            // even sized weights use asymmetric padding -- this must match
+            // python's `mx.convolve()` so that the result is the centered
+            // `input.size` window of the full convolution
             let padLeft = weightSize / 2
-            let padRight = max(0, padLeft / 2 - 1)
+            let padRight = max(0, padLeft - 1)
 
             input = padded(input, widths: [0, [padLeft, padRight], 0], stream: stream)
         }
@@ -1141,7 +1144,7 @@ public enum QuantizationMode: String, Codable, Sendable {
 ///   - stream: Stream or device to evaluate on
 ///
 /// ### See Also
-/// - ``quantized(_:groupSize:bits:mode:stream:)``
+/// - ``quantized(_:groupSize:bits:mode:globalScale:stream:)``
 /// - ``quantizedMM(_:_:scales:biases:transpose:groupSize:bits:mode:stream:)``
 public func dequantized(
     _ w: MLXArray,
@@ -1154,7 +1157,7 @@ public func dequantized(
     var result = mlx_array_new()
     let gs = mlx_optional_int(value: Int32(groupSize ?? 0), has_value: groupSize != nil)
     let bits = mlx_optional_int(value: Int32(bits ?? 0), has_value: bits != nil)
-    let dtype = mlx_optional_dtype(value: dtype?.cmlxDtype ?? MLX_FLOAT16, has_value: dtype != nil)
+    let dtype = mlx_optional_dtype(dtype)
     mlx_dequantize(
         &result, w.ctx,
         scales.ctx, (biases ?? .mlxNone).ctx, gs, bits, mode.rawValue,
@@ -1164,18 +1167,18 @@ public func dequantized(
     return MLXArray(result)
 }
 
-/// Decode E4M3 FP8 payload bytes to a floating-point array.
+/// The n-th discrete difference along the given axis.
 ///
-/// Casting a `uint8` FP8 tensor to float interprets each byte as an integer.
-/// This op preserves the FP8 value semantics used by bundles that store
-/// `.weight` plus `.weight_scale_inv` tensors.
-public func fromFP8(
-    _ x: MLXArray,
-    dtype: DType = .bfloat16,
-    stream: StreamOrDevice = .default
+/// - Parameters:
+///   - array: Input array
+///   - n: The number of times to difference
+///   - axis: The axis along which to difference
+///   - stream: Stream or device to evaluate on
+public func diff(
+    _ array: MLXArray, n: Int = 1, axis: Int = -1, stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
-    mlx_from_fp8(&result, x.ctx, dtype.cmlxDtype, stream.ctx)
+    mlx_diff(&result, array.ctx, n.int32, axis.int32, stream.ctx)
     return MLXArray(result)
 }
 
@@ -1389,6 +1392,57 @@ public func expm1(_ array: MLXArray, stream: StreamOrDevice = .default) -> MLXAr
     return MLXArray(result)
 }
 
+/// Reverse the order of elements along the given axes.
+///
+/// - Parameters:
+///   - array: Input array
+///   - axes: The axes along which to flip or None for all
+///   - stream: Stream or device to evaluate on
+public func flipped(
+    _ array: MLXArray, axes: [Int]? = nil, stream: StreamOrDevice = .default
+) -> MLXArray {
+    var result = mlx_array_new()
+    let axes = axes ?? Array(0 ..< array.ndim)
+    mlx_flip_axes(&result, array.ctx, axes.asInt32, axes.count, stream.ctx)
+    return MLXArray(result)
+}
+
+/// Reverse the order of elements along the given axis.
+///
+/// - Parameters:
+///   - array: Input array
+///   - axis: The axis along which to flip
+///   - stream: Stream or device to evaluate on
+public func flipped(
+    _ array: MLXArray, axis: Int, stream: StreamOrDevice = .default
+) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_flip_axis(&result, array.ctx, axis.int32, stream.ctx)
+    return MLXArray(result)
+}
+
+/// Convert an E4M3 FP8 array to the given floating-point ``DType``.
+///
+/// The input array is interpreted as raw FP8 bytes.
+///
+/// - Parameters:
+///   - array: input array containing E4M3 FP8 values
+///   - dtype: data type of the output array
+///   - stream: stream or device to evaluate on
+///
+/// ### See Also
+/// - ``toFP8(_:stream:)``
+/// - <doc:conversion>
+public func fromFP8(
+    _ array: MLXArray,
+    dtype: DType = .bfloat16,
+    stream: StreamOrDevice = .default
+) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_from_fp8(&result, array.ctx, dtype.cmlxDtype, stream.ctx)
+    return MLXArray(result)
+}
+
 @available(*, deprecated, renamed: "gatherMM(_:_:lhsIndices:rhsIndices:sortedIndices:stream:)")
 public func gatherMatmul(
     _ a: MLXArray, _ b: MLXArray, lhsIndices: MLXArray? = nil, rhsIndices: MLXArray? = nil,
@@ -1437,7 +1491,7 @@ public func gatherMM(
 @available(
     *, deprecated,
     renamed:
-        "gatherQuantizedMM(_:_:scales:biases:lhsIndices:rhsIndices:transpose:groupSize:bits:mode:sortedIndices:stream:)"
+        "gatherQuantizedMM(_:_:scales:biases:lhsIndices:rhsIndices:transpose:groupSize:bits:mode:globalScale:sortedIndices:stream:)"
 )
 public func gatherQuantizedMatmul(
     _ x: MLXArray, _ w: MLXArray, scales: MLXArray, biases: MLXArray?,
@@ -1474,6 +1528,8 @@ public func gatherQuantizedMatmul(
 ///   - groupSize: The size of the group in `w` that shares a scale and bias. Default is `64`
 ///   - bits: The number of bits occupied by each element in `w`. Default is `4`
 ///   - mode: The quantization mode. Default is `.affine`
+///   - globalScale: The per-input float32 scale used for
+///     `nvfp4` quantization of `w`. Only supported on the GPU.
 ///   - sortedIndices: Whether the indices are sorted. Default is `false`
 ///   - stream: Stream or device to evaluate on
 ///
@@ -1481,10 +1537,11 @@ public func gatherQuantizedMatmul(
 /// - <doc:arithmetic>
 /// - ``quantizedMM(_:_:scales:biases:transpose:groupSize:bits:mode:stream:)``
 public func gatherQuantizedMM(
-    _ x: MLXArray, _ w: MLXArray, scales: MLXArray, biases: MLXArray?,
+    _ x: MLXArray, _ w: MLXArray, scales: MLXArray, biases: MLXArray? = nil,
     lhsIndices: MLXArray? = nil, rhsIndices: MLXArray? = nil,
     transpose: Bool = true, groupSize: Int? = nil, bits: Int? = nil,
     mode: QuantizationMode = .affine,
+    globalScale: MLXArray? = nil,
     sortedIndices: Bool = false,
     stream: StreamOrDevice = .default
 ) -> MLXArray {
@@ -1497,9 +1554,33 @@ public func gatherQuantizedMM(
         &result,
         x.ctx, w.ctx, scales.ctx, (biases ?? .mlxNone).ctx, (lhsIndices ?? .mlxNone).ctx,
         (rhsIndices ?? .mlxNone).ctx, transpose,
-        gs, bits, mode.rawValue, sortedIndices,
+        gs, bits,
+        mode.rawValue,
+        (globalScale ?? .mlxNone).ctx,
+        sortedIndices,
         stream.ctx)
 
+    return MLXArray(result)
+}
+
+/// Perform a matrix multiplication but segment the inner dimension and
+/// save the result for each segment separately.
+///
+/// - Parameters:
+///   - a: array of shape `MxK`
+///   - b: array of shape `KxN`
+///   - segments: offsets into the inner dimension for each segment
+///   - stream: stream or device to evaluate on
+/// - Returns: result per segment of shape `MxN`
+/// ### See Also
+/// - <doc:arithmetic>
+public func segmentedMM(
+    _ a: MLXArray, _ b: MLXArray,
+    segments: MLXArray,
+    stream: StreamOrDevice = .default
+) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_segmented_mm(&result, a.ctx, b.ctx, segments.ctx, stream.ctx)
     return MLXArray(result)
 }
 
@@ -1596,7 +1677,7 @@ public func hamming(
     _ m: Int, stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
-    mlx_hamming(&result, Int32(m), stream.ctx)
+    mlx_hamming(&result, m.int32, stream.ctx)
     return MLXArray(result)
 }
 
@@ -1613,7 +1694,7 @@ public func hanning(
     _ m: Int, stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
-    mlx_hanning(&result, Int32(m), stream.ctx)
+    mlx_hanning(&result, m.int32, stream.ctx)
     return MLXArray(result)
 }
 
@@ -1917,8 +1998,27 @@ public func logicalOr(
     return MLXArray(result)
 }
 
+/// Element-wise logical exclusive or.
+///
+/// - Parameters:
+///   - a: input array or scalar
+///   - b: input array or scalar
+///   - stream: stream or device to evaluate on
+///
+/// ### See Also
+/// - <doc:arithmetic>
+/// - <doc:logical>
+public func logicalXor(
+    _ a: some ScalarOrArray, _ b: some ScalarOrArray, stream: StreamOrDevice = .default
+) -> MLXArray {
+    let (a, b) = toArrays(a, b)
+    var result = mlx_array_new()
+    mlx_logical_xor(&result, a.ctx, b.ctx, stream.ctx)
+    return MLXArray(result)
+}
+
 /// Indexing mode for ``meshGrid(_:sparse:indexing:stream:)``.
-public enum MeshGridIndexing: String, Sendable {
+public enum MeshGridIndexing: String, Sendable, Codable {
     /// cartesian indexing
     case xy
 
@@ -1947,6 +2047,22 @@ public func meshGrid(
     defer { mlx_vector_array_free(vec) }
 
     return mlx_vector_array_values(vec)
+}
+
+/// Transpose the last two dimensions of the array.
+///
+/// ### See Also
+/// - ``transposed(_:stream:)``
+///
+/// - Parameters:
+///   - array: array to transpose
+///   - stream: stream or device to evaluate on
+public func matrixTransposed(
+    _ array: MLXArray, stream: StreamOrDevice = .default
+) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_matrix_transpose(&result, array.ctx, stream.ctx)
+    return MLXArray(result)
 }
 
 /// Element-wise maximum.
@@ -2093,7 +2209,7 @@ public func multiply(
 /// - <doc:arithmetic>
 public func nanToNum(
     _ array: MLXArray,
-    nan: Float = 0, posInf: Float? = 0, negInf: Float? = 0,
+    nan: Float = 0, posInf: Float? = nil, negInf: Float? = nil,
     stream: StreamOrDevice = .default
 ) -> MLXArray {
     let posInf = mlx_optional_float(value: posInf ?? 0, has_value: posInf != nil)
@@ -2297,6 +2413,17 @@ public func partitioned(_ array: MLXArray, kth: Int, stream: StreamOrDevice = .d
     return MLXArray(result)
 }
 
+/// Element-wise unary plus. Returns a copy of the input.
+///
+/// - Parameters:
+///   - array: input array
+///   - stream: stream or device to evaluate on
+public func positive(_ array: MLXArray, stream: StreamOrDevice = .default) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_positive(&result, array.ctx, stream.ctx)
+    return MLXArray(result)
+}
+
 /// Put values along an axis at the specified indices.
 ///
 /// - Parameters:
@@ -2363,7 +2490,7 @@ public func putAlong(
 /// [this documentation](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.quantize.html)
 ///
 /// ### See Also
-/// - ``dequantized(_:scales:biases:groupSize:bits:mode:dtype:stream:)``
+/// - ``dequantized(_:scales:biases:groupSize:bits:mode:globalScale:dtype:stream:)``
 /// - ``quantizedMM(_:_:scales:biases:transpose:groupSize:bits:mode:stream:)``
 public func quantized(
     _ w: MLXArray,
@@ -2422,8 +2549,8 @@ public func quantizedMatmul(
 ///   - stream: Stream or device to evaluate on
 ///
 /// ### See Also
-/// - ``dequantized(_:scales:biases:groupSize:bits:mode:dtype:stream:)``
-/// - ``quantized(_:groupSize:bits:mode:stream:)``
+/// - ``dequantized(_:scales:biases:groupSize:bits:mode:globalScale:dtype:stream:)``
+/// - ``quantized(_:groupSize:bits:mode:globalScale:stream:)``
 public func quantizedMM(
     _ x: MLXArray, _ w: MLXArray, scales: MLXArray, biases: MLXArray?,
     transpose: Bool = true,
@@ -2593,6 +2720,31 @@ public func roll(
     return MLXArray(result)
 }
 
+public enum SearchSortedSide: String, Sendable, Codable {
+    case left
+    case right
+}
+
+/// Find the indices that keep `sorted` sorted when inserting `values`.
+///
+/// - Parameters:
+///   - sorted: 1-D array in ascending order.
+///   - values: values to insert in any shape
+///   - side: if `.left` the first suitable index is returned, otherwise last
+///   - stream: stream or device to evaluate on
+/// - Returns: `.uint32` array in the same shape as `values`
+public func search(
+    sorted: MLXArray,
+    values: MLXArray,
+    side: SearchSortedSide = .left,
+    stream: StreamOrDevice = .default
+) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_searchsorted(
+        &result, sorted.ctx, values.ctx, side.rawValue.cString(using: .utf8), stream.ctx)
+    return MLXArray(result)
+}
+
 /// Element-wise logistic sigmoid.
 ///
 /// For details, please see
@@ -2659,6 +2811,7 @@ public func softMax(
 /// - Parameters:
 ///     - array: input array
 ///     - axes: axes to compute the softmax over
+///     - precise: if true, compute a more precise softmax by scaling the input
 ///     - stream: stream or device to evaluate on
 ///
 /// ### See Also
@@ -2693,6 +2846,7 @@ public func softMax(
 /// - Parameters:
 ///     - array: input array
 ///     - axis: axis to compute the softmax over
+///     - precise: if true, compute a more precise softmax by scaling the input
 ///     - stream: stream or device to evaluate on
 ///
 /// ### See Also
@@ -2725,6 +2879,7 @@ public func softMax(_ array: MLXArray, precise: Bool = false, stream: StreamOrDe
 ///
 /// - Parameters:
 ///     - array: input array
+///     - precise: if true, compute a more precise softmax by scaling the input
 ///     - stream: stream or device to evaluate on
 ///
 /// ### See Also
@@ -2851,6 +3006,178 @@ public func stacked(
     return MLXArray(result)
 }
 
+/// Split an array into a sequence of arrays along the given axis.
+///
+/// The inverse of ``stacked(_:axis:stream:)``. The given axis is removed from each of the returned arrays.
+///
+/// ### See Also
+/// - <doc:shapes>
+public func unstacked(
+    _ array: MLXArray, axis: Int = 0, stream: StreamOrDevice = .default
+) -> [MLXArray] {
+    var result = mlx_vector_array_new()
+    defer { mlx_vector_array_free(result) }
+    mlx_unstack_axis(&result, array.ctx, axis.int32, stream.ctx)
+    return mlx_vector_array_values(result)
+}
+
+/// Returns the sorted unique elements of the flattened array.
+///
+/// The shape of the output does not depend on the values in `array`, so
+/// `array` is not evaluated. Unlike NumPy, the size is never inferred from
+/// the values and must be provided.
+///
+/// Entries past the last unique element hold `fillValue`.
+/// A truncated output keeps the smallest `size` unique elements.
+///
+/// This op builds on ``sorted(_:stream:)``, so a `Bool` input needs the CPU
+/// stream.
+///
+/// ### See Also
+/// - ``uniqued(_:size:fillValue:returning:stream:)``
+///
+/// - Parameters:
+///   - array: input array
+///   - size: The size of the output. If the size is smaller than
+///     the number of unique elements of `array`, the output is truncated.
+///     If it is larger, the output is padded with `fillValue`.
+///   - fillValue: optional value to fill empty positions in the result.  If
+///     not specified this defaults to the first of the sorted unique elements.
+///   - stream: stream or device to evaluate on
+/// - Returns: sorted unique elements
+public func uniqued(
+    _ array: MLXArray,
+    size: Int,
+    fillValue: MLXArray? = nil,
+    stream: StreamOrDevice = .default
+) -> MLXArray {
+    var vector = mlx_vector_array_new()
+    defer { mlx_vector_array_free(vector) }
+
+    mlx_unique(
+        &vector,
+        array.ctx, size.int32,
+        false, false, false,
+        (fillValue ?? .mlxNone).ctx,
+        stream.ctx)
+
+    let arrays = mlx_vector_array_values(vector)
+    return arrays[0]
+}
+
+/// Options for `uniqued()`.
+///
+/// See ``uniqued(_:size:fillValue:returning:stream:)``.
+public struct UniqueOptions: OptionSet, Sendable {
+    public let rawValue: Int
+    public init(rawValue: Int) { self.rawValue = rawValue }
+
+    /// Requests the index in the flattened input of the first
+    /// occurence of each unique element.
+    public static let index = UniqueOptions(rawValue: 1 << 0)
+
+    /// Requests the indices of the unique array that rebuild
+    /// the input to `uniqued()`.
+    public static let inverse = UniqueOptions(rawValue: 1 << 1)
+
+    /// Requests the number of times each unique element occurs in the
+    /// input.
+    public static let counts = UniqueOptions(rawValue: 1 << 2)
+}
+
+/// Return value for `uniqued()`.
+///
+/// See ``uniqued(_:size:fillValue:returning:stream:)``.
+public struct UniqueResult {
+
+    /// Array of unique values of the given size.
+    public var values: MLXArray
+    public var index: MLXArray?
+    public var inverse: MLXArray?
+    public var counts: MLXArray?
+
+    public init(
+        values: MLXArray,
+        index: MLXArray? = nil, inverse: MLXArray? = nil, counts: MLXArray? = nil
+    ) {
+        self.values = values
+        self.index = index
+        self.inverse = inverse
+        self.counts = counts
+    }
+}
+
+/// Returns the sorted unique elements of the flattened array.
+///
+/// The shape of the output does not depend on the values in `array`, so
+/// `array` is not evaluated. Unlike NumPy, the size is never inferred from
+/// the values and must be provided.
+///
+/// Entries past the last unique element hold `fillValue` and their
+/// count is `0`, so `sum(result.counts > 0)` gives the number of unique
+/// elements as long as the output is not truncated.
+///
+/// A truncated output keeps the smallest `size` unique elements, and
+/// `result.index`, `result.inverse` and `result.counts`
+/// then stop describing all of `array`,
+/// and `result.inverse` and `result.counts` stop agreeing with each other:
+/// the counts of the dropped elements are gone, while their
+/// indices in `result.inverse` are clamped to the last entry.
+///
+/// This op builds on ``sorted(_:stream:)``, so a `Bool` input needs the CPU
+/// stream.
+///
+/// ### See Also
+/// - ``uniqued(_:size:fillValue:stream:)``
+///
+/// - Parameters:
+///   - array: input array
+///   - size: The size of the output. If the size is smaller than
+///     the number of unique elements of `array`, the output is truncated.
+///     If it is larger, the output is padded with `fillValue`.
+///   - fillValue: optional value to fill empty positions in the result.  If
+///     not specified this defaults to the first of the sorted unique elements.
+///   - returning: Additional values to return
+///   - stream: stream or device to evaluate on
+/// - Returns: sorted unique elements
+public func uniqued(
+    _ array: MLXArray,
+    size: Int,
+    fillValue: MLXArray? = nil,
+    returning: UniqueOptions,
+    stream: StreamOrDevice = .default
+) -> UniqueResult {
+    var vector = mlx_vector_array_new()
+    defer { mlx_vector_array_free(vector) }
+
+    mlx_unique(
+        &vector,
+        array.ctx, size.int32,
+        returning.contains(.index),
+        returning.contains(.inverse),
+        returning.contains(.counts),
+        (fillValue ?? .mlxNone).ctx,
+        stream.ctx)
+
+    let arrays = mlx_vector_array_values(vector)
+    var result = UniqueResult(values: arrays[0])
+
+    var readIndex = 1
+    if returning.contains(.index) {
+        result.index = arrays[readIndex]
+        readIndex += 1
+    }
+    if returning.contains(.inverse) {
+        result.inverse = arrays[readIndex]
+        readIndex += 1
+    }
+    if returning.contains(.counts) {
+        result.counts = arrays[readIndex]
+        readIndex += 1
+    }
+    return result
+}
+
 /// Stop gradients from being computed.
 ///
 ///The operation is the identity but it prevents gradients from flowing
@@ -2965,7 +3292,7 @@ public func tanh(_ array: MLXArray, stream: StreamOrDevice = .default) -> MLXArr
 /// - Parameters:
 ///   - a: input array
 ///   - b: input array
-///   - axes: sum over the last `axes` dimensions
+///   - axes: sum over the last `axes` dimensions of `a` and the first `axes` of `b`
 ///   - stream: stream or device to evaluate on
 /// - Returns: tensor dot product
 ///
@@ -2973,7 +3300,7 @@ public func tanh(_ array: MLXArray, stream: StreamOrDevice = .default) -> MLXArr
 /// - <doc:arithmetic>
 /// - ``tensordot(_:_:axes:stream:)-(MLXArray,MLXArray,Int,StreamOrDevice)``
 public func tensordot(
-    _ a: MLXArray, _ b: MLXArray, axes: Int = 1, stream: StreamOrDevice = .default
+    _ a: MLXArray, _ b: MLXArray, axes: Int = 2, stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
     mlx_tensordot_axis(&result, a.ctx, b.ctx, axes.int32, stream.ctx)
@@ -3027,6 +3354,21 @@ public func tensordot(
     return MLXArray(result)
 }
 
+/// Compute the vector dot product of two arrays along an axis.
+///
+/// - Parameters:
+///   - a: first array
+///   - b: second array
+///   - axis: axis over which to compute the dot product
+///   - stream: stream or device to evaluate on
+public func vecdot(
+    _ a: MLXArray, _ b: MLXArray, axis: Int = -1, stream: StreamOrDevice = .default
+) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_vecdot(&result, a.ctx, b.ctx, axis.int32, stream.ctx)
+    return MLXArray(result)
+}
+
 /// Construct array by repeating given array the number of times given by `repetitions`.
 ///
 /// - Parameters:
@@ -3064,6 +3406,21 @@ public func tiled(_ array: MLXArray, repetitions: Int, stream: StreamOrDevice = 
 {
     var result = mlx_array_new()
     mlx_tile(&result, array.ctx, [repetitions.int32], 1, stream.ctx)
+    return MLXArray(result)
+}
+
+/// Convert a floating-point array to E4M3 FP8 bytes.
+///
+/// - Parameters:
+///   - array: input array
+///   - stream: stream or device to evaluate on
+///
+/// ### See Also
+/// - ``fromFP8(_:dtype:stream:)``
+/// - <doc:conversion>
+public func toFP8(_ array: MLXArray, stream: StreamOrDevice = .default) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_to_fp8(&result, array.ctx, stream.ctx)
     return MLXArray(result)
 }
 
@@ -3161,6 +3518,17 @@ public func triu(_ array: MLXArray, k: Int = 0, stream: StreamOrDevice = .defaul
     return MLXArray(result)
 }
 
+/// Element-wise truncation towards zero.
+///
+/// - Parameters:
+///   - array: Input array
+///   - stream: stream or device to evaluate on
+public func trunc(_ array: MLXArray, stream: StreamOrDevice = .default) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_trunc(&result, array.ctx, stream.ctx)
+    return MLXArray(result)
+}
+
 /// Select from `x` or `y` according to `condition`.
 ///
 /// The condition and input arrays must be the same shape or <doc:broadcasting>
@@ -3170,8 +3538,8 @@ public func triu(_ array: MLXArray, k: Int = 0, stream: StreamOrDevice = .defaul
 ///
 /// - Parameters:
 ///     - condition: condition array
-///     - a: input selected from where condiiton is non-zero or `true`
-///     - b: input selected from where condiiton is zero or `false`
+///     - a: input selected from where condition is non-zero or `true`
+///     - b: input selected from where condition is zero or `false`
 ///     - stream: stream or device to evaluate on
 ///
 /// ### See Also
@@ -3194,8 +3562,8 @@ public func `where`(
 ///
 /// - Parameters:
 ///     - condition: condition array
-///     - a: input selected from where condiiton is non-zero or `true`
-///     - b: input selected from where condiiton is zero or `false`
+///     - a: input selected from where condition is non-zero or `true`
+///     - b: input selected from where condition is zero or `false`
 ///     - stream: stream or device to evaluate on
 ///
 /// ### See Also
@@ -3256,7 +3624,7 @@ public func unflatten(
     _ a: MLXArray, axis: Int, shape: some Collection<Int>, stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
-    mlx_unflatten(&result, a.ctx, axis.int32, shape.map { Int32($0) }, shape.count, stream.ctx)
+    mlx_unflatten(&result, a.ctx, axis.int32, shape.map { $0.int32 }, shape.count, stream.ctx)
     return MLXArray(result)
 }
 

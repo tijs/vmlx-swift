@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
+import Cmlx
 import MLX
 import XCTest
 
@@ -54,10 +55,16 @@ private let mlxMetallibSourceDirectoryForTests: URL? = {
 private final class MLXTestBundleProbe {}
 
 func setDefaultDevice() {
+    prepareMLXMetallibForTests()
     MLX.Device.setDefault(device: .gpu)
 }
 
 private let mlxMetallibPreparedForTests: Void = {
+    if let path = ProcessInfo.processInfo.environment["VMLX_TEST_METALLIB_PATH"] {
+        precondition(FileManager.default.isReadableFile(atPath: path))
+        precondition(mlx_metal_set_metallib_path(path) == 0)
+        return
+    }
     let fileManager = FileManager.default
     guard let sourceDirectory = mlxMetallibSourceDirectoryForTests else {
         return

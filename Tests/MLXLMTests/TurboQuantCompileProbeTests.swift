@@ -88,7 +88,7 @@ class TurboQuantCompileProbeTests: XCTestCase {
         // degenerate output.
         let capturedModel = model
         let captured = tqCache
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let result = capturedModel(
@@ -205,7 +205,7 @@ class TurboQuantCompileProbeTests: XCTestCase {
         // Compiled path: build trace over compiledCache.
         let capturedModel = model
         let captured = compiledCache
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let result = capturedModel(
@@ -340,7 +340,7 @@ class TurboQuantCompileProbeTests: XCTestCase {
 
         let capturedModel = model
         let captured = compiledCache
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let result = capturedModel(

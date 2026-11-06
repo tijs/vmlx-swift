@@ -1474,6 +1474,24 @@ public struct CompositeLogitProcessor: LogitProcessor {
     }
 }
 
+// Preserve constraint metadata through composites without classifying an
+// ordinary penalty or filter as structured output.
+func logitConstraintFailure(_ processor: (any LogitProcessor)?) -> JSONSchemaGrammarError? {
+    if let composite = processor as? CompositeLogitProcessor {
+        return logitConstraintFailure(composite.base) ?? logitConstraintFailure(composite.additional)
+    }
+    return (processor as? any ConstraintFailureReporting)?.constraintFailure
+}
+
+func logitConstraintCompletion(_ processor: (any LogitProcessor)?) -> Bool? {
+    if let composite = processor as? CompositeLogitProcessor {
+        let states = [logitConstraintCompletion(composite.base),
+                      logitConstraintCompletion(composite.additional)].compactMap { $0 }
+        return states.isEmpty ? nil : states.allSatisfy { $0 }
+    }
+    return (processor as? any ConstraintFailureReporting)?.constraintIsComplete
+}
+
 /// Common properties shared by token-generating iterators.
 public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
     var maxTokens: Int? { get }
@@ -1784,7 +1802,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     var cache: [KVCache]
     public private(set) var generationFailure: GenerationFailure? = nil
     public var structuredOutputComplete: Bool? {
-        (processor as? any ConstraintFailureReporting)?.constraintIsComplete
+        logitConstraintCompletion(processor)
     }
 
     var processor: LogitProcessor?
@@ -1801,7 +1819,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let quantizedKVStart: Int
     let kvMode: KVQuantizationMode
 
-    private var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
+    private var compiledForward: (([MLXArray]) -> [MLXArray])?
     private var compiledExternalInputModel: (any CompiledDecodeExternalInputModel)?
 
     /// Host-side offset bookkeeping for recurrent caches under compiled
@@ -2087,6 +2105,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         self.processor = effectiveParameters.processor()
+        if let additionalProcessor {
+            self.processor = CompositeLogitProcessor(
+                base: self.processor, additional: additionalProcessor)
+        }
+        // The schema mask stays authoritative after optional processors.
         if let schema = effectiveParameters.jsonSchema {
             guard let tokenizer else {
                 throw GenerationFailure(
@@ -2095,10 +2118,6 @@ public struct TokenIterator: TokenIteratorProtocol {
             self.processor = try JSONSchemaLogitProcessor(
                 schema: schema, tokenizer: tokenizer, stopTokenIDs: stopTokenIDs,
                 base: self.processor)
-        }
-        if let additionalProcessor {
-            self.processor = CompositeLogitProcessor(
-                base: self.processor, additional: additionalProcessor)
         }
         self.sampler = effectiveParameters.sampler()
         MetalLiveBufferGuard.reportProjectedBufferPressure(
@@ -3654,7 +3673,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         if var processor {
             logits = processor.process(logits: logits)
-            if let failure = (processor as? any ConstraintFailureReporting)?.constraintFailure {
+            if let failure = logitConstraintFailure(processor) {
                 self.generationFailure = GenerationFailure(
                     stage: .decoding, cause: failure.localizedDescription)
                 self.processor = processor
@@ -3664,7 +3683,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             let y = sampler.sample(logits: logits)
             processor.didSample(token: y)
             self.processor = processor
-            if let failure = (processor as? any ConstraintFailureReporting)?.constraintFailure {
+            if let failure = logitConstraintFailure(processor) {
                 self.generationFailure = GenerationFailure(
                     stage: .decoding, cause: failure.localizedDescription)
             }

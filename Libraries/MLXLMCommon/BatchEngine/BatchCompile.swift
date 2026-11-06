@@ -268,11 +268,12 @@ public enum BatchCompile {
     ///   - model: The language model to trace through.
     ///   - cacheRef: Array of `CompilableKVCache` instances, one per layer.
     ///     Captured by the returned closure; must not be empty.
-    /// - Returns: A `@Sendable` closure mapping `[tokens]` → `[logits]`.
+    /// - Returns: A closure mapping `[tokens]` → `[logits]`, owned by the slot
+    ///   that owns the captured mutable cache. Invoke it on that slot’s execution lane.
     public static func compileForward(
         model: any LanguageModel,
         cacheRef: [KVCache]
-    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+    ) -> ([MLXArray]) -> [MLXArray] {
         precondition(!cacheRef.isEmpty,
             "BatchCompile.compileForward requires at least one cache layer")
         // Accepts arrays where ALL layers belong to one of the shipped
@@ -348,7 +349,7 @@ public enum BatchCompile {
 
         /// Compiled forward closure shared across all slots in the
         /// bucket. `nil` until first prefill assembles the trace.
-        public var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
+        public var compiledForward: (([MLXArray]) -> [MLXArray])?
 
         public init(key: BucketKey) {
             self.key = key

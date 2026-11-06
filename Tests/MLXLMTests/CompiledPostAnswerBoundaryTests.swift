@@ -50,7 +50,7 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
                 let control = CompilableRotatingKVCache(from: controlRaw)
                 eval(control)
                 let controlCounter = TraceCounter()
-                let controlForward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+                let controlForward: ([MLXArray]) -> [MLXArray] = compile(
                     inputs: [control], outputs: [control]
                 ) { args in
                     controlCounter.increment()
@@ -89,7 +89,7 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
                         : [CompilableCacheList(compilableSubCaches: [simple, rotating])]
                     eval(caches)
                     let traceCounter = TraceCounter()
-                    let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+                    let forward: ([MLXArray]) -> [MLXArray] = compile(
                         inputs: caches, outputs: caches
                     ) { args in
                         traceCounter.increment()

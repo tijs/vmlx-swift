@@ -586,6 +586,7 @@ template <
     typename T,
     int group_size,
     int bits,
+    bool partial_rows = false,
     bool has_global_scale = false,
     int results_per_simdgroup = 4>
 METAL_FUNC void fp_qmv_fast_impl(
@@ -619,6 +620,15 @@ METAL_FUNC void fp_qmv_fast_impl(
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
+  // Reuse the last valid row for reads beyond the output tile.
+  int last_row = results_per_simdgroup - 1;
+  if constexpr (partial_rows) {
+    if (out_row >= out_vec_size) {
+      return;
+    }
+    last_row = min(last_row, out_vec_size - 1 - out_row);
+  }
+
   ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
@@ -628,8 +638,12 @@ METAL_FUNC void fp_qmv_fast_impl(
     load_vector<T, U, values_per_thread>(x, x_thread);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      const device auto* sl = scales + row * in_vec_size_g;
+      int src = row;
+      if constexpr (partial_rows) {
+        src = min(row, last_row);
+      }
+      auto wl = (const device uint8_t*)(ws + src * in_vec_size_w);
+      const device auto* sl = scales + src * in_vec_size_g;
 
       U s = dequantize_scale<U, group_size>(sl[0]);
       result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s);
@@ -647,7 +661,7 @@ METAL_FUNC void fp_qmv_fast_impl(
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
-    if (simd_lid == 0) {
+    if (simd_lid == 0 && row <= last_row) {
       if constexpr (has_global_scale) {
         y[row] = static_cast<T>(result[row] * inv_scale_enc);
       } else {
@@ -1048,6 +1062,7 @@ template <
     const int group_size,
     const int bits,
     const bool aligned_N,
+    typename U = T,
     const bool has_global_scale = false,
     const int BM = 32,
     const int BK = 32,
@@ -1058,7 +1073,7 @@ METAL_FUNC void fp_qmm_t_impl(
     const device uint8_t* scales,
     const device float* global_scale,
     const device T* x,
-    device T* y,
+    device U* y,
     threadgroup T* Xs,
     threadgroup TW* Ws,
     const constant int& K,
@@ -1083,7 +1098,7 @@ METAL_FUNC void fp_qmm_t_impl(
 
   // Instantiate the appropriate BlockMMA and Loader
   using mma_t = mlx::steel::
-      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+      BlockMMA<T, U, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   // Use shortcut when loading fp4 quants to half weights
@@ -1500,6 +1515,7 @@ template <
     int group_size,
     int bits,
     bool batched,
+    bool partial_rows = false,
     bool has_global_scale = false,
     int results_per_simdgroup = 4>
 [[kernel]] void fp_qmv_fast(
@@ -1541,6 +1557,7 @@ template <
       T,
       group_size,
       bits,
+      partial_rows,
       has_global_scale,
       results_per_simdgroup>(
       w,
@@ -1560,6 +1577,7 @@ template <
     int group_size,
     int bits,
     bool batched,
+    bool partial_rows = false,
     bool has_global_scale = false,
     int results_per_simdgroup = 4>
 [[kernel]] void fp_qmv(
@@ -1963,14 +1981,14 @@ template <typename T, const int group_size, int bits, int split_k = 32>
 
 template <
     typename T,
-    const int group_size,
-    const int bits,
-    const bool aligned_N,
-    const bool batched,
-    const bool has_global_scale = false,
-    const int BM = 32,
-    const int BK = 32,
-    const int BN = 32>
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    bool has_global_scale = false,
+    int BM = 32,
+    int BK = 32,
+    int BN = 32>
 [[kernel]] void fp_qmm_t(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -2018,7 +2036,16 @@ template <
         s_strides,
         tid);
   }
-  fp_qmm_t_impl<T, group_size, bits, aligned_N, has_global_scale, BM, BK, BN>(
+  fp_qmm_t_impl<
+      T,
+      group_size,
+      bits,
+      aligned_N,
+      T,
+      has_global_scale,
+      BM,
+      BK,
+      BN>(
       w,
       scales,
       global_scale,
@@ -2140,7 +2167,7 @@ template <typename T, int group_size, int bits, bool has_global_scale = false>
       w_strides,
       s_strides,
       tid);
-  fp_qmv_fast_impl<T, group_size, bits, has_global_scale>(
+  fp_qmv_fast_impl<T, group_size, bits, false, has_global_scale>(
       w,
       scales,
       global_scale,
@@ -2337,7 +2364,16 @@ template <
       w_strides,
       s_strides,
       tid);
-  fp_qmm_t_impl<T, group_size, bits, aligned_N, has_global_scale, BM, BK, BN>(
+  fp_qmm_t_impl<
+      T,
+      group_size,
+      bits,
+      aligned_N,
+      T,
+      has_global_scale,
+      BM,
+      BK,
+      BN>(
       w,
       scales,
       global_scale,
@@ -2367,7 +2403,7 @@ template <
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
     const device T* x [[buffer(2)]],
-    device T* y [[buffer(3)]],
+    device float* y [[buffer(3)]],
     const constant int& K [[buffer(4)]],
     const constant int& N [[buffer(5)]],
     const constant int& M [[buffer(6)]],
@@ -2398,7 +2434,7 @@ template <
   scales += k_start / group_size;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  fp_qmm_t_impl<T, group_size, bits, aligned_N, false, BM, BK, BN>(
+  fp_qmm_t_impl<T, group_size, bits, aligned_N, float, false, BM, BK, BN>(
       (const device uint32_t*)wl,
       scales,
       nullptr,

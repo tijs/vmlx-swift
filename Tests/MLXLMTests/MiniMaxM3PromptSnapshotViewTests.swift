@@ -118,24 +118,24 @@ struct MiniMaxM3PromptSnapshotViewTests {
                     MLX.eval(iterator.cache.flatMap(\.state))
                     if viewsOn {
                         #expect(iterator.promptCacheSnapshot == nil && iterator.deferredPromptSnapshotRows == prompt.count)
+                        #expect(coordinator.promptSnapshotBytes == 0)
                     } else {
                         #expect(iterator.promptCacheSnapshot != nil && iterator.deferredPromptSnapshotRows == nil)
+                        #expect(coordinator.promptSnapshotBytes > 0)
                     }
                     var out: [Int] = []
                     while let token = iterator.next() { out.append(token) }
                     iterator.storeCacheAfterGeneration(generatedTokenIds: out, includeGeneratedBoundary: false)
                     #expect(iterator.deferredPromptSnapshotRows == nil)
-                    if viewsOn {
-                        // The stores took views of the finished cache: the snapshot shares the live cache's buffers.
-                        let snapshot = try #require(iterator.promptCacheSnapshot)
-                        #expect(cacheIsPrefixViews(snapshot) && snapshot.allSatisfy { $0.offset == prompt.count })
-                        MLX.eval(snapshot.flatMap(\.state))
-                        for (view, live) in zip(snapshot, iterator.cache) {
-                            let liveKeys = (live as? MiniMaxM3SparseCache)?.kv.keys ?? (live as? KVCacheSimple)?.keys
-                            #expect(liveKeys.map { Self.address(view.state[0]) == Self.address($0) } == true)
-                        }
-                        #expect(iterator.cache.contains { $0 is MiniMaxM3SparseCache })
-                    }
+                    // Finalization releases the optional snapshot and its shared-budget
+                    // reservation. Keeping it on the iterator just to inspect it here
+                    // would retain a consumed checkpoint. Buffer-sharing is covered by
+                    // prefixViewSharesTheSourceBuffers; the next test verifies actual
+                    // stored/reused tokens and logits against both cold and copied paths.
+                    #expect(iterator.promptCacheSnapshot == nil)
+                    #expect(coordinator.promptSnapshotBytes == 0)
+                    #expect(Self.diskEntries(coordinator) > 0)
+                    #expect(iterator.cache.contains { $0 is MiniMaxM3SparseCache })
                 }
             }
         }

@@ -478,7 +478,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
                 of: "guard !isReusablePrefixWarmup,",
                 range: stableLoop.lowerBound ..< source.endIndex))
         let storageBody = source[topology.lowerBound ..< generatedBoundary.lowerBound]
-        #expect(storageBody.contains("if let storageTopologySnapshot,"))
+        #expect(storageBody.contains(
+            "else if !exactPromptSnapshotWasDeclined, let storageTopologySnapshot"))
         #expect(storageBody.contains("storageSnapshot: storageTopologySnapshot"))
         #expect(topology.lowerBound < stableLoop.lowerBound)
     }
@@ -618,8 +619,13 @@ struct BatchEngineGrowingChatCacheSourceTests {
         // predicate in addition to the coordinator hybrid flag, so rotating
         // chat prompts get the same generation-suffix-stripped cross-turn
         // boundary instead of only the never-matching full-prompt key.
-        #expect(evaluate.contains(
-            "coordinator.isHybrid || cacheHasStandaloneRotatingWindowState(cache))"))
+        let topologyStart = try #require(evaluate.range(of: "(coordinator.isHybrid\n"))
+        let topologyEnd = try #require(evaluate.range(
+            of: "coordinator.canPersistBoundaries,",
+            range: topologyStart.lowerBound..<evaluate.endIndex))
+        let predicate = evaluate[topologyStart.lowerBound..<topologyEnd.lowerBound]
+        #expect(predicate.contains("coordinator.requiresPagedBoundaryCompanion"))
+        #expect(predicate.contains("cacheHasStandaloneRotatingWindowState(cache)"))
         // Every call site hands the helper the live cache topology so the
         // standalone-rotating admission cannot silently miss an engine.
         #expect(evaluate.contains(
@@ -778,16 +784,27 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(storeSource.contains("MLXCacheIOLock.withSerializedMLXCacheIO"))
         #expect(storeSource.contains("MLX.eval(materialized)"))
         #expect(storeSource.contains("synchronizeComputeStream()"))
-        #expect(storeSource.contains("let disk: SSMCompanionDiskStore?"))
+        #expect(storeSource.contains("let disk = diskStore"))
         #expect(promptTailSource.contains("input.text.tokenIds"))
         #expect(!promptTailSource.contains("tailArray.asArray"))
 
+        let reservationLock = try #require(storeSource.range(of: "lock.lock()"))
+        let reservationUnlock = try #require(storeSource.range(of: "lock.unlock()"))
         let materialize = try #require(storeSource.range(of: "MLX.eval(materialized)"))
-        let lruLock = try #require(storeSource.range(of: "lock.lock()"))
-        let diskWrite = try #require(storeSource.range(of: "try? disk.store("))
+        let commitLock = try #require(storeSource.range(
+            of: "lock.lock()", range: materialize.upperBound..<storeSource.endIndex))
+        let commitUnlock = try #require(storeSource.range(
+            of: "lock.unlock()", range: commitLock.upperBound..<storeSource.endIndex))
+        let diskWrite = try #require(storeSource.range(
+            of: "try? disk.store(", range: commitUnlock.upperBound..<storeSource.endIndex))
 
-        #expect(materialize.lowerBound < lruLock.lowerBound)
-        #expect(lruLock.lowerBound < diskWrite.lowerBound)
+        // Admission reserves before copying; evaluation and disk writes still
+        // run outside the LRU lock. A disk-only decline writes before copying.
+        #expect(reservationLock.lowerBound < reservationUnlock.lowerBound)
+        #expect(reservationUnlock.lowerBound < materialize.lowerBound)
+        #expect(materialize.lowerBound < commitLock.lowerBound)
+        #expect(commitLock.lowerBound < commitUnlock.lowerBound)
+        #expect(commitUnlock.lowerBound < diskWrite.lowerBound)
     }
 
     @Test("token iterator trims full cache hits before one-token seed prefill")

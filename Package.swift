@@ -1,4 +1,4 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.3
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 // Copyright © 2024 Apple Inc.
 
@@ -80,6 +80,7 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
 
     let mlxSwiftExcludes: [String] = [
         "GPU+Metal.swift",
+        "GPU+CUDA.swift",
         "MLXArray+Metal.swift",
     ]
 #else
@@ -114,7 +115,7 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         .linkedFramework("Accelerate"),
     ]
 
-    let mlxSwiftExcludes: [String] = []
+    let mlxSwiftExcludes: [String] = ["GPU+CUDA.swift"]
 #endif
 
 let transformersSwiftSettings: [SwiftSetting] = [
@@ -192,8 +193,6 @@ let cmlx = Target.target(
         // example code + mlx-c distributed
         "mlx-c/examples",
         "mlx-c/tests",
-        "mlx-c/mlx/c/distributed.cpp",
-        "mlx-c/mlx/c/distributed_group.cpp",
 
         // vendored library, include header only
         "json",
@@ -293,7 +292,7 @@ let cmlx = Target.target(
         .headerSearchPath("json/single_include/nlohmann"),
         .headerSearchPath("mlx/mlx/distributed/jaccl/lib"),
         .headerSearchPath("fmt/include"),
-        .define("MLX_VERSION", to: "\"0.32.3\""),
+        .define("MLX_VERSION", to: "\"0.32.4\""),
     ],
     linkerSettings: linkerSettings
 )
@@ -358,13 +357,13 @@ let package = Package(
     dependencies: [
         // for Complex type
         .package(url: "https://github.com/apple/swift-numerics", from: "1.0.0"),
-        .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
+        .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "604.0.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.0"),
         .package(url: "https://github.com/apple/swift-nio-http2.git", from: "1.34.0"),
         .package(url: "https://github.com/apple/swift-certificates.git", from: "1.5.0"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.5.0"),
-        .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0"..<"5.0.0"),
+        .package(url: "https://github.com/apple/swift-crypto.git", "5.1.1"..<"6.0.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.33.0"),
         .package(url: "https://github.com/ibireme/yyjson.git", from: "0.12.0"),
     ],
@@ -583,7 +582,7 @@ let package = Package(
         ),
         .target(
             name: "CmlxDistributedShim",
-            dependencies: [],
+            dependencies: ["Cmlx"],
             path: "Libraries/CmlxDistributedShim",
             publicHeadersPath: "include",
             cSettings: [

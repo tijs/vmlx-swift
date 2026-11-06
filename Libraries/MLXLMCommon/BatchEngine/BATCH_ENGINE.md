@@ -1839,7 +1839,7 @@ that wraps `MLX.compile(inputs:outputs:)` for a decode-step forward pass.
 ```swift
 let cacheRef: [KVCache] = (0 ..< L).map { _ in CompilableKVCache(maxLength: 4096) }
 let forward = BatchCompile.compileForward(model: model, cacheRef: cacheRef)
-// forward: @Sendable ([MLXArray]) -> [MLXArray]
+// forward: ([MLXArray]) -> [MLXArray], owned by this cache slot
 // Later, at decode time:
 let logits = forward([nextToken])[0]  // [B, L, V]
 ```

@@ -52,16 +52,22 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   if (bits == 1) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      for (int j = 0; j < 8; j++) {
-        sum += x[i + j];
-        x_thread[i + j] = x[i + j] / static_cast<U>(1 << j);
-      }
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+          x[i + 6] + x[i + 7];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 2.0f;
+      x_thread[i + 2] = x[i + 2] / 4.0f;
+      x_thread[i + 3] = x[i + 3] / 8.0f;
+      x_thread[i + 4] = x[i + 4] / 16.0f;
+      x_thread[i + 5] = x[i + 5] / 32.0f;
+      x_thread[i + 6] = x[i + 6] / 64.0f;
+      x_thread[i + 7] = x[i + 7] / 128.0f;
     }
   }
 
   else if (bits == 2) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 4.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -71,8 +77,8 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 3) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]) + U(x[i + 4]) +
+          U(x[i + 5]) + U(x[i + 6]) + U(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 8.0f;
       x_thread[i + 2] = x[i + 2] / 64.0f;
@@ -86,7 +92,7 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 16.0f;
       x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -96,8 +102,8 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 5) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]) + U(x[i + 4]) +
+          U(x[i + 5]) + U(x[i + 6]) + U(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 32.0f;
       x_thread[i + 2] = x[i + 2] / 4.0f;
@@ -111,7 +117,7 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 6) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 64.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -140,16 +146,22 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   if (bits == 1) {
     for (int i = 0; i < N; i += 8) {
-      for (int j = 0; j < min(8, N - i); j++) {
-        sum += x[i + j];
-        x_thread[i + j] = x[i + j] / static_cast<U>(1 << j);
-      }
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+          x[i + 6] + x[i + 7];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 2.0f;
+      x_thread[i + 2] = x[i + 2] / 4.0f;
+      x_thread[i + 3] = x[i + 3] / 8.0f;
+      x_thread[i + 4] = x[i + 4] / 16.0f;
+      x_thread[i + 5] = x[i + 5] / 32.0f;
+      x_thread[i + 6] = x[i + 6] / 64.0f;
+      x_thread[i + 7] = x[i + 7] / 128.0f;
     }
   }
 
   else if (bits == 2) {
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 4.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -159,8 +171,8 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   else if (bits == 3) {
     for (int i = 0; i < N; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]) + U(x[i + 4]) +
+          U(x[i + 5]) + U(x[i + 6]) + U(x[i + 7]);
 
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 8.0f;
@@ -175,7 +187,7 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   else if (bits == 4) {
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 16.0f;
       x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -185,8 +197,8 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   else if (bits == 5) {
     for (int i = 0; i < N; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]) + U(x[i + 4]) +
+          U(x[i + 5]) + U(x[i + 6]) + U(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 32.0f;
       x_thread[i + 2] = x[i + 2] / 4.0f;
@@ -200,7 +212,7 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   else if (bits == 6) {
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 64.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -238,9 +250,15 @@ inline U qdot(
 
   if (bits == 1) {
     for (int i = 0; i < (values_per_thread / 8); i++) {
-      for (int j = 0; j < 8; j++) {
-        accum += x_thread[8 * i + j] * (w[i] & (1 << j));
-      }
+      accum +=
+          (x_thread[8 * i] * (w[i] & 0x01) +
+           x_thread[8 * i + 1] * (w[i] & 0x02) +
+           x_thread[8 * i + 2] * (w[i] & 0x04) +
+           x_thread[8 * i + 3] * (w[i] & 0x08) +
+           x_thread[8 * i + 4] * (w[i] & 0x10) +
+           x_thread[8 * i + 5] * (w[i] & 0x20) +
+           x_thread[8 * i + 6] * (w[i] & 0x40) +
+           x_thread[8 * i + 7] * (w[i] & 0x80));
     }
   }
 
@@ -347,10 +365,16 @@ inline U qdot_safe(
   U accum = 0;
 
   if (bits == 1) {
-    for (int i = 0; i < N; i += 8) {
-      for (int j = 0; j < min(8, N - i); j++) {
-        accum += x_thread[i + j] * (w[i / 8] & (1 << j));
-      }
+    for (int i = 0; i < (N / 8); i++) {
+      accum +=
+          (x_thread[8 * i] * (w[i] & 0x01) +
+           x_thread[8 * i + 1] * (w[i] & 0x02) +
+           x_thread[8 * i + 2] * (w[i] & 0x04) +
+           x_thread[8 * i + 3] * (w[i] & 0x08) +
+           x_thread[8 * i + 4] * (w[i] & 0x10) +
+           x_thread[8 * i + 5] * (w[i] & 0x20) +
+           x_thread[8 * i + 6] * (w[i] & 0x40) +
+           x_thread[8 * i + 7] * (w[i] & 0x80));
     }
   }
 
@@ -450,10 +474,24 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
       "Template undefined for bits not in {1, 2, 3, 4, 5, 6, 8}");
 
   if (bits == 1) {
+    U s[8] = {
+        scale,
+        scale / 2.0f,
+        scale / 4.0f,
+        scale / 8.0f,
+        scale / 16.0f,
+        scale / 32.0f,
+        scale / 64.0f,
+        scale / 128.0f};
     for (int i = 0; i < (values_per_thread / 8); i++) {
-      for (int j = 0; j < 8; j++) {
-        result[8 * i + j] += x * (((w[i] >> j) & 1) * scale + bias);
-      }
+      result[8 * i] += x * (s[0] * (w[i] & 0x01) + bias);
+      result[8 * i + 1] += x * (s[1] * (w[i] & 0x02) + bias);
+      result[8 * i + 2] += x * (s[2] * (w[i] & 0x04) + bias);
+      result[8 * i + 3] += x * (s[3] * (w[i] & 0x08) + bias);
+      result[8 * i + 4] += x * (s[4] * (w[i] & 0x10) + bias);
+      result[8 * i + 5] += x * (s[5] * (w[i] & 0x20) + bias);
+      result[8 * i + 6] += x * (s[6] * (w[i] & 0x40) + bias);
+      result[8 * i + 7] += x * (s[7] * (w[i] & 0x80) + bias);
     }
   }
 
@@ -554,12 +592,28 @@ inline void dequantize(BytePtr w, U scale, U bias, OutPtr w_local) {
   const float b = float(bias);
 
   if (bits == 1) {
+    float sc[8] = {
+        s,
+        s / 2.0f,
+        s / 4.0f,
+        s / 8.0f,
+        s / 16.0f,
+        s / 32.0f,
+        s / 64.0f,
+        s / 128.0f};
     for (int i = 0; i < (N / 8); i++) {
-      for (int j = 0; j < 8; j++) {
-        w_local[8 * i + j] = static_cast<U>(((w[i] >> j) & 1) * s + b);
-      }
+      w_local[8 * i] = static_cast<U>(sc[0] * (w[i] & 0x01) + b);
+      w_local[8 * i + 1] = static_cast<U>(sc[1] * (w[i] & 0x02) + b);
+      w_local[8 * i + 2] = static_cast<U>(sc[2] * (w[i] & 0x04) + b);
+      w_local[8 * i + 3] = static_cast<U>(sc[3] * (w[i] & 0x08) + b);
+      w_local[8 * i + 4] = static_cast<U>(sc[4] * (w[i] & 0x10) + b);
+      w_local[8 * i + 5] = static_cast<U>(sc[5] * (w[i] & 0x20) + b);
+      w_local[8 * i + 6] = static_cast<U>(sc[6] * (w[i] & 0x40) + b);
+      w_local[8 * i + 7] = static_cast<U>(sc[7] * (w[i] & 0x80) + b);
     }
-  } else if (bits == 2) {
+  }
+
+  else if (bits == 2) {
     float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
     for (int i = 0; i < (N / 4); i++) {
       w_local[4 * i] = static_cast<U>(sc[0] * (w[i] & 0x03) + b);

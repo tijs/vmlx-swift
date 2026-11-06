@@ -9,10 +9,182 @@ import MLXNN
 /// ### See Also
 /// - <doc:MLXOptimizers>
 /// - ``OptimizerBase``
+// Note on scalar precision: these optimizers store their hyperparameters as `Float`
+// while python stores them as double, so coefficients derived from them differ in
+// the last bits -- `1 - Float(0.95)` is 0.050000012, while python's `1 - 0.95`
+// rounds to 0.05.  Widening at the point of use (`1 - Double(momentum)`) cannot
+// recover python's value: the constant was already rounded when it was stored.
+//
+// The 2.4e-7 difference is invisible in the smooth optimizers, but Muon's
+// Newton-Schulz iteration grows it to ~2e-4 relative over a few steps, which is why
+// the generated `Muon` cases compare with a looser tolerance than the rest.  See
+// `todos/muon-04-pending-p3-float-hyperparameters.md`.
+
 public protocol Optimizer: Updatable, Evaluatable {
 
     /// Apply the gradients to the parameters of the model and update the model with the new parameters.
     func update(model: Module, gradients: ModuleParameters)
+
+    /// Buffers accumulated while training, as a `ModuleParameters` tree.
+    ///
+    /// The tree follows the model parameters. Optimizers that keep one buffer per
+    /// parameter (``SGD``, ``RMSprop``, ``AdaGrad``, ``Lion``, ``Muon``) store that
+    /// array at the parameter. Optimizers that keep several store a dictionary of
+    /// named buffers there:
+    ///
+    /// - ``Adam`` and ``AdamW``: `m`, `v`, and `step`
+    /// - ``Adamax``: `m` and `v`
+    /// - ``AdaDelta``: `v` and `u`
+    /// - ``Adafactor``: `step`, plus the running averages that parameter uses
+    ///   (`expAvgSq`, or `expAvgSqRow` and `expAvgSqCol`, and `expAvg` when
+    ///   `beta1` is set)
+    ///
+    /// ``MultiOptimizer`` nests each sub-optimizer under `states`, indexed
+    /// `"0"`, `"1"`, ... in optimizer order.
+    /// `step` is counted per parameter. Hyperparameters such as the learning rate are
+    /// not part of this tree — build the resumed optimizer with the same values.
+    ///
+    /// The result is empty until the first ``update(model:gradients:)`` or
+    /// ``update(parameters:)``. `flattened()` is the dictionary
+    /// `save(arrays:metadata:url:)` writes.
+    ///
+    /// ```swift
+    /// eval(optimizer)
+    /// let checkpoint = optimizer.state()
+    ///
+    /// let resumed = Adam(learningRate: 1e-3)
+    /// resumed.update(parameters: checkpoint)
+    /// ```
+    func state() -> ModuleParameters
+
+    /// Replace buffers with a tree produced by ``state()``.
+    ///
+    /// Parameters present in the tree replace the stored buffers. Parameters left
+    /// out are unchanged, as with `Module.update(parameters:)`.
+    ///
+    /// - Parameters:
+    ///   - parameters: buffers from ``state()``, or the same tree read back from
+    ///     `loadArrays(url:)`
+    func update(parameters: ModuleParameters)
+}
+
+extension Optimizer {
+    // External `Optimizer` conformers predate this API. The built-in optimizers
+    // replace both methods; a custom one keeps compiling and returns no buffers
+    // until it implements them.
+    public func state() -> ModuleParameters {
+        ModuleParameters()
+    }
+
+    public func update(parameters: ModuleParameters) {
+    }
+}
+
+private func requiredState(
+    _ arrays: [(String, MLXArray)], keys: [String], owner: Any
+) -> [String: MLXArray] {
+    let byKey = Dictionary(arrays, uniquingKeysWith: { _, latest in latest })
+    let missing = keys.filter { byKey[$0] == nil }
+    precondition(
+        missing.isEmpty,
+        "\(type(of: owner)) state is missing \(missing.joined(separator: ", "))")
+    return byKey
+}
+
+/// An optimizer that delegates to several sub-optimizers, routing each parameter to the first
+/// optimizer whose filter matches.
+///
+/// This makes it easy to use different optimizers (or different hyperparameters) for different
+/// weights. The `filters` are predicates over a parameter's flattened key path and its gradient
+/// and must be one fewer than `optimizers` -- the last optimizer is the fallback and receives
+/// every parameter not matched by an earlier filter.
+///
+/// ```swift
+/// // Adam for everything except biases, which use SGD.
+/// let optimizer = MultiOptimizer(
+///     optimizers: [SGD(learningRate: 0.1), Adam(learningRate: 1e-3)],
+///     filters: [{ key, _ in key.hasSuffix(".bias") }])
+/// ```
+///
+/// This is a port of Python `mlx.optimizers.MultiOptimizer`.
+///
+/// ### See Also
+/// - <doc:MLXOptimizers>
+open class MultiOptimizer: Optimizer {
+
+    /// The sub-optimizers; the last one is the fallback for unmatched parameters.
+    public let optimizers: [Optimizer]
+
+    /// Predicates over `(key, gradient)`, one per optimizer. The provided filters select the first
+    /// `optimizers.count - 1`; the last is an implicit always-true fallback.
+    private let filters: [(String, MLXArray) -> Bool]
+
+    /// - Parameters:
+    ///   - optimizers: the optimizers to delegate to (at least one)
+    ///   - filters: predicates selecting which parameters route to each optimizer; there must be
+    ///     `optimizers.count - 1` of them (the last optimizer is the unconditioned fallback)
+    public init(optimizers: [Optimizer], filters: [(String, MLXArray) -> Bool] = []) {
+        precondition(!optimizers.isEmpty, "MultiOptimizer requires at least one optimizer")
+        precondition(
+            filters.count == optimizers.count - 1,
+            "MultiOptimizer given \(filters.count) filters but \(optimizers.count - 1) needed")
+        self.optimizers = optimizers
+        self.filters = filters + [{ _, _ in true }]
+    }
+
+    /// Partition the flattened gradients into one group per optimizer, by first matching filter.
+    private func split(_ gradients: ModuleParameters) -> [[(String, MLXArray)]] {
+        var parts = Array(repeating: [(String, MLXArray)](), count: optimizers.count)
+        for (key, gradient) in gradients.flattened() {
+            for (i, filter) in filters.enumerated() where filter(key, gradient) {
+                parts[i].append((key, gradient))
+                break
+            }
+        }
+        return parts
+    }
+
+    public func update(model: Module, gradients: ModuleParameters) {
+        for (optimizer, part) in zip(optimizers, split(gradients)) where !part.isEmpty {
+            optimizer.update(model: model, gradients: ModuleParameters.unflattened(part))
+        }
+    }
+
+    public func innerState() -> [MLXArray] {
+        optimizers.flatMap { $0.innerState() }
+    }
+
+    /// Buffers for every sub-optimizer, under `states.0`, `states.1`, ...
+    public func state() -> ModuleParameters {
+        var flat: [(String, MLXArray)] = []
+        // `states` matches Python. A bare leading index unflattens as an array,
+        // which ModuleParameters cannot hold at the root.
+        for (index, optimizer) in optimizers.enumerated() {
+            for (key, value) in optimizer.state().flattened() {
+                flat.append(("states.\(index).\(key)", value))
+            }
+        }
+        return ModuleParameters.unflattened(flat)
+    }
+
+    public func update(parameters: ModuleParameters) {
+        var grouped: [Int: [(String, MLXArray)]] = [:]
+        for (key, value) in parameters.flattened() {
+            // "states.<index>.<parameter path>", leaving any further dots intact.
+            let parts = key.split(separator: ".", maxSplits: 2).map(String.init)
+            guard parts.count == 3, parts[0] == "states",
+                let index = Int(parts[1]),
+                optimizers.indices.contains(index)
+            else {
+                preconditionFailure(
+                    "MultiOptimizer state key \"\(key)\" is missing a sub-optimizer index")
+            }
+            grouped[index, default: []].append((parts[2], value))
+        }
+        for (index, pairs) in grouped {
+            optimizers[index].update(parameters: ModuleParameters.unflattened(pairs))
+        }
+    }
 }
 
 /// The base class for all optimizers. It allows us to implement an optimizer on a per-parameter basis
@@ -47,6 +219,128 @@ open class OptimizerBase<State: Updatable>: Optimizer {
         stateStorage
             .flattenedValues()
             .flatMap { $0.innerState() }
+    }
+
+    /// Names written by ``exportState(_:)`` for one parameter.
+    ///
+    /// `""` stores the only buffer directly on the parameter. Any other name stores
+    /// a dictionary of buffers under the parameter (`m`, `v`, `step`, ...).
+    /// ``stateSuffixes()`` must list every name ``exportState(_:)`` can produce.
+    open func stateSuffixes() -> [String] { [""] }
+
+    /// Encode one parameter's buffers.
+    ///
+    /// Return `[("", array)]` for a single buffer. Return `[(name, array)]` for
+    /// several, using the names from ``/MLXOptimizers/OptimizerBase/stateSuffixes()``.
+    open func exportState(_ state: State) -> [(String, MLXArray)] {
+        fatalError("exportState() not implemented \(type(of: self))")
+    }
+
+    /// Rebuild one parameter's buffers from the pairs ``exportState(_:)`` produced.
+    open func importState(_ arrays: [(String, MLXArray)]) -> State {
+        fatalError("importState() not implemented \(type(of: self))")
+    }
+
+    open func state() -> ModuleParameters {
+        ModuleParameters(item: exportTree(stateStorage.asItem()))
+    }
+
+    open func update(parameters: ModuleParameters) {
+        let merged = mergeTree(stateStorage.asItem(), parameters.asItem())
+        guard case .dictionary(let values) = merged else {
+            preconditionFailure("optimizer state must be a dictionary")
+        }
+        stateStorage = NestedDictionary(values: values)
+    }
+
+    /// A dictionary of arrays whose keys are all buffer names is one parameter.
+    /// A dictionary of further dictionaries is the module tree, so a parameter
+    /// that is itself named `m` or `v` is not mistaken for a buffer.
+    private func isStateDictionary(_ updates: [String: NestedItem<String, MLXArray>]) -> Bool {
+        let names = Set(stateSuffixes().filter { !$0.isEmpty })
+        guard !names.isEmpty, !updates.isEmpty else { return false }
+        guard updates.keys.allSatisfy({ names.contains($0) }) else { return false }
+        for value in updates.values {
+            guard case .value = value else { return false }
+        }
+        return true
+    }
+
+    private func exportTree(_ item: NestedItem<String, State>) -> NestedItem<String, MLXArray> {
+        switch item {
+        case .none:
+            return .none
+        case .value(let state):
+            return exportValue(state)
+        case .array(let items):
+            return .array(items.map { exportTree($0) })
+        case .dictionary(let dictionary):
+            return .dictionary(dictionary.mapValues { exportTree($0) })
+        }
+    }
+
+    private func exportValue(_ state: State) -> NestedItem<String, MLXArray> {
+        let pairs = exportState(state)
+        precondition(!pairs.isEmpty, "\(type(of: self)) exportState() returned no buffers")
+        if pairs.count == 1, pairs[0].0.isEmpty {
+            return .value(pairs[0].1)
+        }
+
+        var exported: [String: NestedItem<String, MLXArray>] = [:]
+        for (name, array) in pairs {
+            precondition(
+                !name.isEmpty, "\(type(of: self)) mixed an unnamed buffer with named buffers")
+            exported[name] = .value(array)
+        }
+        return .dictionary(exported)
+    }
+
+    private func mergeTree(
+        _ existing: NestedItem<String, State>, _ update: NestedItem<String, MLXArray>
+    ) -> NestedItem<String, State> {
+        switch update {
+        case .none:
+            return existing
+        case .value(let array):
+            return .value(importState([("", array)]))
+        case .array(let updates):
+            var merged: [NestedItem<String, State>]
+            if case .array(let items) = existing {
+                merged = items
+            } else {
+                merged = []
+            }
+            if merged.count < updates.count {
+                merged.append(
+                    contentsOf: Array(repeating: .none, count: updates.count - merged.count))
+            }
+            for (index, item) in updates.enumerated() {
+                merged[index] = mergeTree(merged[index], item)
+            }
+            return .array(merged)
+        case .dictionary(let updates):
+            if isStateDictionary(updates) {
+                return .value(
+                    importState(
+                        updates.map { name, value in
+                            guard case .value(let array) = value else {
+                                preconditionFailure(
+                                    "optimizer state buffer \(name) is not an array")
+                            }
+                            return (name, array)
+                        }))
+            }
+            var merged: [String: NestedItem<String, State>]
+            if case .dictionary(let items) = existing {
+                merged = items
+            } else {
+                merged = [:]
+            }
+            for (key, item) in updates {
+                merged[key] = mergeTree(merged[key] ?? .none, item)
+            }
+            return .dictionary(merged)
+        }
     }
 
     final public func update(model: Module, gradients: ModuleParameters) {
@@ -84,6 +378,17 @@ open class OptimizerBaseArrayState: OptimizerBase<MLXArray> {
     override open func newState(parameter: MLXArray) -> MLXArray {
         MLXArray.zeros(like: parameter)
     }
+
+    override open func exportState(_ state: MLXArray) -> [(String, MLXArray)] {
+        [("", state)]
+    }
+
+    override open func importState(_ arrays: [(String, MLXArray)]) -> MLXArray {
+        guard let array = arrays.first(where: { $0.0.isEmpty })?.1 else {
+            preconditionFailure("\(type(of: self)) state is missing the parameter buffer")
+        }
+        return array
+    }
 }
 
 /// State container for ``OptimizerBase`` holding a tuple of `MLXArray`.
@@ -104,6 +409,32 @@ public struct TupleState: Updatable {
 
     public func innerState() -> [MLXArray] {
         [values.0, values.1]
+    }
+}
+
+/// State container for Adam-style optimizers that need first and second moments
+/// plus an update step for optional bias correction.
+public struct AdamState: Updatable {
+    let values: (MLXArray, MLXArray)
+    var step: MLXArray
+
+    init(_ values: (MLXArray, MLXArray), step: MLXArray) {
+        self.values = values
+        self.step = step
+    }
+
+    init(_ a: MLXArray, _ b: MLXArray, step: MLXArray) {
+        self.values = (a, b)
+        self.step = step
+    }
+
+    init(zeros array: MLXArray) {
+        self.values = (MLXArray.zeros(like: array), MLXArray.zeros(like: array))
+        self.step = MLXArray(0)
+    }
+
+    public func innerState() -> [MLXArray] {
+        [values.0, values.1, step]
     }
 }
 
@@ -287,6 +618,17 @@ open class AdaDelta: OptimizerBase<TupleState> {
         TupleState(zeros: parameter)
     }
 
+    override open func stateSuffixes() -> [String] { ["v", "u"] }
+
+    override open func exportState(_ state: TupleState) -> [(String, MLXArray)] {
+        [("v", state.values.0), ("u", state.values.1)]
+    }
+
+    override open func importState(_ arrays: [(String, MLXArray)]) -> TupleState {
+        let byKey = requiredState(arrays, keys: ["v", "u"], owner: self)
+        return TupleState(byKey["v"]!, byKey["u"]!)
+    }
+
     override open func applySingle(gradient: MLXArray, parameter: MLXArray, state: TupleState) -> (
         MLXArray, TupleState
     ) {
@@ -302,14 +644,14 @@ open class AdaDelta: OptimizerBase<TupleState> {
 
 /// The Adam optimizer [1].
 ///
-/// Our Adam implementation follows the original paper and omits the bias
-/// correction in the first and second moment estimates. In detail,
+/// By default our Adam implementation omits bias correction in the first and
+/// second moment estimates. Set `biasCorrection` to `true` to apply it. In detail,
 ///
 /// [1]: Kingma, D.P. and Ba, J., 2015. Adam: A method for stochastic optimization. ICLR 2015.
 ///
 /// ### See Also
 /// - <doc:MLXOptimizers>
-open class Adam: OptimizerBase<TupleState> {
+open class Adam: OptimizerBase<AdamState> {
 
     /// The learning rate
     public var learningRate: Float
@@ -317,41 +659,71 @@ open class Adam: OptimizerBase<TupleState> {
     public var betas: (Float, Float) = (0.9, 0.999)
     /// The epsilon added to the denominator to improve numerical stability
     public var eps: Float = 1e-8
+    /// If `true`, apply bias correction to the first and second moments
+    public var biasCorrection = false
 
     /// Initialize the optimizer.
     /// - Parameters:
     ///   - learningRate: the learning rate
     ///   - betas: coefficients used for computing running averages of the gradient and its square
     ///   - eps: the epsilon added to the denominator to improve numerical stability
-    public init(learningRate: Float, betas: (Float, Float) = (0.9, 0.999), eps: Float = 1e-8) {
+    ///   - biasCorrection: if `true`, apply bias correction to the first and second moments
+    public init(
+        learningRate: Float, betas: (Float, Float) = (0.9, 0.999), eps: Float = 1e-8,
+        biasCorrection: Bool = false
+    ) {
         self.learningRate = learningRate
         self.betas = betas
         self.eps = eps
+        self.biasCorrection = biasCorrection
     }
 
-    override open func newState(parameter: MLXArray) -> TupleState {
-        TupleState(zeros: parameter)
+    override open func newState(parameter: MLXArray) -> AdamState {
+        AdamState(zeros: parameter)
     }
 
-    override open func applySingle(gradient: MLXArray, parameter: MLXArray, state: TupleState) -> (
-        MLXArray, TupleState
+    override open func stateSuffixes() -> [String] { ["m", "v", "step"] }
+
+    override open func exportState(_ state: AdamState) -> [(String, MLXArray)] {
+        [("m", state.values.0), ("v", state.values.1), ("step", state.step)]
+    }
+
+    override open func importState(_ arrays: [(String, MLXArray)]) -> AdamState {
+        let byKey = requiredState(arrays, keys: ["m", "v", "step"], owner: self)
+        return AdamState(byKey["m"]!, byKey["v"]!, step: byKey["step"]!)
+    }
+
+    override open func applySingle(gradient: MLXArray, parameter: MLXArray, state: AdamState) -> (
+        MLXArray, AdamState
     ) {
         let (b1, b2) = betas
 
+        var state = state
         var (m, v) = state.values
+        state.step = state.step + 1
 
         m = b1 * m + (1 - b1) * gradient
         v = b2 * v + (1 - b2) * square(gradient)
 
-        return (parameter - learningRate * m / (sqrt(v) + eps), TupleState(m, v))
+        let update: MLXArray
+        if biasCorrection {
+            let step = state.step
+            let c1 = learningRate / (1 - pow(b1, step))
+            let c2 = rsqrt(1 - pow(b2, step))
+            update = (c1 * m) / (sqrt(v) * c2 + eps)
+        } else {
+            update = learningRate * m / (sqrt(v) + eps)
+        }
+
+        return (parameter - update, AdamState(m, v, step: state.step))
     }
 }
 
 /// The AdamW optimizer [1].
 ///
-/// Following the above convention, in contrast with [1], we do not use bias
-/// correction in the first and second moments for AdamW. We update the weights
-/// with a `weightDecay` lambda value:
+/// By default AdamW omits bias correction in the first and second moments, to
+/// match the longstanding MLX Swift behavior. Set `biasCorrection` to `true`
+/// to apply it. We update the weights with a `weightDecay` lambda value:
 ///
 /// [1]: Loshchilov, I. and Hutter, F., 2019. Decoupled weight decay regularization. ICLR 2019.
 ///
@@ -368,16 +740,19 @@ open class AdamW: Adam {
     ///   - betas: coefficients used for computing running averages of the gradient and its square
     ///   - eps: the epsilon added to the denominator to improve numerical stability
     ///   - weightDecay:the weight decay
+    ///   - biasCorrection: if `true`, apply bias correction to the first and second moments
     public init(
         learningRate: Float, betas: (Float, Float) = (0.9, 0.999), eps: Float = 1e-8,
-        weightDecay: Float = 0.01
+        weightDecay: Float = 0.01, biasCorrection: Bool = false
     ) {
         self.weightDecay = weightDecay
-        super.init(learningRate: learningRate, betas: betas, eps: eps)
+        super.init(
+            learningRate: learningRate, betas: betas, eps: eps,
+            biasCorrection: biasCorrection)
     }
 
-    override open func applySingle(gradient: MLXArray, parameter: MLXArray, state: TupleState) -> (
-        MLXArray, TupleState
+    override open func applySingle(gradient: MLXArray, parameter: MLXArray, state: AdamState) -> (
+        MLXArray, AdamState
     ) {
         return super.applySingle(
             gradient: gradient, parameter: parameter * (1 - learningRate * weightDecay),
@@ -418,6 +793,17 @@ open class Adamax: OptimizerBase<TupleState> {
         TupleState(zeros: parameter)
     }
 
+    override open func stateSuffixes() -> [String] { ["m", "v"] }
+
+    override open func exportState(_ state: TupleState) -> [(String, MLXArray)] {
+        [("m", state.values.0), ("v", state.values.1)]
+    }
+
+    override open func importState(_ arrays: [(String, MLXArray)]) -> TupleState {
+        let byKey = requiredState(arrays, keys: ["m", "v"], owner: self)
+        return TupleState(byKey["m"]!, byKey["v"]!)
+    }
+
     override open func applySingle(gradient: MLXArray, parameter: MLXArray, state: TupleState) -> (
         MLXArray, TupleState
     ) {
@@ -449,17 +835,17 @@ open class Lion: OptimizerBaseArrayState {
 
     /// The learning rate
     public var learningRate: Float
-    /// The coefficients used for computing running averages of the gradient and its square
-    public var betas: (Float, Float) = (0.9, 0.999)
+    /// The coefficients used for computing the gradient momentum and update direction
+    public var betas: (Float, Float) = (0.9, 0.99)
     /// The weight decay
     public var weightDecay: Float = 0.0
 
     /// Initialize the optimizer.
     /// - Parameters:
     ///   - learningRate: the learning rate
-    ///   - betas: coefficients used for computing running averages of the gradient and its square
+    ///   - betas: coefficients used for computing the gradient momentum and update direction
     ///   - weightDecay:the weight decay
-    public init(learningRate: Float, betas: (Float, Float) = (0.9, 0.999), weightDecay: Float = 0.0)
+    public init(learningRate: Float, betas: (Float, Float) = (0.9, 0.99), weightDecay: Float = 0.0)
     {
         self.learningRate = learningRate
         self.betas = betas
@@ -520,7 +906,10 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
         var expAvg: MLXArray? = nil
 
         public func innerState() -> [MLXArray] {
-            [expAvgSqRow, expAvgSqCol, expAvgSq, expAvg].compactMap { $0 }
+            // `compile` and `eval` only see these arrays. `step` has to be
+            // here or a compiled run keeps the count from the first trace,
+            // and `state()` saves that stuck value.
+            [expAvgSqRow, expAvgSqCol, expAvgSq, expAvg].compactMap { $0 } + [step]
         }
     }
 
@@ -573,6 +962,30 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
         return s
     }
 
+    override open func stateSuffixes() -> [String] {
+        ["step", "expAvgSqRow", "expAvgSqCol", "expAvgSq", "expAvg"]
+    }
+
+    override open func exportState(_ state: State) -> [(String, MLXArray)] {
+        var exported: [(String, MLXArray)] = [("step", state.step)]
+        if let value = state.expAvgSqRow { exported.append(("expAvgSqRow", value)) }
+        if let value = state.expAvgSqCol { exported.append(("expAvgSqCol", value)) }
+        if let value = state.expAvgSq { exported.append(("expAvgSq", value)) }
+        if let value = state.expAvg { exported.append(("expAvg", value)) }
+        return exported
+    }
+
+    override open func importState(_ arrays: [(String, MLXArray)]) -> State {
+        let byKey = requiredState(arrays, keys: ["step"], owner: self)
+        var state = State()
+        state.step = byKey["step"]!
+        state.expAvgSqRow = byKey["expAvgSqRow"]
+        state.expAvgSqCol = byKey["expAvgSqCol"]
+        state.expAvgSq = byKey["expAvgSq"]
+        state.expAvg = byKey["expAvg"]
+        return state
+    }
+
     func rms(_ inputs: MLXArray) -> MLXArray {
         sqrt(mean(square(inputs)))
     }
@@ -598,7 +1011,9 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
     func approvateExpMovingAverage(expAvgSqRow: MLXArray, expAvgSqCol: MLXArray) -> MLXArray {
         let rFactor = rsqrt(expAvgSqRow / mean(expAvgSqRow, axis: -1, keepDims: true))
         let cFactor = rsqrt(expAvgSqCol)
-        return matmul(rFactor.expandedDimensions(axis: -1), cFactor.expandedDimensions(axis: 0))
+        // broadcast rather than matmul so this also works for parameters with more
+        // than two dimensions
+        return rFactor.expandedDimensions(axis: -1) * cFactor.expandedDimensions(axis: -2)
     }
 
     override open func applySingle(gradient: MLXArray, parameter: MLXArray, state: State) -> (
@@ -618,8 +1033,15 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
         var update = square(gradient) + eps.0
 
         if factored {
-            var expAvgSqRow = state.expAvgSqRow!
-            var expAvgSqCol = state.expAvgSqCol!
+            // the state is created from the gradient shape so that it always agrees
+            // with the branch taken here, even if a parameter's rank changed
+            let rowShape = Array(gradientShape.dropLast())
+            let columnShape = Array(gradientShape.dropLast(2)) + [gradientShape.last!]
+
+            var expAvgSqRow =
+                state.expAvgSqRow ?? MLXArray.zeros(rowShape, dtype: gradient.dtype)
+            var expAvgSqCol =
+                state.expAvgSqCol ?? MLXArray.zeros(columnShape, dtype: gradient.dtype)
 
             expAvgSqRow = (beta2 * expAvgSqRow) + (1 - beta2) * mean(update, axis: -1)
             expAvgSqCol = (beta2 * expAvgSqCol) + (1 - beta2) * mean(update, axis: -2)
@@ -630,7 +1052,7 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
             update = approvateExpMovingAverage(expAvgSqRow: expAvgSqRow, expAvgSqCol: expAvgSqCol)
             update = update * gradient
         } else {
-            var expAvgSq = state.expAvgSq!
+            var expAvgSq = state.expAvgSq ?? MLXArray.zeros(like: gradient)
             expAvgSq = (beta2 * expAvgSq) + (1 - beta2) * update
             state.expAvgSq = expAvgSq
             update = rsqrt(expAvgSq) * gradient
@@ -640,7 +1062,7 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
         update = learningRate * update
 
         if let beta1 {
-            var expAvg = state.expAvg!
+            var expAvg = state.expAvg ?? MLXArray.zeros(like: gradient)
             expAvg = (beta1 * expAvg) + (1 - beta1) * update
             state.expAvg = expAvg
             update = expAvg
@@ -652,6 +1074,101 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
         }
 
         return (parameter - update, state)
+    }
+}
+
+/// The Muon (MomentUm Orthogonalized by Newton-schulz) optimizer.
+///
+/// Follows the original implementation: [Muon: An optimizer for hidden layers in
+/// neural networks](https://kellerjordan.github.io/posts/muon/).
+///
+/// - Note: Muon may be sub-optimal for the embedding layer, the final fully
+///   connected layer, or any 0D/1D parameters; optimize those with a different
+///   method (e.g. ``AdamW``). For parameters with more than 2 dimensions (e.g. 4D
+///   convolution filters) the trailing dimensions are flattened.
+///
+/// ### See Also
+/// - <doc:MLXOptimizers>
+open class Muon: OptimizerBaseArrayState {
+
+    /// The learning rate
+    public var learningRate: Float
+    /// The momentum strength
+    public var momentum: Float = 0.95
+    /// The weight decay (L2 penalty)
+    public var weightDecay: Float = 0.01
+    /// Enables Nesterov momentum (recommended)
+    public var nesterov = true
+    /// Number of Newton-Schulz iteration steps for orthogonalization
+    public var nsSteps: Int = 5
+
+    /// Initialize the optimizer.
+    /// - Parameters:
+    ///   - learningRate: the learning rate
+    ///   - momentum: the momentum strength
+    ///   - weightDecay: the weight decay (L2 penalty)
+    ///   - nesterov: enables Nesterov momentum
+    ///   - nsSteps: number of Newton-Schulz iteration steps
+    public init(
+        learningRate: Float, momentum: Float = 0.95, weightDecay: Float = 0.01,
+        nesterov: Bool = true, nsSteps: Int = 5
+    ) {
+        self.learningRate = learningRate
+        self.momentum = momentum
+        self.weightDecay = weightDecay
+        self.nesterov = nesterov
+        self.nsSteps = nsSteps
+    }
+
+    /// Orthogonalize a 2D matrix via a quintic Newton-Schulz iteration.
+    func zeropowerViaNewtonSchulz5(_ input: MLXArray, steps: Int) -> MLXArray {
+        precondition(input.ndim == 2, "Newton-Schulz iteration expects a 2D array")
+        let (a, b, c): (Float, Float, Float) = (3.4445, -4.7750, 2.0315)
+        let transposeNeeded = input.dim(-2) > input.dim(-1)
+
+        var X = transposeNeeded ? input.transposed(1, 0) : input
+        // Frobenius-normalize so the iteration converges.
+        X = X / (MLX.norm(X, keepDims: true) + 1e-7)
+
+        for _ in 0 ..< steps {
+            let A = matmul(X, X.transposed(1, 0))
+            let B = addMM(b * A, A, A, alpha: c, beta: 1.0)
+            X = addMM(a * X, B, X, alpha: 1.0, beta: 1.0)
+        }
+
+        return transposeNeeded ? X.transposed(1, 0) : X
+    }
+
+    override open func applySingle(gradient: MLXArray, parameter: MLXArray, state: MLXArray) -> (
+        MLXArray, MLXArray
+    ) {
+        var gradient = gradient
+        if weightDecay != 0 {
+            gradient = gradient + weightDecay * parameter
+        }
+
+        let v = momentum * state + (1 - momentum) * gradient
+
+        var update = nesterov ? (gradient * (1 - momentum) + v * momentum) : v
+        var lr = learningRate
+
+        if update.ndim >= 2 {
+            let originalShape = update.shape
+            let reshapeNeeded = update.ndim > 2
+            if reshapeNeeded {
+                update = update.reshaped([update.dim(0), -1])
+            }
+            update = zeropowerViaNewtonSchulz5(update, steps: nsSteps)
+            if reshapeNeeded {
+                update = update.reshaped(originalShape)
+            }
+            // Scale the learning rate by sqrt(max(1, rows / cols)).
+            let rows = Float(update.dim(-2))
+            let cols = Float(update.dim(-1))
+            lr *= pow(max(1, rows / cols), 0.5)
+        }
+
+        return (parameter - lr * update, v)
     }
 }
 

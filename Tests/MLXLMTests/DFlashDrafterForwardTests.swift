@@ -50,7 +50,7 @@ struct DFlashDrafterForwardTests {
     /// Helper to materialize an MLX tensor without calling the
     /// bare-name `eval()` (trips a pre-write hook that rightly guards
     /// against JS eval but fires on the MLX graph-materialize call too).
-    private func materialize(_ a: MLXArray) {
+    private func evaluateTestArrays(_ a: MLXArray) {
         MLX.eval(a)
     }
 
@@ -195,7 +195,7 @@ struct DFlashDrafterForwardTests {
             targetHidden: targetHidden,
             positionIds: positionIds,
             attentionMask: .none)
-        materialize(out)
+        evaluateTestArrays(out)
 
         #expect(out.dim(0) == 1)
         #expect(out.dim(1) == block)

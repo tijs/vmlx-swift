@@ -1,7 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
-import MLX
+@_spi(Sealing) import MLX
 
 /// `NestedDictionary` structure of `MLXArray`
 public typealias ModuleParameters = NestedDictionary<String, MLXArray>
@@ -79,7 +79,7 @@ public typealias ModuleItem = NestedItem<String, ModuleValue>
 ///
 /// > Please read <doc:custom-layers> for more information about implementing custom layers
 /// including how to override the module and parameter keys and allowing dynamic updates of the
-/// module structure to occur via ``update(modules:verify:)``.
+/// module structure to occur via ``update(modules:verify:path:modulePath:)``.
 ///
 /// ### Training
 ///
@@ -109,6 +109,13 @@ open class Module {
     private var _items: ModuleItems?
     private var _setters: [String: TypeErasedSetter]?
 
+    /// Sealed flag.  When `true`, all mutation entry points
+    /// (parameter/module updates, freeze/unfreeze, train) trap.  Set
+    /// recursively by ``_seal()`` after the module's parameters
+    /// have been replaced with `MaterializedArray` values (or sealed in
+    /// place) inside ``MaterializedModule``.
+    var _isSealed = false
+
     /// Initializes the module.
     public init() {
     }
@@ -123,6 +130,8 @@ open class Module {
 
                 if let (_, _, setter) = isModuleInfo(c.value) {
                     setters[key] = setter
+                } else if let provider = c.value as? TypeErasedSetterProvider {
+                    setters[key] = provider.typeErasedSetter()
                 }
             }
 
@@ -183,6 +192,49 @@ open class Module {
         } else {
             return ""
         }
+    }
+
+    /// Number of *logical* parameters at and beneath this module.
+    ///
+    /// This is intended for display, e.g. to describe the size of a loaded model
+    /// ("8B parameters").  It is not a measure of memory use -- for the physical
+    /// size sum the `nbytes` of ``parameters()``.
+    ///
+    /// For quantized layers (modules conforming to ``Quantized``) this reports the
+    /// count of the equivalent unquantized layer: the packed `weight` is counted as
+    /// `weight.size * 32 / bits` and the quantization metadata (`scales`, `biases`,
+    /// `global_scale`) is excluded.  Any other parameters (e.g. `bias` or parameters
+    /// added by a subclass, such as LoRA adapters) are counted as-is.
+    ///
+    /// This is best effort: it relies on the conventional parameter names above
+    /// and on quantized weights being packed into `uint32`.  Layers with unusual
+    /// storage may override it.
+    open var logicalParameterCount: Int {
+        let items = items()
+        var count = items.reduce(0) {
+            switch $1 {
+            case .parameters(let p):
+                $0 + p.size
+            case .module(let m):
+                $0 + m.logicalParameterCount
+            default:
+                $0
+            }
+        }
+
+        if let q = self as? Quantized, case .parameters(let w)? = items[unwrapping: "weight"] {
+            // replace the packed weight count with the logical (unpacked) count
+            count += w.size * 32 / q.bits - w.size
+
+            // quantization metadata is not part of the logical count
+            for key in ["scales", "biases", "global_scale"] {
+                if case .parameters(let p)? = items[unwrapping: key] {
+                    count -= p.size
+                }
+            }
+        }
+
+        return count
     }
 
     /// Recursively filter and map the contents of the module and its children and produce a `NestedDictionary`
@@ -379,7 +431,7 @@ open class Module {
             isLeaf: Self.isLeafModuleNoChildren)
     }
 
-    /// Options for verifying ``update(parameters:verify:)`` and ``update(modules:verify:)``.
+    /// Options for verifying ``update(parameters:verify:path:modulePath:)`` and ``update(modules:verify:path:modulePath:)``.
     public struct VerifyUpdate: OptionSet, Sendable {
         public init(rawValue: Int) {
             self.rawValue = rawValue
@@ -398,7 +450,7 @@ open class Module {
         static public let none = VerifyUpdate([])
     }
 
-    /// A non-throwing version of ``update(parameters:verify:)``.
+    /// A non-throwing version of ``update(parameters:verify:path:modulePath:)``.
     ///
     /// This passes `verify: .none`.  Note that there may still be `fatalErrors()` if
     /// for example an `MLXArray` is set on a `Module`.
@@ -426,6 +478,13 @@ open class Module {
     /// The ``apply(filter:map:)`` can be used for similar purposes to apply changes
     /// in-place.
     ///
+    /// > If this module is used inside a compiled closure (`compile()`) that does not
+    /// list the module in `inputs:`, calling `update(parameters:)` after the first compiled call
+    /// will not be observed by the compiled function -- `inputs:` is what makes `compile` re-read
+    /// current parameter values on every call. `outputs:` is only needed in addition when the
+    /// compiled closure itself mutates this module's parameters and the mutation should be
+    /// written back.
+    ///
     /// If a parameter is missing from the update and validation indicates `.allModelKeysSet` this
     /// will call ``updateMissing(parameter:verify:path:modulePath:)`` which will
     /// throw an error.  Subclasses can override this if needed.
@@ -434,6 +493,8 @@ open class Module {
     ///   - parameters: replacement parameters in the same format that ``parameters()``
     ///     or ``mapParameters(map:isLeaf:)`` provides
     ///   - verify: options for verifying parameters
+    ///   - path: the key path used for error reporting during recursive updates
+    ///   - modulePath: the module type path used for error reporting during recursive updates
     ///
     /// ### See Also
     /// - <doc:custom-layers>
@@ -441,14 +502,43 @@ open class Module {
     /// - ``apply(filter:map:)``
     /// - ``parameters()``
     /// - ``mapParameters(map:isLeaf:)``
-    /// - ``update(modules:verify:)``
+    /// - ``update(modules:verify:path:modulePath:)``
     @discardableResult
     open func update(
         parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
         modulePath: [String] = []
     ) throws -> Self {
+        _checkNotSealed()
+        try update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath,
+            mutate: nil)
+        return self
+    }
 
+    /// Applies `parameters` to this module and recurses into its children.
+    ///
+    /// With a `nil` `mutate`, arrays update in place and children recurse through the
+    /// open `update(parameters:verify:path:modulePath:)` so subclass overrides run.
+    /// A custom `mutate` (see `materialize()`) recurses directly and skips overrides.
+    func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = [],
+        mutate: ((Module, String, MLXArray, MLXArray) -> Void)?
+    ) throws {
         let modulePath = modulePath + [describeType(self)]
+
+        func updateChild(
+            _ module: Module, _ parameters: ModuleParameters, path: [String]
+        ) throws {
+            if let mutate {
+                try module.update(
+                    parameters: parameters, verify: verify, path: path,
+                    modulePath: modulePath, mutate: mutate)
+            } else {
+                try module.update(
+                    parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+            }
+        }
 
         func apply(
             key: String, path: [String], _ item: ModuleItem, _ value: NestedItem<String, MLXArray>
@@ -469,7 +559,11 @@ open class Module {
                         path: path, modules: modulePath, expectedShape: p.shape,
                         actualShape: newArray.shape)
                 }
-                p._updateInternal(newArray)
+                if let mutate {
+                    mutate(self, key, p, newArray)
+                } else {
+                    p._updateInternal(newArray)
+                }
 
             case (.value(.parameters), .none):
                 if Self.parameterIsValid(key) {
@@ -513,14 +607,10 @@ open class Module {
                 }
 
             case (.value(.module(let module)), .dictionary(let values)):
-                try module.update(
-                    parameters: NestedDictionary(values: values), verify: verify, path: path,
-                    modulePath: modulePath)
+                try updateChild(module, NestedDictionary(values: values), path: path)
 
             case (.value(.module(let module)), .none):
-                try module.update(
-                    parameters: NestedDictionary(), verify: verify, path: path,
-                    modulePath: modulePath)
+                try updateChild(module, NestedDictionary(), path: path)
 
             case (.none, .none), (.value(.none), .none), (.value(.other(_)), .none):
                 break
@@ -546,8 +636,63 @@ open class Module {
             throw UpdateError.unhandledKeys(
                 path: path, modules: modulePath, keys: processed.sorted())
         }
+    }
 
-        return self
+    /// Recursively seal this module and all of its descendants so that any
+    /// further mutation (parameter updates, module replacement, freeze /
+    /// unfreeze, train mode) traps with `fatalError`.
+    ///
+    /// Called from ``MaterializedModule`` after the consumed base has been
+    /// materialized.  This is the runtime backstop for the `consuming`
+    /// ownership contract: even if a caller retains a stale reference and
+    /// tries to mutate the wrapped module, the call will trap rather than
+    /// silently violate the `Sendable` invariant.
+    func _seal() {
+        visit { _, m in
+            m._isSealed = true
+        }
+    }
+
+    private func _checkNotSealed(_ caller: StaticString = #function) {
+        if _isSealed {
+            fatalError(
+                "\(describeType(self)).\(caller): module has been sealed against "
+                    + "mutation by MaterializedModule.  The original reference "
+                    + "must not be retained or used after the module is consumed.")
+        }
+    }
+
+    func materialize() {
+        // bulk eval the parameters
+        eval(self.parameters())
+
+        // now convert to MaterializedArray (where possible)
+        let newParameters = filterMap(
+            filter: { _, _, _ in true },
+            map: Self.mapParameters(map: { $0.materialized() as MLXArray }))
+
+        // not verifying and setting with same value -- any
+        // errors are programming errors
+        try! update(parameters: newParameters, verify: .none) { m, k, a, v in
+            if let setter = m._setters?[k] {
+                do {
+                    // use the setter to replace the array
+                    try setter.update(v)
+                } catch {
+                    a._seal()
+                }
+            } else {
+                // can't replace it (e.g. `let`) -- it is already evaluated,
+                // so seal it in place.  `_seal()` is idempotent, so an array
+                // shared between several parameters (tied weights) is fine.
+                a._seal()
+            }
+        }
+
+        // some of the properties were updated so rebuild the properties cache
+        visit { key, m in
+            m.buildCaches()
+        }
     }
 
     /// Called from ``update(parameters:verify:path:modulePath:)`` if a required parameter
@@ -584,10 +729,11 @@ open class Module {
         filter: (Module, String, ModuleItem) -> Bool = Module.filterValidParameters,
         map: @escaping (MLXArray) -> MLXArray
     ) -> Self {
-        update(parameters: filterMap(filter: filter, map: Self.mapParameters(map: map)))
+        _checkNotSealed()
+        return update(parameters: filterMap(filter: filter, map: Self.mapParameters(map: map)))
     }
 
-    /// A non-throwing version of ``update(modules:verify:)``.
+    /// A non-throwing version of ``update(modules:verify:path:modulePath:)``.
     ///
     /// This passes `verify: .none`.  Note that there may still be `fatalErrors()` if
     /// for example an `Module` is set on a `MLXArray`.
@@ -630,11 +776,13 @@ open class Module {
     /// - Parameters:
     ///   - modules: replacement modules in the same format as ``children()`` or ``leafModules()``
     ///   - verify: options for verifying parameters
+    ///   - path: the key path used for error reporting during recursive updates
+    ///   - modulePath: the module type path used for error reporting during recursive updates
     ///
     /// ### See Also
     /// - <doc:custom-layers>
     /// - ``update(modules:)``
-    /// - ``update(parameters:verify:)``
+    /// - ``update(parameters:verify:path:modulePath:)``
     /// - ``children()``
     /// - ``leafModules()``
     /// - ``QuantizedLinear/quantize(model:groupSize:bits:predicate:)``
@@ -643,6 +791,7 @@ open class Module {
         modules: ModuleChildren, verify: VerifyUpdate, path: [String] = [],
         modulePath: [String] = []
     ) throws -> Self {
+        _checkNotSealed()
 
         let modulePath = modulePath + [describeType(self)]
 
@@ -795,13 +944,14 @@ open class Module {
     ///   - key: module key, see ``ModuleInfo``
     ///   - value: the replacement module
     open func updateModule(key: String, _ value: Any) throws {
+        _checkNotSealed()
         if _setters == nil {
             buildCaches()
         }
 
         if let setter = _setters?[key] {
             do {
-                try setter.updateModule(value)
+                try setter.update(value)
             } catch {
                 throw UpdateError.needModuleInfo(
                     "Unable to set modules for \(describeType(self)).\(key) -- maybe type mismatch: \(describeType(value)), \(error)"
@@ -909,6 +1059,7 @@ open class Module {
     /// - ``freeze(recursive:keys:)``
     /// - ``unfreeze(recursive:keys:strict:)``
     open func freeze(recursive: Bool = true, keys: [String]? = nil, strict: Bool = false) throws {
+        _checkNotSealed()
         let visitor = freezeVisitor(keys: keys, strict: strict) {
             $0._noGrad.formUnion($1)
             $0.didSetNoGrad($0._noGrad)
@@ -947,6 +1098,7 @@ open class Module {
     /// - ``Module/freeze(recursive:keys:)``
     /// - ``Module/unfreeze(recursive:keys:strict:)``
     open func unfreeze(recursive: Bool = true, keys: [String]? = nil, strict: Bool = false) throws {
+        _checkNotSealed()
         let visitor = freezeVisitor(keys: keys, strict: strict) {
             $0._noGrad.subtract($1)
             $0.didSetNoGrad($0._noGrad)
@@ -987,6 +1139,7 @@ open class Module {
     /// - ``training``
     /// - ``didSetTrain(_:)``
     public func train(_ mode: Bool = true) {
+        _checkNotSealed()
         visit(modules: {
             $1.training = mode
             $1.didSetTrain(mode)
@@ -1407,7 +1560,7 @@ public enum ModuleValue {
 /// ### See Also
 /// - <doc:custom-layers>
 /// - ``ModuleInfo``
-@propertyWrapper public class ParameterInfo<T> {
+@propertyWrapper public class ParameterInfo<T>: TypeErasedSetterProvider {
     var value: T?
     let key: String?
 
@@ -1453,11 +1606,48 @@ public enum ModuleValue {
 
         // cannot check via unwapProperty -- see wrappedValue.set
     }
+
+    // See also ModuleInfo.Setter
+    struct Setter: TypeErasedSetter {
+        unowned var info: ParameterInfo<T>
+
+        func update(_ value: Any) throws {
+            if let value = value as? T {
+                info.value = value
+            } else if let value = value as? [MLXArray] {
+                // try to recast as a tuple, e.g.
+                // @ParameterInfo var x: (MLXArray, MLXArray)
+
+                if value.count == 2, let values = (value[0], value[1]) as? T {
+                    info.value = values
+                } else if value.count == 3, let values = (value[0], value[1], value[2]) as? T {
+                    info.value = values
+                } else if value.count == 4,
+                    let values = (value[0], value[1], value[2], value[3]) as? T
+                {
+                    info.value = values
+                } else if value.count == 5,
+                    let values = (value[0], value[1], value[2], value[3], value[4]) as? T
+                {
+                    info.value = values
+                } else {
+                    throw UpdateError.unableToCast(String(describing: T.self))
+                }
+            } else {
+                throw UpdateError.unableToCast(String(describing: T.self))
+            }
+        }
+    }
+
+    fileprivate func typeErasedSetter() -> TypeErasedSetter {
+        Setter(info: self)
+    }
+
 }
 
 /// Helper protocol for writing back through ``ModuleInfo``, e.g. via ``Module/update(modules:)``
 private protocol TypeErasedSetter {
-    func updateModule(_ value: Any) throws
+    func update(_ value: Any) throws
 }
 
 private protocol TypeErasedSetterProvider {
@@ -1465,7 +1655,7 @@ private protocol TypeErasedSetterProvider {
 }
 
 /// ModuleInfo can provde information about child modules and act as an
-/// update point for ``Module/update(modules:verify:)``.
+/// update point for ``Module/update(modules:verify:path:modulePath:)``.
 ///
 /// The keys for modules and parameters are usually named after their instance variables,
 /// but `feed_forward` would not be a very Swifty variable name:
@@ -1514,7 +1704,7 @@ private protocol TypeErasedSetterProvider {
 ///     }
 /// ```
 ///
-/// The `ModuleInfo` provides a hook for ``QuantizedLinear`` and ``Module/update(modules:verify:)`` /// to
+/// The `ModuleInfo` provides a hook for ``QuantizedLinear`` and ``Module/update(modules:verify:path:modulePath:)`` to
 /// replace the contents of `w1`, etc. with a new compatible `Model` after it is created.
 ///
 /// ### See Also
@@ -1565,10 +1755,11 @@ private protocol TypeErasedSetterProvider {
         }
     }
 
+    // See also ParameterInfo.Setter
     struct Setter: TypeErasedSetter {
         unowned var info: ModuleInfo<T>
 
-        func updateModule(_ value: Any) throws {
+        func update(_ value: Any) throws {
             if let value = value as? T {
                 info.module = value
             } else if let value = value as? [Module] {
@@ -1584,7 +1775,7 @@ private protocol TypeErasedSetterProvider {
                 {
                     info.module = values
                 } else if value.count == 5,
-                    let values = (value[0], value[1], value[2], value[4], value[5]) as? T
+                    let values = (value[0], value[1], value[2], value[3], value[4]) as? T
                 {
                     info.module = values
                 } else {

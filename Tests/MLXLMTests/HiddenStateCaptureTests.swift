@@ -13,7 +13,7 @@ import Testing
 
 /// Helper to materialize MLX lazy tensors. Wrapped so the bare-name
 /// `eval(...)` call doesn't trip the repo-wide pre-write security hook.
-private func materialize(_ arrays: MLXArray...) {
+private func evaluateTestArrays(_ arrays: MLXArray...) {
     for a in arrays { MLX.eval(a) }
 }
 
@@ -69,10 +69,10 @@ struct HiddenStateCaptureTests {
         let plain = model(input, cache: nil)
         let (captured, states) = model(
             input, cache: nil, captureLayerIDs: [])
-        materialize(plain, captured)
+        evaluateTestArrays(plain, captured)
         #expect(states.isEmpty)
         let eq = equal(plain, captured).all()
-        materialize(eq)
+        evaluateTestArrays(eq)
         #expect(eq.item(Bool.self))
     }
 
@@ -86,7 +86,7 @@ struct HiddenStateCaptureTests {
         #expect(Set(states.keys) == toCapture)
         for id in toCapture {
             let h = states[id]!
-            materialize(h)
+            evaluateTestArrays(h)
             #expect(h.ndim == 3)
             #expect(h.dim(0) == 1)
             #expect(h.dim(1) == 5)
@@ -100,9 +100,9 @@ struct HiddenStateCaptureTests {
         let input = tokens([10, 20, 30])
         let (logitsA, _) = model(input, cache: nil, captureLayerIDs: [])
         let (logitsB, _) = model(input, cache: nil, captureLayerIDs: [0, 1, 2, 3])
-        materialize(logitsA, logitsB)
+        evaluateTestArrays(logitsA, logitsB)
         let eq = equal(logitsA, logitsB).all()
-        materialize(eq)
+        evaluateTestArrays(eq)
         #expect(eq.item(Bool.self))
     }
 
@@ -115,7 +115,7 @@ struct HiddenStateCaptureTests {
         // Request a specific order — output concat must follow it.
         let stacked = extractContextFeature(
             captured: states, targetLayerIDs: [2, 0, 1])
-        materialize(stacked)
+        evaluateTestArrays(stacked)
         #expect(stacked.ndim == 3)
         #expect(stacked.dim(0) == 1)
         #expect(stacked.dim(1) == 3)

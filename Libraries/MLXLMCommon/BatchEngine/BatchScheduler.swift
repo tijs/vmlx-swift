@@ -193,7 +193,7 @@ struct BatchSlot {
     ///
     /// Stage 1B.4 will generalise to `maxBatchSize > 1` via a per-bucket
     /// `BucketHandle` holding shared `[B, H, maxLen, D]` buffers.
-    var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
+    var compiledForward: (([MLXArray]) -> [MLXArray])?
 
     /// `VMLX_LOGITS_NAN_TRACE=1` diagnostic (see ``NaNLogitsTrace``).
     /// `nil` when the flag is off. Set by the engine at slot admission,

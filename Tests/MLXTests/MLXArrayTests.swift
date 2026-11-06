@@ -8,7 +8,6 @@ import XCTest
 class MLXArrayTests: XCTestCase {
 
     override class func setUp() {
-        setDefaultDevice()
     }
 
     func testArrayProperties() {
@@ -210,10 +209,17 @@ class MLXArrayTests: XCTestCase {
         }
     }
 
-    /// The unevaluated outputs of a multi-output primitive (`quantized`'s `Quantize`) hold
-    /// each other as siblings, and through the primitive its input `w`. Measures how much
-    /// of `w`'s buffer is still active once every handle is gone, after `retire` has run on
-    /// the three outputs.
+    func testUpdateInternalWithItself() {
+        // `Module.update(parameters:)` can hand an array its own value back
+        let a = MLXArray([1, 2, 3] as [Float])
+        a._updateInternal(a)
+        XCTAssertEqual(a.asArray(Float.self), [1, 2, 3])
+    }
+
+}
+
+
+extension MLXArrayTests {
     private func activeBytesLeftBySiblings(
         file: StaticString = #filePath, line: UInt = #line,
         retire: (MLXArray, MLXArray, MLXArray?) -> Void
@@ -258,5 +264,4 @@ class MLXArrayTests: XCTestCase {
         }
         XCTAssertLessThan(left, 1024 * 1024)
     }
-
 }

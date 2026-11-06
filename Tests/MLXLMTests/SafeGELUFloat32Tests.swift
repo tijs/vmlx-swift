@@ -120,7 +120,7 @@ final class SafeGELUFloat32Tests: XCTestCase {
         for form in forms {
             for device in devices {
                 let inputs = domain(dtype, on: device)
-                let label = "\(dtype) \(form.name) on \(device.deviceType?.rawValue ?? "?")"
+                let label = "\(dtype) \(form.name) on \(device.deviceType.rawValue)"
                 checkNearOracle(
                     label, inputs, run(form.apply, inputs, dtype, on: device), dtype,
                     file: file, line: line)
@@ -134,7 +134,7 @@ final class SafeGELUFloat32Tests: XCTestCase {
                 (0 ..< 4096).map { -8 + 16 * Float($0) / 4095 } + [0, .infinity, -.infinity, .nan]
             for form in Self.forms {
                 for device in Self.devices {
-                    let label = "\(form.name) on \(device.deviceType?.rawValue ?? "?")"
+                    let label = "\(form.name) on \(device.deviceType.rawValue)"
                     let (actual, reference) = Device.withDefaultDevice(device) {
                         let x = MLXArray(points)
                         return (form.apply(x), safeGeluApproximate(x))
@@ -176,7 +176,7 @@ final class SafeGELUFloat32Tests: XCTestCase {
             for (dtype, inputs) in specials {
                 for form in Self.forms {
                     for device in Self.devices {
-                        let label = "\(dtype) \(form.name) on \(device.deviceType?.rawValue ?? "?")"
+                        let label = "\(dtype) \(form.name) on \(device.deviceType.rawValue)"
                         let actual = Self.run(form.apply, inputs, dtype, on: device)
                         let reference = Self.run(safeGeluApproximate, inputs, dtype, on: device)
                         XCTAssertEqual(actual.dtype, dtype, "\(label): output dtype")
@@ -238,7 +238,7 @@ final class SafeGELUFloat32Tests: XCTestCase {
             for dtype in [DType.bfloat16, .float16] {
                 for form in Self.forms {
                     for (device, expected) in [(Device.gpu, Int32(0)), (Device.cpu, Int32(2))] {
-                        let label = "\(dtype) \(form.name) on \(device.deviceType?.rawValue ?? "?")"
+                        let label = "\(dtype) \(form.name) on \(device.deviceType.rawValue)"
                         let (status, casts): (Int32, Int32) = Device.withDefaultDevice(device) {
                             let bits = Self.domain(dtype, on: device)
                             let y = form.apply(MLXArray(bits).view(dtype: dtype))
@@ -360,7 +360,7 @@ final class SafeGELUFloat32Tests: XCTestCase {
             for dtype in [DType.bfloat16, .float16] {
                 for form in Self.forms {
                     for device in Self.devices {
-                        let label = "\(dtype) \(form.name) on \(device.deviceType?.rawValue ?? "?")"
+                        let label = "\(dtype) \(form.name) on \(device.deviceType.rawValue)"
                         // The sum forces the empty output. Its bytes are not read back:
                         // asArray of an empty array traps on its nil data pointer.
                         let (shape, outputType, sum) = Device.withDefaultDevice(device) {

@@ -23,7 +23,11 @@ extension MLXArray {
     public func asMTLBuffer(device: some MTLDevice, noCopy: Bool = false) -> (any MTLBuffer)? {
         // Hold `evalLock` through the copy, as `asArray` does.
         evalLock.lock()
-        defer { evalLock.unlock() }
+        EvalLockOwnership.entered()
+        defer {
+            EvalLockOwnership.exited()
+            evalLock.unlock()
+        }
         // A failed eval leaves no `array::Data`; the force-unwrapped
         // `mlx_array_data_uint8` below would dereference null.
         guard realizedForHostRead() else {

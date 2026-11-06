@@ -124,7 +124,7 @@ final class K2HorizonModelTests: XCTestCase {
             eval(x, norm.weight)
             // Do not run norm eagerly first: that would conceal a cold-cache
             // eval during tracing by warming the dtype/count entry.
-            let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile {
+            let forward: ([MLXArray]) -> [MLXArray] = compile(inputs: [], outputs: []) {
                 (args: [MLXArray]) -> [MLXArray] in [norm(args[0])]
             }
             let actual = forward([x])[0]

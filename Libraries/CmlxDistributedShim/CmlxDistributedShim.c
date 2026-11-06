@@ -34,10 +34,14 @@ void vmlx_array_free(VMLXArray a) {
 }
 
 int vmlx_group_rank(VMLXGroup g) {
-    return mlx_distributed_group_rank(vmlx_grp(g));
+    int result = -1;
+    mlx_distributed_group_get_rank(&result, vmlx_grp(g));
+    return result;
 }
 int vmlx_group_size(VMLXGroup g) {
-    return mlx_distributed_group_size(vmlx_grp(g));
+    int result = -1;
+    mlx_distributed_group_get_size(&result, vmlx_grp(g));
+    return result;
 }
 VMLXGroup vmlx_group_init(bool strict, const char* backend) {
     mlx_distributed_group g = {NULL};

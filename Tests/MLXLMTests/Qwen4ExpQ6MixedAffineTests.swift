@@ -146,7 +146,7 @@ struct Qwen4ExpQ6MixedAffineTests {
                 .asType(.bfloat16)
             let expectedResidual = (hyper + expected.expandedDimensions(axis: -2) * injection)
                 .asType(.bfloat16)
-            let compiled = MLX.compile { (args: [MLXArray]) -> [MLXArray] in
+            let compiled = MLX.compile(inputs: [], outputs: []) { (args: [MLXArray]) -> [MLXArray] in
                 let projected = quantizedMM(
                     args[0], q, scales: s, biases: b, transpose: true,
                     groupSize: 64, bits: 6, mode: .affine)
@@ -183,7 +183,7 @@ struct Qwen4ExpQ6MixedAffineTests {
                 (0 ..< 4).map {
                     product(rows[$0 ..< ($0 + 1)], q, s, b)
                 })
-            let compiled = MLX.compile { (x: MLXArray) in
+            let compiled = MLX.compile(inputs: [], outputs: []) { (x: MLXArray) in
                 quantizedMM(
                     x, q, scales: s, biases: b, transpose: true,
                     groupSize: 64, bits: 6, mode: .affine)

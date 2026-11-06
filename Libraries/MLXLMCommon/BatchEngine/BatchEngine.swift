@@ -3101,7 +3101,7 @@ public actor BatchEngine {
     /// both.
     private func stepCompiledDecode(
         slotIndex: Int,
-        forward: @Sendable ([MLXArray]) -> [MLXArray],
+        forward: ([MLXArray]) -> [MLXArray],
         error: ErrorBox
     ) throws {
         var slot = activeSlots[slotIndex]

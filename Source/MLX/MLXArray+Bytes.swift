@@ -147,7 +147,11 @@ extension MLXArray {
         // `mlx::core::array::dtype()`). The lock is recursive, so the
         // converted array's own `asArray` takes it again safely.
         evalLock.lock()
-        defer { evalLock.unlock() }
+        EvalLockOwnership.entered()
+        defer {
+            EvalLockOwnership.exited()
+            evalLock.unlock()
+        }
         guard isValid else {
             reportInvalidArrayUse("MLXArray.asArray")
             return []
@@ -186,7 +190,11 @@ extension MLXArray {
             // from here, as `asArray` does, and resolve the stream before it.
             let stream = StreamOrDevice.default
             evalLock.lock()
-            defer { evalLock.unlock() }
+        EvalLockOwnership.entered()
+            defer {
+            EvalLockOwnership.exited()
+            evalLock.unlock()
+        }
             let source = type.dtype == self.dtype ? self : self.asType(type, stream: stream)
             try error.check()
             return try source.withEvaluatedHostAccess { realized in
@@ -253,7 +261,7 @@ extension MLXArray {
     func withEvaluatedHostAccess<Result>(
         _ body: (_ realized: Bool) throws -> Result
     ) rethrows -> Result {
-        try evalLock.withLock {
+        try withEvalLock {
             let realized = realizeForHostRead()
             return try body(realized)
         }
@@ -264,7 +272,7 @@ extension MLXArray {
     /// accessors use this to skip the read on failure; they hold `evalLock`
     /// themselves across the read that follows (it is recursive).
     func realizedForHostRead() -> Bool {
-        evalLock.withLock { realizeForHostRead() }
+        withEvalLock { realizeForHostRead() }
     }
 
 #if DEBUG
@@ -359,7 +367,11 @@ extension MLXArray {
         // as `asArray` does: an in-place update would otherwise free the
         // buffer while it is being read.
         evalLock.lock()
-        defer { evalLock.unlock() }
+        EvalLockOwnership.entered()
+        defer {
+            EvalLockOwnership.exited()
+            evalLock.unlock()
+        }
         // Same realization gate as `asArray`: a failed eval leaves no
         // `array::Data`, and every branch below reads `mlx_array_data_uint8`.
         guard realizedForHostRead() else {
@@ -377,23 +389,12 @@ extension MLXArray {
         case .noCopyIfContiguous:
             if self.contiguousToDimension() == 0 {
                 // the backing is contiguous, we can provide a wrapper
-                // for the contents without a copy.
-                //
-                // An array with no elements has no backing buffer, so
-                // `mlx_array_data_uint8` returns null. There are no bytes to
-                // wrap, and `Data(bytesNoCopy:)` may not take a null base, so
-                // hand back empty `Data` rather than trapping. A zero-element
-                // pixel tensor reaches here through `computeMediaSalt`.
-                guard let source = UnsafeMutableRawPointer(mutating: mlx_array_data_uint8(self.ctx))
-                else {
-                    return MLXArrayData(
-                        data: Data(),
-                        shape: self.shape, strides: contiguousStrides(shape: self.shape),
-                        dType: self.dtype)
-                }
-                let data = Data(
-                    bytesNoCopy: source, count: size * itemSize,
-                    deallocator: .none)
+                // for the contents without a copy
+                // an empty array has no backing pointer
+                let data =
+                    UnsafeMutableRawPointer(mutating: mlx_array_data_uint8(self.ctx)).map {
+                        Data(bytesNoCopy: $0, count: size * itemSize, deallocator: .none)
+                    } ?? Data()
 
                 return MLXArrayData(
                     data: data,
@@ -406,14 +407,11 @@ extension MLXArray {
             }
 
         case .noCopy:
-            // Same null backing as `.noCopyIfContiguous` above: no elements
-            // means no buffer to reference.
-            let data: Data
-            if let source = UnsafeMutableRawPointer(mutating: mlx_array_data_uint8(self.ctx)) {
-                data = Data(bytesNoCopy: source, count: nbytes, deallocator: .none)
-            } else {
-                data = Data()
-            }
+            // an empty array has no backing pointer
+            let data =
+                UnsafeMutableRawPointer(mutating: mlx_array_data_uint8(self.ctx)).map {
+                    Data(bytesNoCopy: $0, count: nbytes, deallocator: .none)
+                } ?? Data()
 
             let strides: [Int]
             if ndim == 0 {

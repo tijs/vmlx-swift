@@ -166,7 +166,7 @@ final class NaiveN05FusedRotaryApplyTests: XCTestCase {
                 NaiveN05FusedRotaryApply.modelRequested(c, environment: [:]))
             let capturedDefault = automatic.fusedRotaryApply
             let metalName = NaiveN05FusedRotaryApply.nativeMetalDeviceName() ?? "unavailable"
-            let backend = Device.defaultDevice().deviceType?.rawValue ?? "unavailable"
+            let backend = Device.defaultDevice().deviceType.rawValue
             print("[NaiveRotaryPolicy] metal_device_name=\(String(reflecting: metalName)) backend=\(backend) default_enabled=\(capturedDefault)")
             setenv(flag, "0", 1)
             let environmentOff = try NaiveN05FlashModel(c)

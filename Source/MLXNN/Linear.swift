@@ -31,7 +31,7 @@ public class Identity: Module, UnaryLayer {
 ///
 /// ## Using In A Module
 ///
-/// > Use `@ModuleInfo` with all your `Linear` module uses so that ``Module/update(modules:verify:)`` can
+/// > Use `@ModuleInfo` with all your `Linear` module uses so that ``Module/update(modules:verify:path:modulePath:)`` can
 /// replace the modules, e.g. via ``QuantizedLinear/quantize(model:groupSize:bits:predicate:)``.
 ///
 /// For example:
@@ -69,8 +69,8 @@ public class Identity: Module, UnaryLayer {
 /// - ``Bilinear``
 open class Linear: Module, UnaryLayer, Quantizable {
 
-    public let weight: MLXArray
-    public let bias: MLXArray?
+    @ParameterInfo public var weight: MLXArray
+    @ParameterInfo public var bias: MLXArray?
 
     open var shape: (Int, Int) {
         weight.shape2

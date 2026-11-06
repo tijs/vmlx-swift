@@ -13,9 +13,6 @@ import Testing
 @testable import MLXLLM
 @testable import MLXLMCommon
 
-@inline(__always)
-private func materialize(_ a: MLXArray) { MLX.eval(a) }
-
 @Suite("DDTree hybrid SSM byte-parity — Phase 3", .serialized)
 struct DDTreeHybridSSMTests {
 
@@ -128,7 +125,7 @@ struct DDTreeHybridSSMTests {
             input, cache: nil, captureLayerIDs: [])
         #expect(states.isEmpty)
         let eq = equal(plain, captured).all()
-        materialize(eq)
+        MLX.eval(eq)
         #expect(eq.item(Bool.self))
     }
 

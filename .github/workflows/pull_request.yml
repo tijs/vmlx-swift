@@ -1,6 +1,8 @@
 name: Build and Test
 
-on: pull_request
+on:
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -85,6 +87,7 @@ jobs:
         run: |
           pre-commit run --all || (echo "Style checks failed, please install pre-commit and run pre-commit run --all and push the change"; echo ""; git --no-pager diff; exit 1)
 
+
   mac_build_and_test:
     # Deliberately NOT `needs: lint`. Gating the build on style meant that the moment CI started
     # running, the only job that can actually tell us whether a pull request COMPILES was skipped
@@ -97,20 +100,42 @@ jobs:
         with:
           submodules: recursive
 
+      - name: List XCodes
+        shell: bash
+        run: |
+          ls -l /Applications/Xcode-latest.app
+          ls /Applications | grep -i xcode
+          swift --version
+
       - name: Verify MetalToolchain installed
         shell: bash
         run: xcodebuild -showComponent MetalToolchain
+
+      - name: Verify SwiftPM manifest CUDA containment
+        shell: sh
+        run: |
+          scripts/verify-spm-manifest.py
 
       - name: Setup cmake
         shell: sh
         run: |
           brew install cmake ninja
 
+      - name: Verify documentation
+        run: scripts/verify-docs.sh
+
+      - name: Build SwiftPM (Xcode, iOS)
+        shell: sh
+        run: |
+          xcodebuild -version
+          swift --version
+          rm -rf ~/Library/Developer/Xcode/DerivedData/*
+          xcodebuild build -scheme mlx-swift-Package -destination 'generic/platform=iOS'
+
       - name: Build SwiftPM (Xcode, macOS)
         shell: sh
         run: |
           xcodebuild -version
-          xcrun --show-sdk-build-version
           swift --version
           rm -rf ~/Library/Developer/Xcode/DerivedData/*
           xcodebuild build-for-testing -scheme mlx-swift-Package -destination 'platform=macOS'
@@ -120,6 +145,13 @@ jobs:
         run: |
           xcrun xctest ~/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/CmlxTests.xctest
           xcrun xctest ~/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/MLXTests.xctest
+          xcrun xctest ~/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/MLXIntegrationTests.xctest
+
+      - name: Run Distributed Tests SwiftPM (Xcode, macOS)
+        shell: sh
+        run: |
+          MLX_TEST_DISTRIBUTED=1 xcrun xctest -XCTest DistributedRingTests ~/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/MLXTests.xctest
+          MLX_TEST_DISTRIBUTED=1 xcrun xctest -XCTest DistributedNNRingTests ~/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/MLXTests.xctest
 
       - name: Build xcodeproj (Xcode, macOS)
         shell: sh
@@ -146,6 +178,11 @@ jobs:
       - name: Build (cmake)
         shell: sh
         run: |
+          # Without an explicit SDK, /usr/bin/cc (xcrun) may pick the
+          # CommandLineTools SDK, which can be newer than the active Xcode's
+          # compiler/linker understands.  Use the SDK that ships with Xcode.
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          echo "SDKROOT=$SDKROOT"
           rm -rf build
           mkdir build
           cd build
@@ -155,20 +192,26 @@ jobs:
   linux_build_cmake_container:
     name: Linux Container CMake Swift Build (${{ matrix.container }} ${{ matrix.arch }})
     needs: lint
+    if: github.repository == 'ml-explore/mlx-swift'
     strategy:
       fail-fast: false
       matrix:
         include:
           # See https://github.com/swiftlang/swift-docker/tree/main/
+          #
+          # Note: mlx-c uses std::format, which requires libstdc++ >= 13 (or
+          # libc++ >= 17).  Debian bookworm only ships gcc/libstdc++ 12 (and
+          # gcc-13 is not available in bookworm-backports), so use Ubuntu
+          # noble (24.04, gcc/libstdc++ 13) for the Debian-family build.
           - host: ubuntu-22.04
             arch: x86_64
-            container: swift:bookworm
+            container: swift:noble
           - host: ubuntu-22.04
             arch: x86_64
             container: swift:fedora39
           - host: ubuntu-22.04-arm
             arch: aarch64
-            container: swift:bookworm
+            container: swift:noble
           - host: ubuntu-22.04-arm
             arch: aarch64
             container: swift:fedora39
@@ -189,6 +232,7 @@ jobs:
   linux_build_cmake_cuda:
     name: Linux CUDA CMake Swift Build (cuda-12.9, swift-6.2.3-RELEASE, ubuntu-24.04, x86_64)
     needs: lint
+    if: github.repository == 'ml-explore/mlx-swift'
     runs-on: "gpu-t4-4-core"
     env:
       # Note 12/18/2025: the CI machine does not meet CUDA 13's driver requirement.

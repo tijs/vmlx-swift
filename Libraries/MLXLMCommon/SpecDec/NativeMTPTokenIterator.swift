@@ -467,7 +467,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// Compiled verify forwards keyed by row count (depth+1). The adaptive
     /// controller moves between at most three depths, so at most three
     /// traces are ever built.
-    private var compiledVerify: [Int: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledVerify: [Int: ([MLXArray]) -> [MLXArray]] = [:]
     /// Row counts whose first staged cycle already ran eagerly. compile()
     /// needs the staging slots to exist as persistent objects before the
     /// trace, so the first cycle at each shape warms them.

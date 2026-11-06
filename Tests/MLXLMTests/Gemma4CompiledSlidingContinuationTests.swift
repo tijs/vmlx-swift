@@ -60,7 +60,7 @@ final class Gemma4CompiledSlidingContinuationTests: XCTestCase {
         // Fail the baseline safely at the owning invariant before an invalid C array cascades.
         XCTAssertEqual(promoted[0].innerState()[0].dim(2), 8)
         guard promoted[0].innerState()[0].dim(2) == 8 else { return }
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: promoted, outputs: promoted) { args in
+        let forward: ([MLXArray]) -> [MLXArray] = compile(inputs: promoted, outputs: promoted) { args in
             CompiledDecodeTrace.withActive {
                 [model(LMInput.Text(tokens: args[0])[text: .newAxis], cache: promoted, state: nil).logits]
             }

@@ -142,7 +142,7 @@ class CompilableMambaCacheTests: XCTestCase {
         let refSum = refCache.convStateArray!.sum().item(Float.self)
 
         let captured = [cmpCache as KVCache]
-        let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        let forward: ([MLXArray]) -> [MLXArray] = compile(
             inputs: captured, outputs: captured
         ) { (args: [MLXArray]) -> [MLXArray] in
             let input = args[0]

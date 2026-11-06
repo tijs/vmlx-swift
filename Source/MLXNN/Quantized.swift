@@ -40,6 +40,14 @@ public protocol Quantized: Module {
     var mode: QuantizationMode { get }
 }
 
+/// Internal so that the sharded quantized layers, which cannot reuse
+/// ``QuantizedLinear``'s forward pass, apply the scale the same way.
+func applyNVFP4GlobalScale(_ value: MLXArray, globalScale: MLXArray?) -> MLXArray {
+    guard let globalScale else { return value }
+    // NVFP4 encodes its E4M3 group scales with (448 * 6) / globalScale.
+    return (value * (globalScale / (448 * 6))).asType(value.dtype)
+}
+
 /// Quantize any ``Quantizable`` layer that is not already quantized.
 public func quantizeSingle(
     layer: Module, groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode = .affine
@@ -172,6 +180,7 @@ open class QuantizedEmbedding: Embedding, Quantized {
     public let mode: QuantizationMode
     @ParameterInfo(key: "scales") public var scales: MLXArray
     @ParameterInfo(key: "biases") public var biases: MLXArray?
+    @ParameterInfo(key: "global_scale") public private(set) var globalScale: MLXArray?
 
     open override var shape: (Int, Int) {
         let (embeddingCount, dimensions) = super.shape
@@ -197,14 +206,16 @@ open class QuantizedEmbedding: Embedding, Quantized {
 
     public init(
         weight: MLXArray, groupSize: Int = 64, bits: Int = 4,
-        mode: QuantizationMode = .affine
+        mode: QuantizationMode = .affine,
+        globalScale: MLXArray? = nil
     ) {
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
+        self._globalScale.wrappedValue = globalScale
 
         let (quantizedWeight, scales, biases) = MLX.quantized(
-            weight, groupSize: groupSize, bits: bits, mode: mode)
+            weight, groupSize: groupSize, bits: bits, mode: mode, globalScale: globalScale)
 
         self._scales.wrappedValue = scales
         self._biases.wrappedValue = biases
@@ -214,26 +225,19 @@ open class QuantizedEmbedding: Embedding, Quantized {
         self.freeze()
     }
 
-    /// Initializer for already-quantized checkpoint tensors.
-    ///
-    /// Pre-quantized model bundles store embedding weights in packed form
-    /// alongside per-group scales and optional biases. Loading those bundles
-    /// should construct the quantized embedding directly from the file-backed
-    /// arrays instead of quantizing a randomly initialized placeholder and
-    /// relying on a later parameter update.
+    /// Initializer meant for subclasses to provide arrays directly.
     public init(
-        weight: MLXArray,
-        scales: MLXArray,
-        biases: MLXArray?,
-        groupSize: Int,
-        bits: Int,
-        mode: QuantizationMode = .affine
+        weight: MLXArray, scales: MLXArray, biases: MLXArray?,
+        groupSize: Int, bits: Int,
+        mode: QuantizationMode = .affine,
+        globalScale: MLXArray? = nil
     ) {
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
         self._scales.wrappedValue = scales
         self._biases.wrappedValue = biases
+        self._globalScale.wrappedValue = globalScale
         super.init(weight: weight)
 
         self.freeze()
@@ -254,6 +258,7 @@ open class QuantizedEmbedding: Embedding, Quantized {
         var out = dequantized(
             weight[x], scales: scales[x], biases: biases == nil ? nil : biases![x],
             groupSize: groupSize, bits: bits, mode: mode)
+        out = applyNVFP4GlobalScale(out, globalScale: globalScale)
         if let outputDType, out.dtype != outputDType {
             out = out.asType(outputDType)
         }
@@ -264,6 +269,7 @@ open class QuantizedEmbedding: Embedding, Quantized {
         var out = quantizedMM(
             x, weight, scales: scales, biases: biases, transpose: true, groupSize: groupSize,
             bits: bits, mode: mode)
+        out = applyNVFP4GlobalScale(out, globalScale: globalScale)
         if let outputDType, out.dtype != outputDType {
             out = out.asType(outputDType)
         }
@@ -297,6 +303,7 @@ open class QuantizedLinear: Linear, Quantized {
     public let mode: QuantizationMode
     @ParameterInfo(key: "scales") public var scales: MLXArray
     @ParameterInfo(key: "biases") public var biases: MLXArray?
+    @ParameterInfo(key: "global_scale") public private(set) var globalScale: MLXArray?
 
     open override var shape: (Int, Int) {
         let shape = weight.shape2
@@ -346,14 +353,16 @@ open class QuantizedLinear: Linear, Quantized {
     /// Initialize a ``QuantizedLinear`` with non-quantized weights and bias.
     public init(
         weight: MLXArray, bias: MLXArray?, groupSize: Int = 64, bits: Int = 4,
-        mode: QuantizationMode = .affine
+        mode: QuantizationMode = .affine,
+        globalScale: MLXArray? = nil
     ) {
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
+        self._globalScale.wrappedValue = globalScale
 
         let (quantizedWeight, scales, biases) = MLX.quantized(
-            weight, groupSize: groupSize, bits: bits, mode: mode)
+            weight, groupSize: groupSize, bits: bits, mode: mode, globalScale: globalScale)
 
         self._scales.wrappedValue = scales
         self._biases.wrappedValue = biases
@@ -370,14 +379,23 @@ open class QuantizedLinear: Linear, Quantized {
     public init(
         weight: MLXArray, bias: MLXArray? = nil, scales: MLXArray, biases: MLXArray?,
         groupSize: Int, bits: Int,
-        mode: QuantizationMode = .affine
+        mode: QuantizationMode = .affine,
+        globalScale: MLXArray? = nil
     ) {
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
         self._scales.wrappedValue = scales
         self._biases.wrappedValue = biases
+        self._globalScale.wrappedValue = globalScale
         super.init(weight: weight, bias: bias)
+    }
+
+    open override func describeExtra(_ indent: Int) -> String {
+        let outputDimensions = scales.dim(0)
+        let inputDimensions = scales.dim(1) * groupSize
+        return
+            "(inputDimensions=\(inputDimensions), outputDimensions=\(outputDimensions), bias=\(self.bias != nil))"
     }
 
     public override func unfreeze(
@@ -389,7 +407,7 @@ open class QuantizedLinear: Linear, Quantized {
 
     open override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let inputDType = x.dtype
-        var x = quantizedMM(
+        var result = quantizedMM(
             x,
             weight,
             scales: scales,
@@ -399,8 +417,9 @@ open class QuantizedLinear: Linear, Quantized {
             bits: bits,
             mode: mode
         )
+        result = applyNVFP4GlobalScale(result, globalScale: globalScale)
         if let bias {
-            x = x + bias
+            result = result + bias
         }
         // MLX types quantizedMM output as promote_types(x, scales): bf16
         // activations against the f16 scales JANG bundles stamp promote to
@@ -410,12 +429,12 @@ open class QuantizedLinear: Linear, Quantized {
         // decode regions refusing their dtype gates. fp32 stays where it
         // belongs: inside the matmul as the accumulator. The env var
         // restores the historical promote-and-propagate behavior for A/B.
-        if !QuantizedRuntime.propagatePromotedOutput, x.dtype != inputDType,
+        if !QuantizedRuntime.propagatePromotedOutput, result.dtype != inputDType,
             inputDType == .bfloat16 || inputDType == .float16
         {
-            x = x.asType(inputDType)
+            result = result.asType(inputDType)
         }
-        return x
+        return result
     }
 
     /// Returns a QuantizedLinear layer that applies the same linear transformation up to the quantization error.

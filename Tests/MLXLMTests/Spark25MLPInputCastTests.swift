@@ -193,7 +193,7 @@ final class Spark25MLPInputCastTests: XCTestCase {
             let (g, u) = Spark25InputCastFixture.layers()
             eval(g.parameters(), u.parameters())
             let x = MLXRandom.normal([1, 1, 2560], key: MLXRandom.key(101))
-            let compiled = compile { (a: MLXArray) in
+            let compiled = compile(inputs: [], outputs: []) { (a: MLXArray) in
                 Spark25DualProjection.applyNormalizedFP32(a, inputDType: .bfloat16, gate: g, up: u)
                     ?? self.reference(a, gate: g, up: u)
             }
