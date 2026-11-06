@@ -2751,6 +2751,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
                 self.exactPromptSnapshotWasDeclined = self.retainedPromptSnapshot == nil
             }
+        } else {
+            // Deliberately omitted exact snapshots must not fall back to live
+            // topology and replay a missing history boundary after decode.
+            // Captured stable/stripped checkpoints remain usable independently.
+            self.exactPromptSnapshotWasDeclined = true
         }
         spillHybridStripBoundaryAfterPrefill()
         MemoryStageTrace.log(
