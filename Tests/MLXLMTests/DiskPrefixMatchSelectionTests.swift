@@ -1070,7 +1070,7 @@ struct DiskPrefixMatchSelectionTests {
     /// Every consumer of a disk hit reports a structural rejection of it,
     /// and only that: the reports sit on the refusals (`restoreFromDiskArrays`
     /// restored nothing; the restored offsets disagree with the boundary),
-    /// each behind `detail == .disk`, and before the contextual roll-backs
+    /// each behind `detail.isDiskTierEntry`, and before the contextual roll-backs
     /// (media placeholders in the suffix, a missing seed state), which say
     /// nothing about the entry.
     ///
@@ -1078,9 +1078,8 @@ struct DiskPrefixMatchSelectionTests {
     /// into exactly as `TokenIterator` does — the model's `newCache` over the
     /// parameters the salt was computed from; a head's or drafter's cache is
     /// a separate array — so a payload that does not fit theirs fits neither.
-    /// DFlash 2 has no offset check to report from. The diffusion iterator
-    /// applies no recurrent companion state, so its offset refusal is
-    /// reported only for a cache without such layers.
+    /// The diffusion iterator applies no recurrent companion state, so its
+    /// offset refusal is reported only for a cache without such layers.
     @Test func everyRestoreConsumerReportsStructuralRejectionsOfDiskHitsOnly() throws {
         let fits = "payload does not fit the runtime cache"
         let offsets = "restored offsets do not match the boundary"
@@ -1095,7 +1094,7 @@ struct DiskPrefixMatchSelectionTests {
                 "let unsafePartial ="
             ),
             (
-                "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift", [fits],
+                "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift", [fits, offsets],
                 "input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)"
             ),
             (
@@ -1111,8 +1110,8 @@ struct DiskPrefixMatchSelectionTests {
                 calls.count - 1 == consumer.reasons.count, "\(path): \(calls.count - 1) reports")
             for before in calls.dropLast() {
                 #expect(
-                    before.suffix(120).contains("detail == .disk"),
-                    "\(path): a report that is not behind `detail == .disk`")
+                    before.suffix(120).contains("detail.isDiskTierEntry"),
+                    "\(path): a report that is not behind `detail.isDiskTierEntry`")
             }
             for reason in consumer.reasons {
                 #expect(source.components(separatedBy: reason).count - 1 == 1, "\(path)")
@@ -1125,7 +1124,7 @@ struct DiskPrefixMatchSelectionTests {
         let diffusion = try Self.packageSource(
             "Libraries/MLXLMCommon/Diffusion/BlockDiffusionTokenIterator.swift")
         #expect(
-            diffusion.contains("if detail == .disk, !cacheContainsPathDependentState(self.cache) {"))
+            diffusion.contains("if detail.isDiskTierEntry, !cacheContainsPathDependentState(self.cache) {"))
     }
 
     // MARK: - 7. A hybrid veto comes after the payload is loaded

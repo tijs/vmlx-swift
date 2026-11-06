@@ -266,7 +266,19 @@ public enum ChatTemplateArgument {
 ///
 /// This is the main protocol that defines all tokenizer operations, including text processing,
 /// chat template application, and special token handling.
+/// A lossless piece from a plain ByteLevel decoder. Added tokens terminate
+/// the preceding byte run and are emitted literally, including non-special ones.
+public enum ByteLevelDecodingPiece: Sendable {
+    case bytes([UInt8])
+    case literal(String)
+    case ignored
+}
+
 public protocol Tokenizer: Sendable {
+    /// Available only when incremental byte decoding is equivalent to decode.
+    /// Generation retains special tokens, matching skipSpecialTokens=false.
+    var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? { get }
+
     /// Tokenizes the input text into a sequence of tokens.
     ///
     /// - Parameter text: The input text to tokenize
@@ -458,6 +470,7 @@ public protocol Tokenizer: Sendable {
 }
 
 extension Tokenizer {
+    public var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? { nil }
     public var hasChatTemplate: Bool { false }
     public func configuredChatTemplate(forTools: Bool) -> String? { nil }
 
@@ -552,6 +565,18 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     private let tokenizerConfig: Config
 
     private let cleanUpTokenizationSpaces: Bool
+
+    public var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? {
+        // Do not bypass subclass overrides, decoder sequences, or cleanup rules.
+        guard type(of: self) == PreTrainedTokenizer.self,
+              decoder is ByteLevelDecoder, !cleanUpTokenizationSpaces else { return nil }
+        return { [self] id in
+            guard let token = model.convertIdToToken(id) else { return .ignored }
+            if addedTokens.contains(token) { return .literal(token) }
+            // Same mapping and invalid-vocabulary contract as ByteLevelDecoder.
+            return .bytes(token.map { byteDecoder[String($0)]! })
+        }
+    }
 
     /// Cache for compiled Jinja templates keyed by their literal template string
     private var compiledChatTemplateCache: [String: Template] = [:]
@@ -946,12 +971,10 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             throw TokenizerError.missingChatTemplate
         }
 
-        // A template that closes the assistant turn after a tool response and then skips the
-        // role header hands the model no turn to speak in; it improvises `<channel|>thought`
-        // scaffolding and, in an agent loop, repeats that header until the budget runs out.
-        // Repair it here, where every path converges — patching the bundle on disk does not
-        // survive the loader re-fetching it from the Hub.
-        let template = try compiledTemplate(for: ChatTemplateRepair.repaired(selectedChatTemplate))
+        // INVARIANT: the selected bundle/explicit override owns turn boundaries.
+        // A substring rewrite cannot infer the next role and previously erased
+        // Gemma's turn close before a new user. Fix stale templates at export.
+        let template = try compiledTemplate(for: selectedChatTemplate)
         var context: [String: VMLXJinja.Value] = try [
             "messages": .array(messages.map { try chatTemplateMessageValue($0) }),
             "add_generation_prompt": .boolean(addGenerationPrompt),

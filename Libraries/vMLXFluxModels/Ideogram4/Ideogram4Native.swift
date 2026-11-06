@@ -457,7 +457,7 @@ private final class Ideogram4Transformer {
     private let llmCondProj: MFluxLinear
     private let timeEmbedding: Ideogram4ScalarEmbed
     private let adalnProj: MFluxLinear
-    private let imageIndicatorEmbedding: MLXArray
+    private let imageIndicatorEmbedding: MFluxEmbedding
     private let layers: [Ideogram4TransformerBlock]
     private let finalLayer: Ideogram4FinalLayer
 
@@ -467,7 +467,8 @@ private final class Ideogram4Transformer {
         llmCondProj = try store.linear(component, "llm_cond_proj", inputDimensions: 53248, outputDimensions: 4608, bias: true)
         timeEmbedding = try Ideogram4ScalarEmbed(store: store, component: component)
         adalnProj = try store.linear(component, "adaln_proj", inputDimensions: 4608, outputDimensions: 512, bias: true)
-        imageIndicatorEmbedding = try store.tensor(component, "embed_image_indicator.weight")
+        // mflux-saved quants store this table group-quantized; MFluxEmbedding handles both.
+        imageIndicatorEmbedding = try store.embedding(component, "embed_image_indicator", dimensions: 4608)
         layers = try (0 ..< 34).map { try Ideogram4TransformerBlock(store: store, component: component, index: $0) }
         finalLayer = try Ideogram4FinalLayer(store: store, component: component)
     }
@@ -486,7 +487,7 @@ private final class Ideogram4Transformer {
         let llm = llmCondProj(llmCondNorm(llmFeatures * llmMask)) * llmMask
         h = h + llm
         let indicatorIDs = (indicator .== MLXArray(Int32(2))).asType(.int32)
-        h = h + imageIndicatorEmbedding[indicatorIDs]
+        h = h + imageIndicatorEmbedding(indicatorIDs)
 
         var adalnInput = timeEmbedding(timestep)
         adalnInput = silu(adalnProj(adalnInput.expandedDimensions(axis: 1)))
@@ -736,7 +737,9 @@ private final class Ideogram4VAEAttention {
         toQ = try store.linear("vae", "\(prefix).to_q", inputDimensions: channels, outputDimensions: channels, bias: true)
         toK = try store.linear("vae", "\(prefix).to_k", inputDimensions: channels, outputDimensions: channels, bias: true)
         toV = try store.linear("vae", "\(prefix).to_v", inputDimensions: channels, outputDimensions: channels, bias: true)
-        toOut = try store.linear("vae", "\(prefix).to_out.0", inputDimensions: channels, outputDimensions: channels, bias: true)
+        toOut = try store.linear(
+            "vae", prefixes: ["\(prefix).to_out.0", "\(prefix).to_out"],
+            inputDimensions: channels, outputDimensions: channels, bias: true)
     }
 
     func callAsFunction(_ input: MLXArray) -> MLXArray {
@@ -795,7 +798,7 @@ final class Ideogram4Pipeline {
         steps: Int,
         guidance: Float,
         seed: UInt64?,
-        progress: (Int, Int, Double?) -> Void
+        preview: ImagePreviewEmitter? = nil, progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
         try Ideogram4Latents.validateDimensions(width: width, height: height)
         let tokenIDs = try tokenizer.ids(prompt)
@@ -812,6 +815,7 @@ final class Ideogram4Pipeline {
 
         let start = Date()
         for step in 0 ..< steps {
+            try FluxInterruptScope.check()
             let scheduleIndex = steps - 1 - step
             let t = scheduler.tValues[scheduleIndex]
             let s = scheduler.sValues[scheduleIndex]
@@ -834,6 +838,10 @@ final class Ideogram4Pipeline {
             let velocity = MLXArray(g) * positiveVelocity + (MLXArray(Float(1)) - MLXArray(g)) * negativeVelocity
             latents = latents + velocity * MLXArray(s - t)
             eval(latents)
+            preview?.emit(step: step + 1) {
+                guard let spatial = try? Ideogram4Latents.unpack(latents, width: width, height: height) else { return nil }
+                return vae.decode(preview!.reducedLatent(spatial, scale: 8))
+            }
             let elapsed = Date().timeIntervalSince(start)
             progress(step + 1, steps, elapsed / Double(step + 1) * Double(steps - step - 1))
         }

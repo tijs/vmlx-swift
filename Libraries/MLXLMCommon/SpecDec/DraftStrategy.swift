@@ -112,6 +112,22 @@ public enum DraftStrategy: @unchecked Sendable {
     /// through the loader; otherwise the iterator refuses to start.
     case nativeMTP(depth: Int, verifierMode: String? = nil)
 
+    /// IFM Uno self-speculation (`Uno.swift`): the target drafts with its own weights plus a
+    /// conditional-LoRA diffusion adapter, then verifies with base weights (lossless).
+    ///
+    /// - Parameters:
+    ///   - adapterPath: PEFT adapter directory (`adapter_config.json` + `adapter_model.safetensors`).
+    ///   - blockSize: rows per draft/verify forward (`nil` = 8). A cycle commits 2...blockSize+1 tokens.
+    case uno(adapterPath: URL, blockSize: Int? = nil)
+
+    /// DeepSeek-V4.1 dSpark (`DSpark.swift`): the bundle's 3-stage MTP draft head in `dspark/`
+    /// drafts a block from the backbone's target-layer hidden; one verify forward per step, greedy
+    /// exact, wall-clock governed against AR. Runs inside `TokenIterator`; requests it cannot serve
+    /// exactly (sampling, logit processors, media) decode AR there.
+    ///
+    /// - Parameter drafterPath: the bundle's `dspark/` directory (holding `dspark.safetensors`).
+    case dspark(drafterPath: URL)
+
     /// Discriminator usable as a stable dictionary key / log label.
     /// Does not expose associated values.
     public var kindName: String {
@@ -122,6 +138,8 @@ public enum DraftStrategy: @unchecked Sendable {
         case .ddtree: return "ddtree"
         case .dflash2: return "dflash2"
         case .nativeMTP: return "native_mtp"
+        case .uno: return "uno"
+        case .dspark: return "dspark"
         }
     }
 
@@ -131,8 +149,26 @@ public enum DraftStrategy: @unchecked Sendable {
     public var usesBlockDiffusion: Bool {
         switch self {
         case .dflash, .ddtree: return true
-        case .none, .autoregressive, .nativeMTP, .dflash2: return false
+        case .none, .autoregressive, .nativeMTP, .dflash2, .uno, .dspark: return false
         }
+    }
+
+    /// True when this strategy runs IFM Uno self-speculation inside `TokenIterator`.
+    public var usesUno: Bool {
+        if case .uno = self { return true }
+        return false
+    }
+
+    /// True when this strategy runs DeepSeek-V4.1 dSpark inside `TokenIterator`.
+    public var usesDSpark: Bool {
+        if case .dspark = self { return true }
+        return false
+    }
+
+    /// The `dspark/` directory for the dSpark strategy.
+    public var dsparkDrafterPath: URL? {
+        if case .dspark(let path) = self { return path }
+        return nil
     }
 
     /// True when this strategy runs the DFlash 2 decode loop

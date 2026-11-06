@@ -17,7 +17,7 @@ import vMLXFluxKit
 // that flux/qwen/z-image use via MFluxStore. Typography has current fp8 live
 // proof; strict object-icon prompts have current fp8 and NF4 live proof.
 
-public final class Ideogram4: ImageGenerator, @unchecked Sendable {
+public final class Ideogram4: ImageGenerator, FluxAdapterPreparing, @unchecked Sendable {
     public static let _register: Void = {
         ModelRegistry.register(ModelEntry(
             name: "ideogram",
@@ -26,6 +26,7 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
             defaultSteps: 20,
             defaultGuidance: 7,
             supportsLoRA: true,
+            limits: { _ in NativeImageRequestContracts.ideogram },
             loader: { path, quant in
                 _ = Ideogram4._register
                 return try Ideogram4(modelPath: path, quantize: quant)
@@ -37,6 +38,13 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
     public let quantize: Int?
     public let loadedWeights: LoadedWeights
     private let store: MFluxStore
+    private var adapterPipeline: Ideogram4Pipeline?
+
+    public func prepareAdapterLayers() async throws {
+        if adapterPipeline == nil {
+            adapterPipeline = try await Ideogram4Pipeline(modelPath: modelPath, loadedWeights: loadedWeights)
+        }
+    }
 
     public init(modelPath: URL, quantize: Int?) throws {
         self.modelPath = modelPath
@@ -52,28 +60,41 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
     }
 
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
+        do { try NativeImageRequestContracts.ideogram.validate(request) }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
+        return AsyncThrowingStream { continuation in
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
+                    let seed = request.seed ?? UInt64.random(in: 0...UInt64(UInt32.max))
+                    let preview = ImagePreviewEmitter(interval: request.previewInterval, maxPixel: request.previewMaxPixel) { data, step in
+                        continuation.yield(.preview(pngData: data, step: step))
+                    }
+                    defer { preview?.close() }
                     guard request.steps > 0 else {
                         throw FluxError.invalidRequest("Ideogram steps must be greater than zero")
                     }
-                    let pipeline = try await Ideogram4Pipeline(
-                        modelPath: self.modelPath,
-                        loadedWeights: self.loadedWeights)
+                    let pipeline: Ideogram4Pipeline
+                    if let adapterPipeline { pipeline = adapterPipeline }
+                    else { pipeline = try await Ideogram4Pipeline(modelPath: self.modelPath, loadedWeights: self.loadedWeights) }
                     let image = try pipeline.generate(
                         prompt: request.prompt,
                         width: request.width,
                         height: request.height,
                         steps: request.steps,
                         guidance: request.guidance,
-                        seed: request.seed
+                        seed: seed, preview: preview
                     ) { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
+                    preview?.close()
+                    try FluxInterruptScope.check()
                     let outURL = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: "ideogram")
-                    continuation.yield(.completed(url: outURL, seed: request.seed ?? 0))
+                    continuation.yield(.completed(url: outURL, seed: seed,
+                        effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL, steps: request.steps, guidance: request.guidance, seed: seed, scheduler: "ideogram-logit-normal")))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)
@@ -147,19 +168,24 @@ enum Ideogram4BundleValidator {
             }
         }
 
+        // Resolve keys through MFluxStore so diffusers (`language_model.*`) and
+        // mflux-saved (prefix-free) text-encoder layouts both validate.
+        let store = MFluxStore(loaded)
         for component in requiredWeightsByComponent.keys.sorted() {
             guard let weights = loaded.componentWeights[component], !weights.isEmpty else {
                 reasons.append("missing \(component) component")
                 continue
             }
-            for key in requiredWeightsByComponent[component, default: []] where weights[key] == nil {
+            for key in requiredWeightsByComponent[component, default: []] where !store.hasKey(component, key) {
                 reasons.append("missing \(component) weight \(key)")
             }
             for prefix in requiredQuantizedLinearsByComponent[component, default: []] {
-                if hasFp8Linear(prefix, in: weights) || hasNF4Linear(prefix, in: weights) {
+                if hasFp8Linear(prefix, in: weights) || hasNF4Linear(prefix, in: weights)
+                    || hasGroupQuantLinear(prefix, in: weights)
+                {
                     continue
                 }
-                reasons.append("missing \(component) quant metadata for \(prefix) (fp8 weight_scale or bitsandbytes NF4 absmax/quant_map/state)")
+                reasons.append("missing \(component) quant metadata for \(prefix) (fp8 weight_scale, bitsandbytes NF4 absmax/quant_map/state, or MLX group scales)")
             }
         }
 
@@ -176,5 +202,10 @@ enum Ideogram4BundleValidator {
         weights["\(prefix).weight.absmax"] != nil &&
             weights["\(prefix).weight.quant_map"] != nil &&
             weights["\(prefix).weight.quant_state.bitsandbytes__nf4"] != nil
+    }
+
+    /// mflux `-q 4/8` saves: packed uint32 `weight` + `scales` (+ `biases`).
+    private static func hasGroupQuantLinear(_ prefix: String, in weights: [String: MLXArray]) -> Bool {
+        weights["\(prefix).weight"] != nil && weights["\(prefix).scales"] != nil
     }
 }

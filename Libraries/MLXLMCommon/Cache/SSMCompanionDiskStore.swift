@@ -498,7 +498,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         key: String, bytes: Int64, rc: Int32, countedBy ledger: DiskCache
     ) -> Bool {
         if let counted = ledger.countedCompanionBytes(key: key), counted >= bytes {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/ssm-store] index record failed rc=\(rc) key=\(key.prefix(12)) "
                     + "— already counted (\(counted) bytes), companion kept\n").utf8))
             return false
@@ -512,7 +512,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         validatedEntries.removeValue(forKey: key)
         lock.unlock()
         MLXDiskCacheIOLock.shared.unlock()
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[vmlx][cache/ssm-store] index record failed rc=\(rc) key=\(key.prefix(12)) — companion removed\n"
                 .utf8))
         return true
@@ -653,7 +653,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
                     kvHash: kvHash)
                 storeSkips += 1
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         "[vmlx][cache/ssm-store] SKIP validated key=\(key) boundary=\(boundary) states=\(ssmStates.count)\n".utf8))
                 }
                 outcome.record = SSMCompanionStoreRecord(
@@ -835,6 +835,12 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             }
             states.append(arr)
         }
+        // Materialize on the CPU stream before returning, as `DiskCache`
+        // does for the KV payload: the companion's lazy `Load`s otherwise
+        // join the engine's restore graph (`restoreSSMStates` seats them
+        // with GPU copies) and put the SSD read inside a Metal command
+        // buffer as a cross-stream wait.
+        MLX.eval(states)
 
         // Accepted/direct reads, not only repeated stores, make an entry hot.
         // Refresh both files to the same timestamp so quota observes the pair
@@ -961,7 +967,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         let named = Set(ledger?.companionsOldestFirst().map(\.key) ?? [])
         let stillOnDisk = removeQuotaEntries(hashes: named)
         ledger?.forgetCompanions(keys: named.subtracting(stillOnDisk))
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[vmlx][cache/ssm-store] clear skipped: the root's index is from a newer build — "
                 + "nothing is removed from a listing of \(cacheDir.lastPathComponent), only the "
                 + "\(named.count) companion(s) the index names\n").utf8))
@@ -1054,15 +1060,24 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
 
     // MARK: - Helpers
 
+    /// Size + mtime of a regular file, read with `lstat` every time.
+    ///
+    /// Not `URL.resourceValues(forKeys:)`: Foundation caches resource values
+    /// on the URL instance, so a second read through the same `URL` value
+    /// returns what the first read saw. `writeEntry` reads the fingerprint
+    /// before touching the pair and again right after, through the same
+    /// URL, and so recorded the PRE-touch mtime as the validated one while
+    /// the files already carried the new one. Every later check — a fresh
+    /// URL, the real mtime — then failed: the companion counted as neither
+    /// validated nor durable from its first re-store on, the next re-store
+    /// fell through to a full rewrite (which recorded a stale fingerprint
+    /// again), and `hasDurableDiskEntry` stopped suppressing the seed
+    /// production that the skip exists for.
     private func fileFingerprint(at url: URL) -> FileFingerprint? {
-        guard let values = try? url.resourceValues(forKeys: [
-            .contentModificationDateKey, .fileSizeKey,
-        ]),
-            let size = values.fileSize,
-            size > 0,
-            let modificationDate = values.contentModificationDate
+        guard case .regularFile(let size, let modified) = DiskCache.pathState(at: url),
+              size > 0
         else { return nil }
-        return FileFingerprint(size: size, modificationDate: modificationDate)
+        return FileFingerprint(size: Int(size), modificationDate: modified)
     }
 
     /// Touch a companion pair without changing either payload. Caller MUST

@@ -564,7 +564,7 @@ struct NemotronHOmniPreEncodedAudioTests {
     }
 
     @Test("Parakeet source weights transpose to MLX layouts")
-    func parakeetWeightRemapsTransposeToMLXLayouts() {
+    func parakeetWeightRemapsUseMLXLayouts() {
         FocusedMLXTestSupport.withLock {
             let conv2d: [String: MLXArray] = [
                 "sound_encoder.encoder.subsampling.layers.0.weight":
@@ -586,7 +586,7 @@ struct NemotronHOmniPreEncodedAudioTests {
 
     @Test("audio latency bench uses bundle generation defaults")
     func audioLatencyBenchUsesGenerationConfig() throws {
-        let path = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let path = FocusedMLXTestSupport.sourceURL("")
             .appending(path: "tools/OmniAudioLatencyBench/main.swift")
         let source = try String(contentsOf: path)
         #expect(source.contains(

@@ -16,6 +16,8 @@ public struct ModelEntry: Sendable {
     public let defaultSteps: Int
     public let defaultGuidance: Float
     public let supportsLoRA: Bool
+    /// Reads configuration only; must not load tensors or construct the model.
+    public let limits: (@Sendable (URL) throws -> FluxModelLimits)?
     /// Loader — constructs the concrete model from a local weights dir +
     /// optional quantization bits. Called from inside `FluxEngine` actor.
     public let loader: @Sendable (URL, Int?) async throws -> any FluxModel
@@ -27,6 +29,7 @@ public struct ModelEntry: Sendable {
         defaultSteps: Int,
         defaultGuidance: Float,
         supportsLoRA: Bool = false,
+        limits: (@Sendable (URL) throws -> FluxModelLimits)? = nil,
         loader: @Sendable @escaping (URL, Int?) async throws -> any FluxModel
     ) {
         self.name = name
@@ -35,6 +38,7 @@ public struct ModelEntry: Sendable {
         self.defaultSteps = defaultSteps
         self.defaultGuidance = defaultGuidance
         self.supportsLoRA = supportsLoRA
+        self.limits = limits
         self.loader = loader
     }
 }
@@ -78,7 +82,11 @@ public enum ModelRegistry {
         // Collapse `flux.1-schnell` → `flux1-schnell`.
         let collapsed = key.replacingOccurrences(of: ".", with: "")
                            .replacingOccurrences(of: "_", with: "-")
-        return lookup(name: collapsed)
+        if let entry = lookup(name: collapsed) { return entry }
+        // Bundle directory names (`Qwen-Image-2.1-mflux-8bit`, `ideogram-4-mflux-q4`)
+        // route through the same family rules the local store uses, so callers that
+        // resolve defaults by directory name get the family's steps/guidance.
+        return MLXStudioModelStore.canonicalName(for: name).flatMap { lookup(name: $0) }
     }
 
     /// Enumerate all registered models (for UI listing).

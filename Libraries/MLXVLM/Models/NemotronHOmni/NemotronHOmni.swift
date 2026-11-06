@@ -14,7 +14,9 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXNN
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 
 // MARK: - Configuration
 
@@ -48,6 +50,24 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
     public let videoContextTokenId: Int
     public let soundContextTokenId: Int
 
+    /// Bundle profile from `config_omni.json`, injected by the factory as
+    /// `_omni_*` keys. Nemotron-3-Nano-Omni ships a Parakeet audio tower and a
+    /// video path; the Nemotron 3.5 VL bundles (Bolt, Super-VL) are image-only
+    /// (`sound_config: null`, `video_context_token_id: null`). Absent keys keep
+    /// the Nano-Omni profile.
+    public let hasSound: Bool
+    public let hasVideo: Bool
+    /// `vision_projector.vision_final_layernorm` — present iff its tensors are
+    /// in the bundle (Nemotron 3.5 Super: HF creates it iff the LLM has an MTP
+    /// head; there is no config key). Applied per token after the cls strip and
+    /// BEFORE pixel shuffle. Skipping it is silent and wrong (up to 38.75 abs).
+    public let hasVisionFinalLayerNorm: Bool
+    public let visionLayerNormEps: Float
+    /// 3.5 bundles expand the chat template's own `<image>` markers in place
+    /// (`<img>` + N x `<image>` + `</img>`, no trailing newline), as the bundled
+    /// HF processor does; Nano-Omni keeps its prepended run.
+    public let expandsTemplateImageMarkers: Bool
+
     /// Non-nil when the bundle is JANGTQ-quantized — opts the LLM
     /// backbone's routed-expert switch_mlp into TurboQuantSwitchLinear
     /// instead of the affine SwitchLinear. Resolved at decode time
@@ -62,6 +82,15 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
     }
 
     enum WrapperKeys: String, CodingKey { case llmConfig = "llm_config" }
+
+    enum ProfileKeys: String, CodingKey {
+        case hasSound = "_omni_has_sound"
+        case hasVideo = "_omni_has_video"
+        case hasVisionFinalLayerNorm = "_omni_vision_final_layernorm"
+        case visionLayerNormEps = "_omni_vision_layer_norm_eps"
+        case imageContextTokenId = "_omni_img_context_token_id"
+        case visionNumClsTokens = "_omni_vision_num_cls_tokens"
+    }
 
     public init(from decoder: Decoder) throws {
         // Two bundle layouts carry the nemotron_h LLM config:
@@ -84,7 +113,14 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
         self.visionPatchSize = 16
         self.visionNumBlocks = 32
         self.visionNumHeads = 16
-        self.visionNumClsTokens = 10
+        let profile = try? decoder.container(keyedBy: ProfileKeys.self)
+        func flag(_ key: ProfileKeys) -> Bool? {
+            (try? profile?.decodeIfPresent(Bool.self, forKey: key)) ?? nil
+        }
+        func int(_ key: ProfileKeys) -> Int? {
+            (try? profile?.decodeIfPresent(Int.self, forKey: key)) ?? nil
+        }
+        self.visionNumClsTokens = int(.visionNumClsTokens) ?? 10
         self.visionMaxGrid = 128
         self.projectorHiddenSize = 20480
 
@@ -97,9 +133,22 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
         self.soundNumMelBins = 128
         self.soundSampleRate = 16000
 
-        self.imageContextTokenId = 18
+        self.imageContextTokenId = int(.imageContextTokenId) ?? 18
         self.videoContextTokenId = 131_081
         self.soundContextTokenId = 27
+        self.hasSound = flag(.hasSound) ?? true
+        self.hasVideo = flag(.hasVideo) ?? true
+        self.hasVisionFinalLayerNorm = flag(.hasVisionFinalLayerNorm) ?? false
+        self.visionLayerNormEps =
+            ((try? profile?.decodeIfPresent(Float.self, forKey: .visionLayerNormEps)) ?? nil) ?? 1e-6
+        self.expandsTemplateImageMarkers = !self.hasSound
+        if self.hasVisionFinalLayerNorm != (self.llmConfig.numNextnPredictLayers > 0) {
+            // HF builds the LN iff the LLM ships an MTP head. A bundle that
+            // disagrees is unusual, but the tensors are what the model computes
+            // with; say so instead of guessing.
+            RuntimeDiagnostics.write(Data(
+                "[NemotronHOmni] vision_final_layernorm present=\(self.hasVisionFinalLayerNorm) but num_nextn_predict_layers=\(self.llmConfig.numNextnPredictLayers); following the tensors\n".utf8))
+        }
 
         // Detect JANGTQ from the merged config.json (the factory layer
         // injects `weight_format` + `mxtq_bits` from `jang_config.json`
@@ -123,20 +172,49 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
 
 // MARK: - Multimodal model
 
-public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAModel {
+public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAModel,
+    TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
+    NemotronHBlockOutputTappable, PrefixCacheInvariantModel
+{
+    // MARK: - PrefixCacheInvariantModel
+
+    /// Nemotron-H is Mamba2 + full attention without rotary positions + MoE,
+    /// all causal; image embeddings are spliced only at the `<image>`
+    /// placeholder positions (`spliceMultimodal`), and nothing before the
+    /// first placeholder reads the media. Every KV/SSM state strictly before
+    /// that token is therefore the text-only prompt's state, so the text
+    /// turns' prefix rows are reused by image turns and vice versa.
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { true }
+
+    /// An exact token-prefix row of this model is the state a cold prefill of
+    /// those tokens produces (proven live: every ordinary turn restores the
+    /// stable seeds and the previous turn's stripped boundary, and the native
+    /// MTP capture test shows warm continuation equals cold). The suffix a
+    /// request appends — a forced tool-selection tail included — cannot
+    /// change it, so `freshRequiredToolSelection` keeps the longest-prefix
+    /// restore instead of re-prefilling the whole prompt.
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+
 
     @ModuleInfo(key: "language_model") private var languageModel: NemotronHModel
 
-    // Tower modules. The on-disk weights for these are fp16/bf16 (NOT
-    // quantized); sanitize() routes them through the remap helpers.
+    /// `NemotronHBlockOutputTappable`: forwarded to the language model's backbone.
+    public var blockOutputTap: NemotronHBlockOutputTap? {
+        get { languageModel.blockOutputTap }
+        set { languageModel.blockOutputTap = newValue }
+    }
+
+    // Tower modules may contain affine-quantized linears alongside fp16/bf16
+    // normalization tensors; sanitize() routes both through the remap helpers.
     //
     // NOTE: @ModuleInfo keys must be single-segment (no dots). Multi-level
     // namespaces from the bundle's safetensors keys are flattened by
     // sanitize() into one-segment paths that match these keys directly.
     @ModuleInfo(key: "vision_model") private var radioModel: NemotronHRADIOVisionModel
     @ModuleInfo(key: "mlp1") private var visionMLP: NemotronHVisionMLPProjector
-    @ModuleInfo(key: "sound_encoder") private var soundEncoder: NemotronHParakeetEncoder
-    @ModuleInfo(key: "sound_projection") private var soundProjection: NemotronHSoundProjector
+    @ModuleInfo(key: "sound_encoder") private var soundEncoder: NemotronHParakeetEncoder?
+    @ModuleInfo(key: "sound_projection") private var soundProjection: NemotronHSoundProjector?
+    @ModuleInfo(key: "vision_final_layernorm") private var visionFinalLayerNorm: LayerNorm?
 
     public let config: NemotronHOmniConfiguration
 
@@ -144,15 +222,21 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
     public var kvHeads: [Int] { languageModel.kvHeads }
     public var loraLayers: [Module] { languageModel.loraLayers }
 
-    public init(_ config: NemotronHOmniConfiguration) {
-        self.config = config
-
+    public convenience init(_ config: NemotronHOmniConfiguration) {
+        let languageModel: NemotronHModel
         if let jangtq = config.jangtqContext {
-            self._languageModel.wrappedValue = NemotronHModel(
-                jangtqContext: jangtq, configuration: config.llmConfig)
+            languageModel = NemotronHModel(jangtqContext: jangtq, configuration: config.llmConfig)
         } else {
-            self._languageModel.wrappedValue = NemotronHModel(config.llmConfig)
+            languageModel = NemotronHModel(config.llmConfig)
         }
+        self.init(config, languageModel: languageModel)
+    }
+
+    /// Wrap an already-constructed language model (Nemotron 3.5 Bolt: routed
+    /// blocks bound to mapped JANGH banks by `NemotronHJANGHPreparation`).
+    public init(_ config: NemotronHOmniConfiguration, languageModel: NemotronHModel) {
+        self.config = config
+        self._languageModel.wrappedValue = languageModel
         self._radioModel.wrappedValue = NemotronHRADIOVisionModel(
             embedDim: config.vitHiddenSize,
             numBlocks: config.visionNumBlocks,
@@ -169,16 +253,68 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             projectorDim: config.projectorHiddenSize,
             llmDim: config.llmConfig.hiddenSize)
 
-        self._soundEncoder.wrappedValue = NemotronHParakeetEncoder(
-            hiddenSize: config.soundHiddenSize,
-            numLayers: config.soundNumLayers,
-            numHeads: config.soundNumHeads,
-            ffHidden: config.soundFFHidden,
-            convKernel: config.soundConvKernel)
-        self._soundProjection.wrappedValue = NemotronHSoundProjector(
-            soundHidden: config.soundHiddenSize,
-            projectionHidden: config.soundProjectionHidden,
-            llmHidden: config.llmConfig.hiddenSize)
+        if config.hasSound {
+            self._soundEncoder.wrappedValue = NemotronHParakeetEncoder(
+                hiddenSize: config.soundHiddenSize,
+                numLayers: config.soundNumLayers,
+                numHeads: config.soundNumHeads,
+                ffHidden: config.soundFFHidden,
+                convKernel: config.soundConvKernel)
+            self._soundProjection.wrappedValue = NemotronHSoundProjector(
+                soundHidden: config.soundHiddenSize,
+                projectionHidden: config.soundProjectionHidden,
+                llmHidden: config.llmConfig.hiddenSize)
+        }
+        if config.hasVisionFinalLayerNorm {
+            self._visionFinalLayerNorm.wrappedValue = NemotronHVisionLayerNorm(
+                dimensions: config.vitHiddenSize, eps: config.visionLayerNormEps, affine: true,
+                bias: true)
+        }
+    }
+
+    // MARK: - Native MTP / staged verify (forwarded to the language model)
+
+    public var nativeMTPAvailable: Bool { languageModel.nativeMTPAvailable }
+
+    /// The wrapped text model, for load-time attachments (the LiLiCorr drafter).
+    public var nemotronLanguageModel: NemotronHModel { languageModel }
+
+    public func makeNativeMTPCache() -> [KVCache] { languageModel.makeNativeMTPCache() }
+
+    public func embed(_ tokenIds: MLXArray) -> MLXArray { languageModel.embed(tokenIds) }
+
+    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        languageModel.projectToLogits(hidden)
+    }
+
+    public func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?)
+        -> NativeMTPForwardResult
+    {
+        languageModel.nativeBackboneForward(inputs, cache: cache)
+    }
+
+    public func nativeBackboneMTPVerifyForward(_ inputs: MLXArray, cache: [KVCache]?)
+        -> NativeMTPForwardResult
+    {
+        languageModel.nativeBackboneMTPVerifyForward(inputs, cache: cache)
+    }
+
+    public func nativeMTPForward(
+        hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        languageModel.nativeMTPForward(
+            hiddenStates: hiddenStates, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    public func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool {
+        languageModel.commitVerifiedBlock(cache: cache, acceptedInputs: acceptedInputs)
+    }
+
+    public func commitStagedVerifiedBlock(
+        cache: [KVCache], acceptedInputs: Int, blockLength: Int
+    ) -> Bool {
+        languageModel.commitStagedVerifiedBlock(
+            cache: cache, acceptedInputs: acceptedInputs, blockLength: blockLength)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
@@ -190,6 +326,22 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         languageModel.callAsFunction(inputs, cache: cache)
     }
 
+    /// Text prefill chunk: the caller's value, except the library default
+    /// (`GenerateParameters.prefillStepSize` = 512, indistinguishable from "unset"), which becomes 2,048.
+    /// Measured on M5 Max, 5,506-token prompt, cold cache, interleaved x3 (RunBench BENCH_PREFILL_SWEEP):
+    /// Super-VL 451 / 508 / 550 / 577 tok/s and Bolt 568 / 625 / 656 / 670 tok/s at 512 / 1,024 / 2,048 /
+    /// 4,096. 2,048 keeps most of the gain (+22 % / +15 %) at half the transient chunk activations of 4,096
+    /// (Bolt targets 32-48 GB Macs) and matches the vMLX Python app's step. The SSM scan chunks itself, so
+    /// the O(L^2) segsum the chunking guards against stays bounded. `VMLX_NEMOTRON_PREFILL_STEP=<n>`
+    /// overrides both.
+    static func prefillStep(requested: Int?) -> Int {
+        if let raw = ProcessInfo.processInfo.environment["VMLX_NEMOTRON_PREFILL_STEP"], let n = Int(raw), n > 0 {
+            return n
+        }
+        guard let requested, requested != 512 else { return 2048 }
+        return requested
+    }
+
     /// VLM prepare — accepts LMInput with text + optional image / video /
     /// audio. Each non-text modality gets encoded by its tower and
     /// spliced into the token-embedding sequence at its placeholder
@@ -197,7 +349,17 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
+        try Task.checkCancellation()
         let convertedCache = cache.compactMap { $0 as KVCache }
+
+        if input.audio != nil, !config.hasSound {
+            throw NemotronHOmniMediaError.unsupported(
+                "audio input: this bundle has no audio encoder (config_omni.json sound_config is null)")
+        }
+        if input.video != nil, !config.hasVideo {
+            throw NemotronHOmniMediaError.unsupported(
+                "video input: this bundle's video path is not wired (config_omni.json video_context_token_id is null)")
+        }
 
         if input.image == nil && input.video == nil && input.audio == nil {
             // Text-only path. We deliberately return `.logits` (run the
@@ -229,7 +391,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             // instead of O(prompt_length²). We always return `.logits` so
             // the BatchEngine never re-axises this output and the .newAxis
             // trap stays dodged.
-            let prefillStepSize = windowSize ?? 512
+            let prefillStepSize = Self.prefillStep(requested: windowSize)
             let tokensShape = input.text.tokens.shape
             if tokensShape.count >= 2 && tokensShape[0] != 1 {
                 fatalError(
@@ -237,14 +399,18 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
                     + "got shape \(tokensShape).")
             }
             var flatTokens = input.text.tokens.reshaped([-1])
+            let promptSize = flatTokens.size
             while flatTokens.size > prefillStepSize {
+                try Task.checkCancellation()
                 let chunkTokens = flatTokens[..<prefillStepSize][.newAxis, 0...]
                 _ = languageModel.callAsFunction(
                     chunkTokens, cache: convertedCache)
                 MLX.eval(convertedCache)
                 flatTokens = flatTokens[prefillStepSize...]
+                PrefillProgressReporter.reportCompletedUnits(promptSize - flatTokens.size)
                 Memory.clearCache()
             }
+            try Task.checkCancellation()
             let lastChunk = flatTokens[.newAxis, 0...]
             let logits = languageModel.callAsFunction(
                 lastChunk, cache: convertedCache)
@@ -295,9 +461,16 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             // Use the pre-encoded embedding when the processor already
             // ran Parakeet (avoids re-encoding the same audio across
             // turns); otherwise encode the raw waveform now.
+            #if canImport(Accelerate)
             let audioEmbeds: MLXArray = audio.preEncodedEmbedding
                 ?? extractAudioEmbeds(waveformArray: audio.waveform,
                                       sampleRate: audio.sampleRate)
+            #else
+            guard let audioEmbeds = audio.preEncodedEmbedding else {
+                throw VLMError.processing(
+                    "Nemotron-H Omni audio input needs Accelerate, which this platform lacks.")
+            }
+            #endif
             spliced = spliceAtToken(
                 tokens: input.text.tokens,
                 inputsEmbeds: spliced,
@@ -330,14 +503,17 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         let sequenceLength = spliced.dim(1)
         var offset = 0
         while sequenceLength - offset > prefillStepSize {
+            try Task.checkCancellation()
             let end = offset + prefillStepSize
             let chunk = spliced[0..., offset..<end, 0...]
             _ = languageModel.callAsFunction(
                 inputsEmbeds: chunk, cache: convertedCache)
             MLX.eval(convertedCache)
             offset = end
+            PrefillProgressReporter.reportCompletedUnits(offset)
             Memory.clearCache()
         }
+        try Task.checkCancellation()
         let logits = languageModel.callAsFunction(
             inputsEmbeds: spliced[0..., offset..<sequenceLength, 0...],
             cache: convertedCache)
@@ -386,6 +562,11 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         var feats = radioModel(pixelValues, video: video)
         // Strip cls/register tokens (first numClsTokens)
         feats = feats[0..., config.visionNumClsTokens..., 0...]
+        // Nemotron 3.5 Super: per-token LayerNorm on the RADIO features before
+        // pixel shuffle (absent on Nano-Omni and Bolt).
+        if let visionFinalLayerNorm {
+            feats = visionFinalLayerNorm(feats)
+        }
         // Reshape (N, P, D) → (N, h, w, D) using the dynamic-resolution
         // patch grid from the actual pixel tensor. The source processor can
         // emit non-square images (for example 736x384), so sqrt(P) is not a
@@ -437,6 +618,9 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
     private func projectedVideoEmbedsByGroup(pixelValues: MLXArray) -> MLXArray {
         var feats = radioModel(pixelValues, video: true)
         feats = feats[0..., config.visionNumClsTokens..., 0...]
+        if let visionFinalLayerNorm {
+            feats = visionFinalLayerNorm(feats)
+        }
         let nGroups = feats.dim(0)
         let patches = feats.dim(1)
         let hidden = feats.dim(2)
@@ -480,6 +664,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             totalTokens: totalTokens)
     }
 
+    #if canImport(Accelerate)
     /// Run STFT + Parakeet + sound_projection on a mono waveform stored
     /// as an `MLXArray` (any rate; resampled to 16 kHz internally if
     /// necessary). Convenience wrapper around the [Float] form for
@@ -509,12 +694,16 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             waveform,
             sampleRate: config.soundSampleRate,
             nMels: config.soundNumMelBins)
+        guard let soundEncoder, let soundProjection else {
+            fatalError("NemotronHOmni.extractAudioEmbeds on a bundle without an audio encoder")
+        }
         var feats = soundEncoder(mel) // (1, F_sub, 1024)
         feats = soundProjection(feats) // (1, F_sub, llm_hidden)
         let f = feats.dim(1)
         let h = feats.dim(2)
         return feats.reshaped([f, h])
     }
+    #endif
 
     /// Splice `replacement` embeddings at every position where `tokens == tokenId`.
     /// Lengths must match. Returns embedding tensor of same shape as inputsEmbeds.
@@ -622,6 +811,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         var soundKeys = [String: MLXArray]()
         var mlp1Keys = [String: MLXArray]()
         var soundProjKeys = [String: MLXArray]()
+        var visionFinalLNKeys = [String: MLXArray]()
 
         for (k, v) in weights {
             if k.hasPrefix("vision_model.radio_model.") {
@@ -632,9 +822,15 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
                 mlp1Keys[k] = v
             } else if k.hasPrefix("sound_projection.") {
                 soundProjKeys[k] = v
-            } else if k.hasPrefix("vision_model.input_conditioner.") {
-                // Skip — preprocess applies CLIP norm.
+            } else if k.hasPrefix("vision_model.input_conditioner.")
+                || k == "vision_model.summary_idxs"
+            {
+                // Skip — preprocess applies CLIP norm; summary_idxs indexes
+                // RADIO's summary head, which the image path does not use.
                 continue
+            } else if k.hasPrefix("vision_projector.vision_final_layernorm.") {
+                visionFinalLNKeys[
+                    String(k.dropFirst("vision_projector.vision_final_layernorm.".count))] = v
             } else {
                 // Treat as LLM weight — strip any leading "language_model." so NemotronHModel.sanitize
                 // sees ROOT-level keys; the single "language_model." segment is re-added below. The
@@ -669,6 +865,9 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         for (k, v) in soundRemapped { out["sound_encoder.\(k)"] = v }
         for (k, v) in mlp1Remapped { out["mlp1.\(k)"] = v }
         for (k, v) in soundProjRemapped { out["sound_projection.\(k)"] = v }
+        if visionFinalLayerNorm != nil {
+            for (k, v) in visionFinalLNKeys { out["vision_final_layernorm.\(k)"] = v }
+        }
 
         return out
     }
@@ -686,6 +885,10 @@ public struct NemotronHOmniProcessorConfiguration: Codable, Sendable {
     public let downsampleRatio: Float
     public let useThumbnail: Bool
     public let videoPruningRate: Float
+    /// Injected by the VLM factory for image-only Omni bundles (Nemotron 3.5):
+    /// render the bundle template's own image parts and expand each `<image>`
+    /// in place, like the bundled `processing_nemotron_h_omni.py`.
+    public let expandsTemplateImageMarkers: Bool
 
     public init() {
         self.processorClass = nil
@@ -697,6 +900,7 @@ public struct NemotronHOmniProcessorConfiguration: Codable, Sendable {
         self.downsampleRatio = 0.5
         self.useThumbnail = true
         self.videoPruningRate = 0.7
+        self.expandsTemplateImageMarkers = false
     }
 
     public init(from decoder: Decoder) throws {
@@ -710,6 +914,8 @@ public struct NemotronHOmniProcessorConfiguration: Codable, Sendable {
         self.downsampleRatio = try c.decodeIfPresent(Float.self, forKey: .downsampleRatio) ?? 0.5
         self.useThumbnail = try c.decodeIfPresent(Bool.self, forKey: .useThumbnail) ?? true
         self.videoPruningRate = try c.decodeIfPresent(Float.self, forKey: .videoPruningRate) ?? 0.7
+        self.expandsTemplateImageMarkers =
+            try c.decodeIfPresent(Bool.self, forKey: .expandsTemplateImageMarkers) ?? false
     }
 
     enum CodingKeys: String, CodingKey {
@@ -722,9 +928,11 @@ public struct NemotronHOmniProcessorConfiguration: Codable, Sendable {
         case downsampleRatio = "downsample_ratio"
         case useThumbnail = "use_thumbnail"
         case videoPruningRate = "video_pruning_rate"
+        case expandsTemplateImageMarkers = "_omni_template_image_markers"
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct NemotronHOmniProcessor: UserInputProcessor {
     private let config: NemotronHOmniProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -846,6 +1054,9 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
+        if config.expandsTemplateImageMarkers {
+            return try prepareTemplateImageMarkers(input: input)
+        }
         // Build prompt with NVLM 1-D placeholders. After tile selection we
         // know N total tiles → expand 256 image tokens per tile (post pixel
         // shuffle 32×32 → 16×16). Audio takes a parallel placeholder
@@ -976,6 +1187,17 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         let promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
+        // These messages already contain the final image placeholder
+        // spans. Preserve exact template boundaries for recurrent cache reuse.
+        // Video EVS changes token positions in model.prepare, so its boundaries
+        // must continue to come from the post-prepare cache-key path.
+        // Audio remains outside this image-cache validation lane.
+        let cacheBoundaries = processedVideo == nil && processedAudio == nil
+            ? canonicalChatCacheBoundaries(
+                tokenizer: tokenizer, messages: messages, tools: input.tools,
+                additionalContext: input.additionalContext, promptTokens: promptTokens,
+                staticSystemPrefix: input.cacheStableSystemPrefix)
+            : CanonicalChatCacheBoundaries(all: [], stable: [])
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
 
@@ -987,7 +1209,122 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             mediaTokenIds: media.isEmpty
                 ? nil
                 : [Self.imageContextTokenId, Self.soundContextTokenId],
-            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            cachePrefixTokenCounts: cacheBoundaries.all,
+            cacheStablePrefixTokenCounts: cacheBoundaries.stable)
+    }
+
+    /// Nemotron 3.5 VL path. The bundle chat template renders one `<image>`
+    /// per image content part (with the Super template's `\n` after preceding
+    /// text and `<image k>` labels for several images); the HF processor then
+    /// expands each `<image>` to `<img>` + N x `<image>` + `</img>` with N the
+    /// image's post-shuffle token count. Expanding in id space keeps the
+    /// template's exact boundaries. Video and audio fail closed: these bundles
+    /// ship neither path.
+    private func prepareTemplateImageMarkers(input: UserInput) throws -> LMInput {
+        guard input.videos.isEmpty else {
+            throw NemotronHOmniMediaError.unsupported(
+                "video input: this bundle's video path is not wired")
+        }
+        guard input.audios.isEmpty else {
+            throw NemotronHOmniMediaError.unsupported(
+                "audio input: this bundle has no audio encoder")
+        }
+
+        var processedImage: LMInput.ProcessedImage?
+        var tokenCounts: [Int] = []
+        if !input.images.isEmpty {
+            let ciImages = try input.images.map { try $0.asCIImage() }
+            let (pixels, counts, dims) = try preprocess(images: ciImages)
+            processedImage = LMInput.ProcessedImage(
+                pixels: pixels, frames: dims.map { THW(1, $0.h, $0.w) })
+            tokenCounts = counts
+        }
+
+        let messages = Self.structuredMessages(from: input)
+        let rendered = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools,
+            additionalContext: input.additionalContext)
+
+        let imageId = Self.imageContextTokenId
+        let markerCount = rendered.lazy.filter { $0 == imageId }.count
+        guard markerCount == tokenCounts.count else {
+            throw NemotronHOmniMediaError.placeholderMismatch(
+                "chat template rendered \(markerCount) <image> markers for \(tokenCounts.count) images")
+        }
+        var promptTokens = rendered
+        if !tokenCounts.isEmpty {
+            guard let startId = tokenizer.convertTokenToId("<img>"),
+                let endId = tokenizer.convertTokenToId("</img>")
+            else {
+                throw NemotronHOmniMediaError.placeholderMismatch("tokenizer has no <img>/</img> tokens")
+            }
+            promptTokens = []
+            promptTokens.reserveCapacity(rendered.count + tokenCounts.reduce(0, +) + 2 * tokenCounts.count)
+            var next = 0
+            for token in rendered {
+                if token == imageId {
+                    promptTokens.append(startId)
+                    promptTokens.append(contentsOf: repeatElement(imageId, count: tokenCounts[next]))
+                    promptTokens.append(endId)
+                    next += 1
+                } else {
+                    promptTokens.append(token)
+                }
+            }
+        }
+
+        // Boundaries are found on the unexpanded rendering, then shifted by
+        // the expansion that precedes each one.
+        let raw = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer, messages: messages, tools: input.tools,
+            additionalContext: input.additionalContext, promptTokens: rendered,
+            staticSystemPrefix: input.cacheStableSystemPrefix)
+        func expanded(_ boundary: Int) -> Int {
+            var shift = 0
+            var seen = 0
+            for (index, token) in rendered.enumerated() where index < boundary && token == imageId {
+                shift += tokenCounts[seen] + 1
+                seen += 1
+            }
+            return boundary + shift
+        }
+        let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
+        return LMInput(
+            text: .init(
+                tokens: promptArray, mask: ones(like: promptArray).asType(.int8),
+                tokenIds: promptTokens),
+            image: processedImage,
+            mediaTokenIds: tokenCounts.isEmpty ? nil : [imageId],
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            cachePrefixTokenCounts: raw.all.map(expanded),
+            cacheStablePrefixTokenCounts: raw.stable.map(expanded))
+    }
+
+    /// Messages with image content parts in place, so the bundle template
+    /// decides where each `<image>` goes. A chat message's images precede its
+    /// text (how hosts attach them); raw message dictionaries keep their parts.
+    private static func structuredMessages(from input: UserInput) -> [Message] {
+        switch input.prompt {
+        case .text(let text):
+            return [["role": "user", "content": text]]
+        case .chat(let chat):
+            return chat.map { message in
+                var dict = defaultMessageDict(for: message)
+                if !message.images.isEmpty {
+                    var parts: [[String: any Sendable]] = message.images.map { _ in
+                        ["type": "image"]
+                    }
+                    if !message.content.isEmpty {
+                        parts.append(["type": "text", "text": message.content])
+                    }
+                    dict["content"] = parts
+                }
+                return dict
+            }
+        case .messages(let rawMessages):
+            return rawMessages
+        }
     }
 
     private static func textOnlyMessages(from input: UserInput) -> [Message] {
@@ -1157,5 +1494,48 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             }.joined(separator: "\n")
         }
         return value.map { String(describing: $0) } ?? ""
+    }
+}
+#endif
+
+public enum NemotronHOmniMediaError: Error, LocalizedError, CustomStringConvertible {
+    case unsupported(String)
+    case placeholderMismatch(String)
+
+    public var description: String {
+        switch self {
+        case .unsupported(let what): return "Unsupported \(what)"
+        case .placeholderMismatch(let what): return "Image placeholder mismatch: \(what)"
+        }
+    }
+
+    public var errorDescription: String? { description }
+}
+
+extension NemotronHOmni: SafetensorsLoadKeyExcluding {
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        languageModel.excludeFromGenericSafetensorsLoad(key: key)
+    }
+
+    public var requiresExactTensorMmapBuffers: Bool { languageModel.requiresExactTensorMmapBuffers }
+}
+
+extension NemotronHOmni: NativeMTPBlockDraftModel {
+    public var nativeMTPUsesBlockDrafts: Bool { nemotronLanguageModel.nativeMTPUsesBlockDrafts }
+    public var nativeMTPBlockDraftDepthLimit: Int { nemotronLanguageModel.nativeMTPBlockDraftDepthLimit }
+    public var nativeMTPBlockDraftVocabularySize: Int {
+        nemotronLanguageModel.nativeMTPBlockDraftVocabularySize
+    }
+    public func nativeMTPBlockDraft(nextToken: MLXArray, depth: Int, targetCache: [KVCache]) -> MLXArray {
+        nemotronLanguageModel.nativeMTPBlockDraft(
+            nextToken: nextToken, depth: depth, targetCache: targetCache)
+    }
+}
+
+extension NemotronHOmni: NativeMTPAutoregressiveBackboneModel {
+    public func nativeAutoregressiveBackboneForward(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        nemotronLanguageModel.nativeAutoregressiveBackboneForward(inputs, cache: cache)
     }
 }

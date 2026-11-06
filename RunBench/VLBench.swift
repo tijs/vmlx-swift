@@ -22,6 +22,19 @@ import MLXVLM
 /// 7. Reports decode tok/s + first decoded text per turn
 enum VLBench {
 
+    private static func bundleParameters(context: ModelContext, maxTokens: Int) -> GenerateParameters {
+        let seed = ProcessInfo.processInfo.environment["BENCH_VL_SEED"].flatMap(UInt64.init)
+        var parameters = GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: GenerateParameters(maxTokens: maxTokens, randomSeed: seed, prefillStepSize: 512))
+        parameters.maxTokens = maxTokens
+        parameters.randomSeed = seed
+        print("Sampling: source=bundle-defaults temperature=\(parameters.temperature) " +
+              "topP=\(parameters.topP) topK=\(parameters.topK) " +
+              "repetitionPenalty=\(String(describing: parameters.repetitionPenalty)) thinking=template-default")
+        return parameters
+    }
+
     /// Load through the same mmap-backed policy Osaurus uses in production.
     /// The plain `loadModel(from:using:)` overload bypasses that policy and
     /// copies safetensors into anonymous storage, which makes VL memory gates
@@ -31,7 +44,7 @@ enum VLBench {
             from: modelDir,
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: .osaurusProduction)
-        return loaded.0
+        return loaded
     }
 
     static func run(modelPath: String, maxNewTokens: Int) async throws {
@@ -111,9 +124,7 @@ enum VLBench {
             let label = compileOn ? "compile ON" : "compile OFF"
             print("\n[\(label)] BatchEngine VL 2-turn chat")
 
-            var params = GenerateParameters(
-                maxTokens: maxNewTokens, temperature: 0,
-                prefillStepSize: 512)
+            var params = bundleParameters(context: context, maxTokens: maxNewTokens)
             params.enableCompiledBatchDecode = compileOn
 
             let engine = BatchEngine(context: ctx, maxBatchSize: 1)
@@ -167,8 +178,7 @@ enum VLBench {
         print("  \(label) [\(parameters.enableCompiledBatchDecode ? "compile" : "uncomp")]:")
         let t0 = CFAbsoluteTimeGetCurrent()
 
-        var userInput = UserInput(prompt: prompt, images: [.ciImage(image)])
-        userInput.additionalContext = ["enable_thinking": false]
+        let userInput = UserInput(prompt: prompt, images: [.ciImage(image)])
         let lmInput = try await context.processor.prepare(input: userInput)
         if (ProcessInfo.processInfo.environment["BENCH_VL_DEBUG_PROMPT"] ?? "0") == "1" {
             let ids = lmInput.text.tokenIds ?? []
@@ -199,6 +209,8 @@ enum VLBench {
         let stream = await engine.generate(input: sendable, parameters: parameters)
 
         var text = ""
+        var reasoning = ""
+        var unclosedReasoning = false
         var ttft: Double?
         var chunkCount = 0
         var generationTokens = 0
@@ -222,7 +234,10 @@ enum VLBench {
                 promptTokensPerSecond = info.promptTokensPerSecond
                 decodeTokensPerSecond = info.tokensPerSecond
                 stopReason = String(describing: info.stopReason)
-            case .reasoning, .toolCall, .toolCallProgress:
+                unclosedReasoning = info.unclosedReasoning
+            case .reasoning(let chunk):
+                reasoning += chunk
+            case .toolCall, .toolCallProgress:
                 break
             }
         }
@@ -238,6 +253,14 @@ enum VLBench {
             stopReason, rssAfter, footprintAfter, rssAfter - rssBefore,
             footprintAfter - footprintBefore))
         print("    \"\(preview)\"")
+
+        print("    FULL_REASONING \(reasoning.debugDescription)")
+        print("    FULL_TEXT \(text.debugDescription)")
+        guard stopReason == "stop", !unclosedReasoning else {
+            throw NSError(domain: "VLBench", code: 20,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "Incomplete media generation: stop=\(stopReason) unclosedReasoning=\(unclosedReasoning)"])
+        }
 
         let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard chunkCount > 0, !visible.isEmpty else {
@@ -383,9 +406,7 @@ enum VLBench {
 
         nonisolated(unsafe) let ctx = context
 
-        let params = GenerateParameters(
-            maxTokens: maxNewTokens, temperature: 0,
-            prefillStepSize: 512)
+        let params = bundleParameters(context: context, maxTokens: maxNewTokens)
 
         let engine = BatchEngine(context: ctx, maxBatchSize: 1)
 
@@ -397,13 +418,9 @@ enum VLBench {
             let turnLabel = "Turn \(i + 1)"
             print("  \(turnLabel):")
             let t0 = CFAbsoluteTimeGetCurrent()
-            // enable_thinking=false so the token budget goes to visible
-            // content, not chain-of-thought. Without this, Qwen 3.x
-            // defaults to thinking-on and a 256-token budget gets spent
-            // entirely inside `<think>...</think>` before any answer.
-            var userInput = UserInput(
+            // Omit thinking overrides: preserve the bundle template contract.
+            let userInput = UserInput(
                 prompt: prompt, videos: [.url(videoURL)])
-            userInput.additionalContext = ["enable_thinking": false]
             let lmInput: LMInput
             do {
                 lmInput = try await ctx.processor.prepare(input: userInput)
@@ -420,6 +437,8 @@ enum VLBench {
                 input: sendable, parameters: params)
 
             var text = ""
+            var reasoning = ""
+            var unclosedReasoning = false
             var chunkCount = 0
             var reasoningCount = 0
             var ttft: Double?
@@ -433,13 +452,15 @@ enum VLBench {
                     if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
                     text += c
                     chunkCount += 1
-                case .reasoning:
+                case .reasoning(let chunk):
+                    reasoning += chunk
                     reasoningCount += 1
                 case .info(let info):
                     generationTokens = info.generationTokenCount
                     promptTokensPerSecond = info.promptTokensPerSecond
                     decodeTokensPerSecond = info.tokensPerSecond
                     stopReason = String(describing: info.stopReason)
+                    unclosedReasoning = info.unclosedReasoning
                 case .prefillProgress, .toolCall, .toolCallProgress:
                     break
                 }
@@ -457,6 +478,14 @@ enum VLBench {
                 generationTokens, promptTokensPerSecond, decodeTokensPerSecond,
                 stopReason, footprint))
             print("    \"\(preview)\"")
+
+            print("    FULL_REASONING \(reasoning.debugDescription)")
+            print("    FULL_TEXT \(text.debugDescription)")
+            guard stopReason == "stop", !unclosedReasoning else {
+                throw NSError(domain: "VLBench", code: 20,
+                              userInfo: [NSLocalizedDescriptionKey:
+                                "Incomplete media generation: stop=\(stopReason) unclosedReasoning=\(unclosedReasoning)"])
+            }
 
             let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard chunkCount > 0, !visible.isEmpty else {
@@ -499,6 +528,135 @@ enum VLBench {
         }
 
         print("=== VLBench VIDEO BATCH done ===")
+    }
+
+    // MARK: - Image smoke (real file, three connected turns)
+
+    /// Three connected turns through the production processor + BatchEngine:
+    ///   T1 image + prompt (thinking as given), T2 text-only follow-up with T1 in history,
+    ///   T3 the same image again with thinking flipped. Prints TTFT, prompt tok/s, decode tok/s and
+    /// the full visible/reasoning text of every turn; fails on an incomplete generation, a leaked
+    /// `<think>` marker or an empty answer.
+    static func runImageSmoke(
+        modelPath: String, imagePath: String, prompt: String, followUp: String, thinking: Bool,
+        temperature: Float, maxNewTokens: Int
+    ) async throws {
+        let modelDir = URL(fileURLWithPath: modelPath)
+        print("=== VLBench IMAGE SMOKE — \(modelDir.lastPathComponent) ===")
+        guard let image = CIImage(contentsOf: URL(fileURLWithPath: imagePath)) else {
+            throw NSError(domain: "VLBench", code: 30,
+                          userInfo: [NSLocalizedDescriptionKey: "cannot load image \(imagePath)"])
+        }
+        print("image: \(imagePath) extent=\(Int(image.extent.width))x\(Int(image.extent.height))")
+
+        let loadStart = CFAbsoluteTimeGetCurrent()
+        let context = try await loadProductionContext(from: modelDir)
+        print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
+        print("Model: \(type(of: context.model))")
+        print("Processor: \(type(of: context.processor))")
+        if let bearing = context.model as? ModalityBearing {
+            print("Modalities: \(bearing.modalities.modalityDescription)")
+        }
+        nonisolated(unsafe) let ctx = context
+        let engine = BatchEngine(context: ctx, maxBatchSize: 1)
+        var params = GenerateParameters(maxTokens: maxNewTokens, temperature: temperature, prefillStepSize: 512)
+        params.maxTokens = maxNewTokens
+        print("Sampling: temperature=\(params.temperature) maxTokens=\(maxNewTokens) thinking(T1)=\(thinking)")
+
+        var history: [Chat.Message] = []
+        let turns: [(label: String, chat: [Chat.Message], thinking: Bool)] = [
+            ("T1 image thinking=\(thinking)", [.user(prompt, images: [.ciImage(image)])], thinking),
+        ]
+        var answers: [String] = []
+        for (label, chat, think) in turns {
+            history = chat
+            answers.append(try await runSmokeTurn(label: label, engine: engine, ctx: ctx, chat: history, thinking: think, params: params))
+        }
+        history.append(.assistant(answers[0]))
+        history.append(.user(followUp))
+        answers.append(try await runSmokeTurn(
+            label: "T2 text follow-up thinking=\(thinking)", engine: engine, ctx: ctx, chat: history,
+            thinking: thinking, params: params))
+        history.append(.assistant(answers[1]))
+        history.append(.user("Look at the image once more. " + prompt, images: [.ciImage(image)]))
+        answers.append(try await runSmokeTurn(
+            label: "T3 image again thinking=\(!thinking)", engine: engine, ctx: ctx, chat: history,
+            thinking: !thinking, params: params))
+        print("\n=== VLBench IMAGE SMOKE done ===")
+    }
+
+    private static func runSmokeTurn(
+        label: String, engine: BatchEngine, ctx: ModelContext, chat: [Chat.Message], thinking: Bool,
+        params: GenerateParameters
+    ) async throws -> String {
+        print("\n[\(label)]")
+        var input = UserInput(chat: chat)
+        input.additionalContext = ["enable_thinking": thinking]
+        let prepStart = CFAbsoluteTimeGetCurrent()
+        let lmInput = try await ctx.processor.prepare(input: input)
+        let prepMs = (CFAbsoluteTimeGetCurrent() - prepStart) * 1000
+        let ids = lmInput.text.tokenIds ?? []
+        let imageId = ctx.tokenizer.convertTokenToId("<|image_pad|>") ?? -1
+        print(String(format: "  prepare(): %.0fms tokens=%d image_pads=%d pixels=%@ frames=%@",
+            prepMs, ids.count, ids.filter { $0 == imageId }.count,
+            lmInput.image?.pixels.shape.description ?? "nil",
+            lmInput.image?.frames?.map { "\($0.h)x\($0.w)" }.joined(separator: ",") ?? "nil"))
+        let t0 = CFAbsoluteTimeGetCurrent()
+        nonisolated(unsafe) let sendable = lmInput
+        let stream = await engine.generate(input: sendable, parameters: params)
+        var text = ""
+        var reasoning = ""
+        var ttft: Double?
+        var generationTokens = 0
+        var promptTokensPerSecond = 0.0
+        var decodeTokensPerSecond = 0.0
+        var promptTime = 0.0
+        var stopReason = "unknown"
+        var unclosedReasoning = false
+        for await event in stream {
+            switch event {
+            case .chunk(let chunk):
+                if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
+                text += chunk
+            case .reasoning(let chunk):
+                if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
+                reasoning += chunk
+            case .info(let info):
+                generationTokens = info.generationTokenCount
+                promptTokensPerSecond = info.promptTokensPerSecond
+                decodeTokensPerSecond = info.tokensPerSecond
+                promptTime = info.promptTime
+                stopReason = String(describing: info.stopReason)
+                unclosedReasoning = info.unclosedReasoning
+            case .prefillProgress, .toolCall, .toolCallProgress:
+                break
+            }
+        }
+        let total = CFAbsoluteTimeGetCurrent() - t0
+        print(String(format:
+            "  TTFT %dms total %.2fs promptTime %.2fs promptTok/s=%.1f genTokens=%d decodeTok/s=%.1f stop=%@ unclosedReasoning=%@",
+            Int((ttft ?? 0) * 1000), total, promptTime, promptTokensPerSecond, generationTokens,
+            decodeTokensPerSecond, stopReason, unclosedReasoning ? "true" : "false"))
+        print("  FULL_REASONING \(reasoning.debugDescription)")
+        print("  FULL_TEXT \(text.debugDescription)")
+        guard stopReason == "stop", !unclosedReasoning else {
+            throw NSError(domain: "VLBench", code: 31,
+                          userInfo: [NSLocalizedDescriptionKey: "\(label): incomplete generation stop=\(stopReason) unclosedReasoning=\(unclosedReasoning)"])
+        }
+        let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !visible.isEmpty else {
+            throw NSError(domain: "VLBench", code: 32,
+                          userInfo: [NSLocalizedDescriptionKey: "\(label): empty visible answer"])
+        }
+        if let marker = ["<think>", "</think>", "<|image_pad|>", "<image>", "</image>", "<slice>"].first(where: { visible.contains($0) }) {
+            throw NSError(domain: "VLBench", code: 33,
+                          userInfo: [NSLocalizedDescriptionKey: "\(label): leaked marker \(marker)"])
+        }
+        if !thinking, !reasoning.isEmpty {
+            throw NSError(domain: "VLBench", code: 34,
+                          userInfo: [NSLocalizedDescriptionKey: "\(label): reasoning deltas with thinking off"])
+        }
+        return text
     }
 
     // MARK: - Mixed-variable multi-turn matrix (2026-04-22)
@@ -697,8 +855,7 @@ enum VLBench {
             postLoadRSS, postLoadFootprint, postLoadRSS - preLoadRSS,
             postLoadFootprint - preLoadFootprint))
 
-        let params = GenerateParameters(
-            maxTokens: maxNewTokens, temperature: 0, prefillStepSize: 512)
+        let params = bundleParameters(context: context, maxTokens: maxNewTokens)
         let coordinator = makeProofCoordinator(
             modelDir: modelDir, context: context, parameters: params,
             label: "media-salt")
@@ -733,8 +890,14 @@ enum VLBench {
         let genStart = CFAbsoluteTimeGetCurrent()
         let (_, streamA) = await engine.submit(input: sendA, parameters: params)
         var genA = 0
+        var generatedIDs: [Int] = []
+        var completion: GenerateCompletionInfo?
         for await event in streamA {
-            if case .token = event { genA += 1 }
+            if case .token(let id) = event {
+                genA += 1
+                generatedIDs.append(id)
+            }
+            if case .info(let info) = event { completion = info }
             peakRSS = max(peakRSS, currentRSSMiB())
             peakFootprint = max(peakFootprint, currentPhysFootprintMiB())
         }
@@ -742,6 +905,15 @@ enum VLBench {
         print(String(format:
             "  Turn 1 (store): generated %d tokens at %.2f tok/s with image A",
             genA, Double(genA) / genSeconds))
+
+        print("  RAW_PROTOCOL_TEXT \(context.tokenizer.decode(tokenIds: generatedIDs).debugDescription)")
+        guard let completion, completion.stopReason == .stop,
+              completion.generationTokenCount > 0, completion.tokensPerSecond > 0 else {
+            throw NSError(domain: "VLBenchMediaSalt", code: 20,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "Missing telemetry or non-natural media-salt generation stop"])
+        }
+        print("  completion stop=\(completion.stopReason) decodeTok/s=\(completion.tokensPerSecond)")
 
         // Probe 1: same prompt + same image A → must HIT.
         let probeHit = coordinator.fetch(tokens: tokensA, mediaSalt: saltA)
@@ -823,6 +995,130 @@ enum VLBench {
             }
         }
         return Double(total) / (1024.0 * 1024.0)
+    }
+
+    /// Bundle-default, parsed generation through cold, restored, changed-media
+    /// and growing-history requests. Video mode requires two actual file paths.
+    static func runMediaCacheProof(modelPath: String, maxNewTokens: Int) async throws {
+        let env = ProcessInfo.processInfo.environment
+        let dir = URL(fileURLWithPath: modelPath)
+        let context = try await loadProductionContext(from: dir)
+        let params = bundleParameters(context: context, maxTokens: maxNewTokens)
+        let coordinator = makeProofCoordinator(
+            modelDir: dir, context: context, parameters: params, label: "media-replay")
+        nonisolated(unsafe) let ctx = context
+        let engine = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
+        let isVideo = env["BENCH_MEDIA_VIDEO_A"] != nil
+        let prompt = isVideo
+            ? "Describe the video in one sentence."
+            : "Describe the image in one sentence."
+        func mediaMessage(changed: Bool) throws -> Chat.Message {
+            if isVideo {
+                let key = changed ? "BENCH_MEDIA_VIDEO_B" : "BENCH_MEDIA_VIDEO_A"
+                guard let path = env[key], FileManager.default.fileExists(atPath: path) else {
+                    throw NSError(domain: "MediaCacheProof", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Missing video fixture: \(key)"])
+                }
+                return .user(prompt, videos: [.url(URL(fileURLWithPath: path))])
+            }
+            return .user(prompt, images: [.ciImage(try synthesiseGradientImage(side: 224, invert: changed))])
+        }
+        func prepare(_ chat: [Chat.Message]) async throws -> LMInput {
+            try await ctx.processor.prepare(input: UserInput(chat: chat))
+        }
+        func hitCount() -> Int {
+            let stats = coordinator.snapshotStats()
+            return (stats.diskStats?.hits ?? 0) + (stats.pagedStats?.cacheHits ?? 0)
+        }
+        func probe(_ input: LMInput, expectHit: Bool, label: String) throws {
+            let rawTokens = input.text.tokens.reshaped(-1).asArray(Int.self)
+            let salt = computeCacheSalt(for: input, parameters: params)
+            let tokens = coordinator.resolvePostPrepareCacheKeyAlias(
+                rawTokens: rawTokens, mediaSalt: salt) ?? rawTokens
+            print("MEDIA_KEY \(label) raw=\(rawTokens.count) effective=\(tokens.count)")
+            guard input.hasMediaContent, salt != nil else {
+                throw NSError(domain: "MediaCacheProof", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Missing media payload or cache salt"])
+            }
+            switch coordinator.fetch(tokens: tokens, mediaSalt: salt) {
+            case .hit(let matched, _, let detail, let blocks, _, let arrays):
+                coordinator.release(blocks: blocks)
+                print("MEDIA_PROBE \(label) hit=\(detail.rawValue) matched=\(matched)/\(tokens.count) arrays=\(arrays?.count ?? 0)")
+                guard expectHit, matched > 0 else {
+                    throw NSError(domain: "MediaCacheProof", code: 3,
+                        userInfo: [NSLocalizedDescriptionKey: "Unexpected media cache hit"])
+                }
+            case .miss:
+                print("MEDIA_PROBE \(label) miss")
+                guard !expectHit else {
+                    throw NSError(domain: "MediaCacheProof", code: 4,
+                        userInfo: [NSLocalizedDescriptionKey: "Expected media cache restore missed"])
+                }
+            }
+        }
+        func generate(_ input: sending LMInput, label: String, requireHit: Bool) async throws -> String {
+            let hitsBefore = hitCount()
+            let stream = await engine.generate(input: input, parameters: params)
+            var text = ""
+            var reasoning = ""
+            var info: GenerateCompletionInfo?
+            var firstPrefill: PrefillProgress?
+            for await event in stream {
+                switch event {
+                case .chunk(let delta): text += delta
+                case .reasoning(let delta): reasoning += delta
+                case .info(let value): info = value
+                case .prefillProgress(let progress):
+                    if progress.stage == .prefill, firstPrefill == nil {
+                        firstPrefill = progress
+                    }
+                    if progress.stage == .cacheRestore {
+                        print("MEDIA_RESTORE \(label) completed=\(progress.completedUnitCount)/\(progress.totalUnitCount) detail=\(progress.detail ?? "none")")
+                    }
+                default: break
+                }
+            }
+            let stats = coordinator.snapshotStats()
+            let hitDelta = hitCount() - hitsBefore
+            print("MEDIA_FULL_TEXT \(label) \(text.debugDescription)")
+            print("MEDIA_FULL_REASONING \(label) \(reasoning.debugDescription)")
+            print("MEDIA_CACHE \(label) hitsDuringGeneration=\(hitDelta) paged=\(stats.pagedEnabled) disk=\(stats.diskEnabled) hybrid=\(stats.isHybrid) pagedIncompatible=\(stats.isPagedIncompatible) ssmHits=\(stats.ssmStats.hits)")
+            print("MEDIA_PREFILL \(label) firstCompleted=\(firstPrefill?.completedUnitCount ?? -1) total=\(firstPrefill?.totalUnitCount ?? -1)")
+            guard let info else {
+                throw NSError(domain: "MediaCacheProof", code: 5,
+                    userInfo: [NSLocalizedDescriptionKey: "Missing completion telemetry"])
+            }
+            print("MEDIA_COMPLETION \(label) stop=\(info.stopReason) tokens=\(info.generationTokenCount) tokps=\(info.tokensPerSecond) promptSeconds=\(info.promptTime) footprintMiB=\(currentPhysFootprintMiB()) unclosed=\(info.unclosedReasoning)")
+            guard info.stopReason == .stop, !info.unclosedReasoning,
+                  info.tokensPerSecond > 0, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !requireHit || hitDelta > 0 else {
+                throw NSError(domain: "MediaCacheProof", code: 6,
+                    userInfo: [NSLocalizedDescriptionKey: "Incomplete generation or absent live cache restore"])
+            }
+            for marker in ["<think>", "</think>", "<|channel>", "<channel|>", "<|im_start|>"] {
+                guard !text.contains(marker) else {
+                    throw NSError(domain: "MediaCacheProof", code: 7,
+                        userInfo: [NSLocalizedDescriptionKey: "Visible protocol marker: \(marker)"])
+                }
+            }
+            return text
+        }
+        let base: [Chat.Message] = [try mediaMessage(changed: false)]
+        // Each stream drains fully before the shared processor is used again.
+        nonisolated(unsafe) let cold = try await prepare(base)
+        let first = try await generate(cold, label: "cold", requireHit: false)
+        nonisolated(unsafe) let replay = try await prepare(base)
+        try probe(replay, expectHit: true, label: "same-media")
+        _ = try await generate(replay, label: "replay", requireHit: true)
+        let changed = try await prepare([mediaMessage(changed: true)])
+        try probe(changed, expectHit: false, label: "changed-media")
+        _ = try await generate(changed, label: "changed-media", requireHit: false)
+        let follow = try await prepare(base + [
+            .assistant(first), .user("What colors were in the media I first showed you?")])
+        try probe(follow, expectHit: true, label: "follow-up")
+        _ = try await generate(follow, label: "follow-up", requireHit: true)
+        await engine.shutdown()
+        print("=== Media cache proof completed; inspect full answers for grounding ===")
     }
 
     // MARK: - Cross-engine byte-identity on VL (iter 47)
@@ -1087,12 +1383,11 @@ enum VLBench {
                 from: modelDir,
                 using: #huggingFaceTokenizerLoader(),
                 loadConfiguration: LoadConfiguration(
-                    jangPress: .disabled,
-                    maxResidentBytes: .unlimited,
+                        maxResidentBytes: .unlimited,
                     memoryLimit: .unlimited,
                     useMmapSafetensors: true,
                     nativeMTP: true))
-            context = loaded.0
+            context = loaded
         } else {
             context = try await loadProductionContext(from: modelDir)
         }
@@ -1529,12 +1824,11 @@ enum VLBench {
                 from: modelDir,
                 using: #huggingFaceTokenizerLoader(),
                 loadConfiguration: LoadConfiguration(
-                    jangPress: .disabled,
-                    maxResidentBytes: .unlimited,
+                        maxResidentBytes: .unlimited,
                     memoryLimit: .unlimited,
                     useMmapSafetensors: true,
                     nativeMTP: true))
-            context = loaded.0
+            context = loaded
         } else {
             context = try await loadProductionContext(from: modelDir)
         }
@@ -1547,6 +1841,20 @@ enum VLBench {
         if let nativeMTPDepth {
             params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
         }
+        // `BENCH_VL_DFLASH2=1` runs the same shapes with the bundle's DFlash 2 drafter (27B), so restored
+        // follow-ups, media turns and tool turns all cross the speculative lane. `BENCH_VL_SAMPLED=1` uses the
+        // bundle sampler the app sends (T 1.0, top_p 0.95, top_k 20).
+        let env = ProcessInfo.processInfo.environment
+        if env["BENCH_VL_DFLASH2"] == "1" {
+            params.draftStrategy = .dflash2(drafterPath: modelDir.appendingPathComponent("dflash2"), blockSize: nil)
+        }
+        if env["BENCH_VL_SAMPLED"] == "1" {
+            params.temperature = 1.0
+            params.topP = 0.95
+            params.topK = 20
+            params.randomSeed = 1234
+        }
+        print("DFlash 2: \(env["BENCH_VL_DFLASH2"] == "1" ? "on" : "off") sampled: \(env["BENCH_VL_SAMPLED"] == "1")")
         // `BENCH_REQUESTED_REASONING_BUDGET` runs the SAME variating shapes
         // with the per-request reasoning ceiling armed on every turn — the
         // crossed axis for the answer-reserve feature: a think close forced
@@ -1792,8 +2100,7 @@ enum VLBench {
     private static func prepareChat(
         _ chat: [Chat.Message], context: ModelContext
     ) async throws -> LMInput {
-        var input = UserInput(chat: chat)
-        input.additionalContext = ["enable_thinking": false]
+        let input = UserInput(chat: chat)
         return try await context.processor.prepare(input: input)
     }
 
@@ -1911,7 +2218,6 @@ enum VLBench {
             prompt: "Describe what happens in this short video in one sentence.",
             videos: [.url(videoURL)]
         )
-        userInput.additionalContext = ["enable_thinking": false]
         userInput.processing = benchVideoProcessing(defaultSquare: 224)
         if let resize = userInput.processing.resize {
             print("  video processing resize = \(Int(resize.width))x\(Int(resize.height))")

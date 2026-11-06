@@ -1,5 +1,8 @@
 # Qwen3.6 Native MTP Overnight Speed Loop - 2026-05-17
 
+> Historical measurement/implementation record. For current product defaults and controls, see [Speculative decoding defaults](SPECULATIVE_DECODING_DEFAULTS.md). Fixed-depth probes here are diagnostics, not current user settings.
+
+
 This note is the autonomous work prompt and execution contract for improving
 native MTP speed in `vmlx-swift`. It is intentionally focused on runtime
 performance and correctness, not UI policy wiring.

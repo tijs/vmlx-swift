@@ -50,16 +50,19 @@ public enum ModelKind: String, Sendable, Codable {
 public enum FluxError: Error, CustomStringConvertible {
     case unknownModel(String)
     case notLoaded
+    case staleHandle
     case wrongModelKind(expected: String, actual: String)
     case weightsNotFound(URL)
     case localModelNotFound(String, URL)
     case localModelIncomplete(URL, reasons: [String])
     case notImplemented(String)
     case invalidRequest(String)
+    case invalidField(field: String, value: String, allowed: String)
 
     public var description: String {
         switch self {
         case .unknownModel(let n): return "unknown model: \(n)"
+        case .staleHandle: return "stage handle was released or belongs to an unloaded model"
         case .notLoaded:           return "no model loaded — call FluxEngine.load first"
         case .wrongModelKind(let e, let a):
             return "wrong model kind: expected \(e), got \(a)"
@@ -70,6 +73,13 @@ public enum FluxError: Error, CustomStringConvertible {
             return "local model incomplete at \(u.path): \(reasons.joined(separator: ", "))"
         case .notImplemented(let s): return "not implemented: \(s)"
         case .invalidRequest(let s): return "invalid request: \(s)"
+        case .invalidField(let field, let value, let allowed):
+            return "invalid request: \(field)=\(value); expected \(allowed)"
         }
     }
+}
+
+/// Models that construct linear layers lazily prepare them before adapter matching.
+public protocol FluxAdapterPreparing: FluxModel {
+    func prepareAdapterLayers() async throws
 }

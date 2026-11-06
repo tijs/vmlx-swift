@@ -213,10 +213,10 @@ extension ProposalHeadStampTests {
         ProposalHeadBootstrap.ensure(model: model, modelDirectory: dir, isCalibratedBundle: true)
 
         XCTAssertEqual(model.installedBits, [4], "re-derived verdict must be used in-process")
-        let healed = ProposalHeadStamp.load(fromBundleAt: dir)
+        // The runtime never writes into a model folder (2026-10-06): the stale file is left as it was.
+        let untouched = ProposalHeadStamp.load(fromBundleAt: dir)
         XCTAssertEqual(
-            healed?.source, model.layout, "stamp must be overwritten with the MEASURED source")
-        XCTAssertEqual(healed?.verdict, .eligible(proposalBits: 4))
+            untouched?.source, configLie, "the runtime must not rewrite a bundle's stamp")
     }
 
     /// The inverse authority rule: when the source MATCHES the loaded head,
@@ -251,9 +251,8 @@ extension ProposalHeadStampTests {
         XCTAssertEqual(before, after, "matching stamp must never be rewritten")
     }
 
-    /// Concurrent first loads race benignly: both derive identical content
-    /// and atomic rename leaves a valid file either way.
-    func testConcurrentDerivesLeaveAValidIdenticalStamp() async throws {
+    /// Concurrent first loads derive in memory and never create a stamp file in the bundle (2026-10-06).
+    func testConcurrentDerivesNeverWriteIntoTheBundle() async throws {
         let dir = try makeBundleDir()
         let layout = ProposalHeadSourceLayout(
             bits: 8, groupSize: 64, mode: "affine", tied: false)
@@ -266,9 +265,10 @@ extension ProposalHeadStampTests {
                 }
             }
         }
-        let loaded = ProposalHeadStamp.load(fromBundleAt: dir)
-        XCTAssertEqual(loaded?.verdict, .eligible(proposalBits: 4))
-        XCTAssertEqual(loaded?.source, layout)
+        XCTAssertNil(
+            ProposalHeadStamp.load(fromBundleAt: dir),
+            "the runtime must not write into a model folder")
+        _ = layout
     }
 }
 

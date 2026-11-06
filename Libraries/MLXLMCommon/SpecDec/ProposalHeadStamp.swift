@@ -18,7 +18,8 @@
 //  - `source` is the validity key: the lm_head layout the verdict was
 //    derived from. At load it is compared against the ACTUAL loaded head —
 //    match → the stamp is authoritative and never rewritten; mismatch
-//    (bundle requantized) → treat as absent, re-derive, write fresh.
+//    (bundle requantized) → treat as absent and re-derive IN MEMORY. The runtime never writes the stamp into a
+//    model folder (2026-10-06); `write(toBundleAt:)` is for the converter (jang-tools) and tests only.
 //  - Eligibility is a pure function of the head (valid because JANG bundles
 //    are AWQ + imatrix/GPTQ calibrated at conversion):
 //      untied + affine + q8/g64          → eligible, proposal_bits 4
@@ -320,15 +321,14 @@ public enum ProposalHeadBootstrap {
             verdict = stamp.verdict
             honoredStamp = stamp
         } else if isCalibratedBundle {
+            // In-process only. The runtime NEVER writes into a model folder (Eric, 2026-10-06): a stamp written
+            // here into Qwen3.8-27B-JANG_4D (a bundle with no MTP head) nearly shipped in a HF re-upload. Model
+            // folders are inputs — published, possibly read-only, possibly shared. Re-deriving costs ~166 ms
+            // per load; only jang-tools (the converter) writes the stamp file.
             verdict = ProposalHeadVerdict.derive(from: actual)
-            let fresh = ProposalHeadStamp(
-                family: installing.nativeMTPProposalHeadFamily,
-                source: actual,
-                verdict: verdict,
-                basis:
-                    "derived at load by vmlx-swift from the actual lm_head layout (contract 2026-09-04)"
+            stampLog.info(
+                "proposal head: \(modelDirectory.lastPathComponent, privacy: .public) verdict derived in memory (not written to the bundle)"
             )
-            fresh.write(toBundleAt: modelDirectory)
         } else {
             stampLog.info(
                 "proposal head: \(modelDirectory.lastPathComponent, privacy: .public) is not a calibrated JANG bundle — not stamping, drafting stays on the full head"

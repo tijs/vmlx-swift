@@ -38,6 +38,10 @@ final class MFluxStore {
         var candidates = [key]
         if component.hasPrefix("text_encoder") {
             candidates.append("model.\(key)")
+            // mflux-saved bundles drop the HF `language_model.` prefix.
+            if key.hasPrefix("language_model.") {
+                candidates.append(String(key.dropFirst("language_model.".count)))
+            }
         }
         for candidate in candidates {
             if let value = loaded.componentWeights[component]?[candidate] { return value }
@@ -168,6 +172,8 @@ private enum MFluxBNBNF4 {
 /// and `weight.quant_map` are present, else dense matmul. MLX group bits + group
 /// size are inferred from the packed `weight`/`scales` shapes.
 final class MFluxLinear {
+    private let adapterState = FluxAdapterScope.current
+    private let adapterName: String
     private let weight: MLXArray
     private let scales: MLXArray?
     private let biases: MLXArray?
@@ -193,6 +199,8 @@ final class MFluxLinear {
         outputDimensions: Int,
         name: String
     ) throws {
+        self.adapterName = name
+        adapterState?.register(name: name, input: inputDimensions, output: outputDimensions)
         let hasGroupQuant = scales != nil
         let hasFp8 = weightScale != nil
         let hasNF4 = nf4Absmax != nil || nf4QuantMap != nil || nf4QuantState != nil
@@ -285,7 +293,7 @@ final class MFluxLinear {
             y = matmul(x, weight.T)
         }
         if let bias { y = y + bias }
-        return y
+        return adapterState?.apply(name: adapterName, input: x, output: y) ?? y
     }
 }
 

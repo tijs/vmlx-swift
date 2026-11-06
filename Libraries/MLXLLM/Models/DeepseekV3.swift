@@ -91,10 +91,6 @@ private func yarnFindCorrectionRange(
     return (max(low, 0), min(high, dim - 1))
 }
 
-private func clippedSilu(_ x: MLXArray) -> MLXArray {
-    clip(x * sigmoid(x), min: -100, max: 100)
-}
-
 class DeepseekV3Attention: Module {
     var config: DeepseekV3Configuration
     var hiddenSize: Int
@@ -335,8 +331,7 @@ class DeepseekV3MoE: Module, UnaryLayer {
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
-            numExperts: config.nRoutedExperts ?? 1,
-            activation: clippedSilu
+            numExperts: config.nRoutedExperts ?? 1
         )
 
         self.gate = MoEGate(config: config)
@@ -350,7 +345,6 @@ class DeepseekV3MoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y = switchMLP(x, indices)
         // Router scores are float32 for numerical stability; cast back
         // before applying so the f32 does not leak into the residual

@@ -15,11 +15,13 @@ public enum VMLXFluxModels {
         _ = Flux1Dev._register
         _ = Flux1Kontext._register
         _ = Flux1Fill._register
+        _ = Flux3Klein._register
         _ = Flux2Klein._register
         _ = Flux2KleinEdit._register
         _ = ZImage._register
         _ = QwenImage._register
         _ = QwenImageEdit._register
+        _ = QwenImage21._register
         _ = FIBO._register
         _ = Ideogram4._register
         _ = SeedVR2._register

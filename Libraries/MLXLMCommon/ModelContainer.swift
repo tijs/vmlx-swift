@@ -7,6 +7,22 @@ import MLXNN
     import os
 #endif
 
+/// The optional loaded head codec changes input embeddings and persisted KV.
+/// Capture its actual precision per model rather than the mutable host policy.
+private func loadedCacheComputationIdentity(_ model: any LanguageModel) -> String? {
+    let heads = model.namedModules().compactMap { path, module -> String? in
+        guard path.hasSuffix("embed_tokens"),
+            let head = module as? QuantizedEmbedding, let dtype = head.outputDType
+        else { return nil }
+        return "\(path):\(head.mode.rawValue)-q\(head.bits)-gs\(head.groupSize)-\(dtype)"
+    }.sorted()
+    var identities = [model.cacheComputationIdentity].compactMap { $0 }
+    if !heads.isEmpty {
+        identities.append("tied-head-after-materialization-v2[\(heads.joined(separator: ","))]")
+    }
+    return identities.isEmpty ? nil : identities.joined(separator: ";")
+}
+
 /// Source-backed cache topology reported by a loaded model.
 ///
 /// This is intentionally derived from `LanguageModel.newCache(parameters:)`
@@ -31,6 +47,9 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     public var cacheListLayerCount: Int
     /// Optional for decoding telemetry written before custom disk contracts.
     public private(set) var diskCacheStateIdentifiers: [String]?
+    /// Optional so older topology/transition telemetry still decodes.
+    /// This identifies model arithmetic, not an additional disk payload layout.
+    public private(set) var cacheComputationIdentity: String?
 
     public init(
         layerCount: Int = 0,
@@ -68,8 +87,9 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
         self.cacheListLayerCount = cacheListLayerCount
     }
 
-    public init(cache: [any KVCache]) {
+    public init(cache: [any KVCache], cacheComputationIdentity: String? = nil) {
         self.init()
+        self.cacheComputationIdentity = cacheComputationIdentity
         layerCount = cache.count
         for layer in cache {
             record(layer)
@@ -122,6 +142,7 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
 
     public var topologyTags: [String] {
         var tags: [String] = ["layers=\(layerCount)"]
+        if let cacheComputationIdentity { tags.append("compute=\(cacheComputationIdentity)") }
         for identifier in diskCacheStateIdentifiers ?? [] {
             tags.append("diskState=\(identifier)")
         }
@@ -274,6 +295,7 @@ public struct TurboQuantCacheTransitionSnapshot: Codable, Sendable, Equatable {
 public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
     private let attentionCacheKeyComponent: String?
+    private let cacheComputationIdentity: String?
 
     // MARK: - Multi-tier KV Cache
 
@@ -301,11 +323,24 @@ public final class ModelContainer: Sendable {
             config.modelKey = "\(ObjectIdentifier(self))"
         }
         if let modelKey = config.modelKey {
-            let scoped = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
-            config.modelKey = attentionCacheKeyComponent.map { "\(scoped)|\($0)" } ?? scoped
+            config.modelKey = scopedCacheModelKey(modelKey)
         }
         let coordinator = CacheCoordinator(config: config)
         _cacheCoordinator.withLock { $0 = coordinator }
+    }
+
+    private func scopedCacheModelKey(_ modelKey: String) -> String {
+        let scoped = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+        var key = attentionCacheKeyComponent.map { "\(scoped)|\($0)" } ?? scoped
+        if let cacheComputationIdentity {
+            let component = "compute=\(cacheComputationIdentity)"
+            // Osaurus already includes topologyTags. Accept only an exact key
+            // component as present, preserving every different/legacy tag.
+            if !key.split(separator: "|").contains(Substring(component)) {
+                key += "|" + component
+            }
+        }
+        return key
     }
 
     /// Enable caching with auto-detection of hybrid models.
@@ -320,8 +355,7 @@ public final class ModelContainer: Sendable {
             config.modelKey = modelConfig.name
         }
         if let modelKey = config.modelKey {
-            let scoped = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
-            config.modelKey = attentionCacheKeyComponent.map { "\(scoped)|\($0)" } ?? scoped
+            config.modelKey = scopedCacheModelKey(modelKey)
         }
 
         let topology = await cacheTopologySnapshot()
@@ -400,64 +434,22 @@ public final class ModelContainer: Sendable {
         parameters: GenerateParameters? = nil
     ) async -> ModelCacheTopologySnapshot {
         await context.read { ctx in
-            ModelCacheTopologySnapshot(cache: ctx.model.newCache(parameters: parameters))
+            ModelCacheTopologySnapshot(
+                cache: ctx.model.newCache(parameters: parameters),
+                cacheComputationIdentity: loadedCacheComputationIdentity(ctx.model))
         }
     }
 
     /// Disable caching and release all cached state.
     public func disableCaching() {
-        _cacheCoordinator.withLock { coordinator in
+        let released = _cacheCoordinator.withLock { coordinator -> CacheCoordinator? in
+            let current = coordinator
             coordinator?.releaseVolatile()
             coordinator = nil
+            return current
         }
-    }
-
-    // MARK: - MLXPress runtime
-
-    /// Locked storage for the optional MLXPress runtime. Settable
-    /// from `loadModelContainer(from:using:loadConfiguration:)` so the
-    /// runtime stays alive for the model's lifetime; callers (osaurus
-    /// settings panel, JANG Studio inspector) poll status from
-    /// anywhere via ``mlxPressStatus()``.
-    private let _jangPressRuntime = OSAllocatedUnfairLock<JangPressRuntime>(
-        initialState: .none)
-
-    /// Read the current MLXPress runtime. `.none` when MLXPress was
-    /// not activated for this load (e.g. `LoadConfiguration.jangPress
-    /// == .disabled` or auto-threshold not met).
-    public var jangPressRuntime: JangPressRuntime {
-        _jangPressRuntime.withLock { $0 }
-    }
-
-    /// Replace the MLXPress runtime. Called once at load time by
-    /// `loadModelContainer(from:using:loadConfiguration:)`. Safe to
-    /// call multiple times — each call replaces; ARC drops the prior
-    /// runtime and its tiers release.
-    public func setJangPressRuntime(_ runtime: JangPressRuntime) {
-        _jangPressRuntime.withLock { $0 = runtime }
-    }
-
-    /// Snapshot the current MLXPress status. Returns
-    /// `MLXPressStatus.disabled` when the runtime is `.none`.
-    /// Cheap enough to call on a polling timer (no heavy work; reads
-    /// cached counters under a single lock).
-    public func jangPressStatus() -> JangPressStatus {
-        jangPressRuntime.status()
-    }
-
-    /// Public MLXPress spelling for the routed cold-tier runtime.
-    public var mlxPressRuntime: MLXPressRuntime {
-        jangPressRuntime
-    }
-
-    /// Public MLXPress spelling for replacing the routed cold-tier runtime.
-    public func setMLXPressRuntime(_ runtime: MLXPressRuntime) {
-        setJangPressRuntime(runtime)
-    }
-
-    /// Public MLXPress spelling for status polling.
-    public func mlxPressStatus() -> MLXPressStatus {
-        jangPressStatus()
+        // Outside the lock: background disk writes of this coordinator finish (bounded wait).
+        released?.waitForPendingDiskWrites()
     }
 
     public var configuration: ModelConfiguration {
@@ -510,8 +502,19 @@ public final class ModelContainer: Sendable {
         }
     }
 
+    /// The loaded architecture's ``LanguageModel/recommendedPrefillStepSize``,
+    /// readable without entering the container.
+    public let recommendedPrefillStepSize: Int?
+
     public init(context: consuming ModelContext) {
-        self.attentionCacheKeyComponent = JangHadamardAttention.cacheKeyComponent(model: context.model)
+        self.recommendedPrefillStepSize = context.model.recommendedPrefillStepSize
+        let cachePolicies = [
+            context.model.cacheStorageDTypeIdentity,
+            JangHadamardAttention.cacheKeyComponent(model: context.model),
+        ].compactMap { $0 }
+        self.attentionCacheKeyComponent =
+            cachePolicies.isEmpty ? nil : cachePolicies.joined(separator: "|")
+        self.cacheComputationIdentity = loadedCacheComputationIdentity(context.model)
         self.context = .init(context)
     }
 
@@ -650,8 +653,6 @@ public final class ModelContainer: Sendable {
         parameters: GenerateParameters,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
-        jangPressRuntime.recordPromptTokenActivity(
-            input.text.tokens.reshaped(-1).asArray(Int.self))
 
         let input = SendableBox(input)
         let coordinator = self.cacheCoordinator

@@ -144,7 +144,7 @@ enum Qwen4ExpCompiledGDNInputs {
         }
         if !didReport {
             didReport = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_gdn_input_projection=active shared_weight_inputs=true input=bfloat16 metadata=\(metadataDType)\n"
                         .utf8))
@@ -198,7 +198,7 @@ enum Qwen4ExpCompiledGDNInputs {
                 diag += " conv_state=\(convState.shape):\(convState.dtype)"
                 diag += " scales=\(metadataDType) biases=\(biases.dtype)"
                 diag += " conv_weight=\(convWeight.dtype)\n"
-                FileHandle.standardError.write(Data(diag.utf8))
+                RuntimeDiagnostics.write(Data(diag.utf8))
             }
             lock.unlock()
             return nil
@@ -255,7 +255,7 @@ enum Qwen4ExpCompiledGDNInputs {
         }
         if !didReport {
             didReport = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_gdn_front=active shared_weight_inputs=true input=bfloat16 metadata=\(metadataDType) conv_state=\(convState.dtype) recurrence=float32\n"
                         .utf8))
@@ -279,8 +279,18 @@ enum Qwen4ExpCompiledGDNInputs {
         eps: Float,
         groupSize: Int,
         bits: Int,
-        mode: QuantizationMode
+        mode: QuantizationMode,
+        batchedRows: Bool = false
     ) -> MLXArray? {
+        #if DEBUG
+        let batchAddressing = batchedRows
+        #else
+        let batchAddressing = false
+        #endif
+        guard !batchedRows || (batchAddressing && (2...8).contains(output.dim(0))
+            && output.ndim == 4 && gate.shape == output.shape
+            && outWeight.ndim == 2 && outScales.ndim == 2 && outBiases.shape == outScales.shape)
+        else { return nil }
         let metadataDType = outScales.dtype
         let supported =
             enabled && !CompiledDecodeTrace.isActive && output.dim(1) == 1
@@ -295,7 +305,7 @@ enum Qwen4ExpCompiledGDNInputs {
             lock.lock()
             if output.dim(1) == 1, !didReportTailRejection {
                 didReportTailRejection = true
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         ("[Qwen4Exp] compiled_gdn_tail=rejected"
                             + " enabled=\(enabled) trace=\(CompiledDecodeTrace.isActive)"
@@ -308,7 +318,7 @@ enum Qwen4ExpCompiledGDNInputs {
         }
 
         let key = [
-            "tail", String(output.dim(-1)), String(gate.dim(-1)),
+            batchAddressing ? "tail-batched-m1" : "tail", String(output.dim(-1)), String(gate.dim(-1)),
             sigmoidGate ? "sigmoid" : "silu",
             String(describing: output.dtype),
             String(describing: gate.dtype),
@@ -328,7 +338,9 @@ enum Qwen4ExpCompiledGDNInputs {
                     .asType(args[0].dtype)
                 let projected = quantizedMM(
                     gated.reshaped(gated.dim(0), gated.dim(1), -1),
-                    args[3], scales: args[4], biases: args[5],
+                    batchAddressing ? args[3][.newAxis, 0..., 0...] : args[3],
+                    scales: batchAddressing ? args[4][.newAxis, 0..., 0...] : args[4],
+                    biases: batchAddressing ? args[5][.newAxis, 0..., 0...] : args[5],
                     transpose: true, groupSize: groupSize, bits: bits, mode: mode)
                 return [projected]
             }
@@ -336,7 +348,7 @@ enum Qwen4ExpCompiledGDNInputs {
         }
         if !didReportTail {
             didReportTail = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_gdn_tail=active gate_mode=\(sigmoidGate ? "sigmoid" : "silu") recurrence_output=\(output.dtype) gate=\(gate.dtype) metadata=\(metadataDType) shared_weight_inputs=true\n"
                         .utf8))
@@ -346,6 +358,36 @@ enum Qwen4ExpCompiledGDNInputs {
         return region!([
             output, gate, normWeight, outWeight, outScales, outBiases,
         ]).first
+    }
+
+    /// Verify-row tail without the projection: exactly `callTail`'s norm + gate expression (same compiled
+    /// elementwise region, row-independent), so `out_proj` can run once for every verify row through the
+    /// row-exact QMV instead of one weight stream per row. `output` [1, rows, H, D].
+    static func callTailGated(
+        output: MLXArray, gate: MLXArray, sigmoidGate: Bool, normWeight: MLXArray, eps: Float
+    ) -> MLXArray? {
+        guard enabled, !CompiledDecodeTrace.isActive, output.ndim == 4, output.dim(0) == 1,
+            gate.shape == output.shape, output.dtype == .bfloat16,
+            gate.dtype == .bfloat16 || gate.dtype == .float32, normWeight.dtype == .bfloat16
+        else { return nil }
+        let key = ["tail-gated", String(output.dim(-1)), sigmoidGate ? "sigmoid" : "silu",
+                   String(describing: gate.dtype), String(eps)].joined(separator: "|")
+        lock.lock()
+        var region = regions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let normalized = MLXFast.rmsNorm(args[0], weight: args[2], eps: eps)
+                let gate =
+                    sigmoidGate
+                    ? sigmoid(args[1].asType(.float32))
+                    : silu(args[1].asType(.float32))
+                let gated = (normalized.asType(.float32) * gate).asType(args[0].dtype)
+                return [gated.reshaped(gated.dim(0), gated.dim(1), -1)]
+            }
+            regions[key] = region
+        }
+        lock.unlock()
+        return region!([output, gate, normWeight]).first
     }
 }
 
@@ -360,6 +402,11 @@ enum Qwen4ExpCompiledMoE {
         let weightDType: DType
     }
 
+    private struct DenseRouterRowsKey: Hashable {
+        let geometry: DenseRouterKey
+        let rows: Int
+    }
+
     static let enabled: Bool = {
         let value = RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_MOE") ?? "1"
         return value != "0" && value.lowercased() != "false"
@@ -367,6 +414,8 @@ enum Qwen4ExpCompiledMoE {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var routerRegions: [String: Region] = [:]
     nonisolated(unsafe) private static var denseRouterRegions: [DenseRouterKey: Region] = [:]
+    nonisolated(unsafe) private static var denseRouterRowsRegions: [DenseRouterRowsKey: Region] =
+        [:]
     nonisolated(unsafe) private static var sharedRegions: [String: Region] = [:]
     nonisolated(unsafe) private static var didReportRouter = false
     nonisolated(unsafe) private static var didReportShared = false
@@ -404,7 +453,7 @@ enum Qwen4ExpCompiledMoE {
         }
         if !didReportRouter {
             didReportRouter = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_moe_router=active shared_weight_inputs=true dtype=bfloat16\n"
                         .utf8))
@@ -453,7 +502,7 @@ enum Qwen4ExpCompiledMoE {
         }
         if !didReportRouter {
             didReportRouter = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_moe_router=active kind=dense shared_weight_inputs=true input_dtype=\(x.dtype) weight_dtype=\(weight.dtype)\n"
                         .utf8))
@@ -464,6 +513,118 @@ enum Qwen4ExpCompiledMoE {
         return (outputs[0], outputs[1])
     }
 
+    static let denseRouterRowsEnabled: Bool = {
+        let value = RuntimeEnvironment.value("VMLX_QWEN4_EXP_ROUTER_ROWS") ?? "1"
+        return value != "0" && value.lowercased() != "false"
+    }()
+
+    /// One compiled invocation, with the AR router's actual singleton shape for
+    /// every row. A strided M=1 batch still changed BF16 routing-score bits on
+    /// real Allosaurus activations, despite passing the original random probes.
+    /// Keep matmul, precise softmax, selection, and normalization together in
+    /// each row's graph; weights remain shared inputs, never copied per row.
+    static func denseRouterRows(
+        _ window: MLXArray, weight: MLXArray, topK: Int, normTopK: Bool
+    ) -> (indices: MLXArray, scores: MLXArray)? {
+        guard denseRouterRowsEnabled, enabled, !CompiledDecodeTrace.isActive,
+            window.ndim == 3, window.dim(0) == 1, window.dim(1) > 1,
+            window.dtype == .bfloat16, weight.ndim == 2, weight.dtype == .bfloat16,
+            window.dim(2) > 0, weight.dim(1) == window.dim(2),
+            topK > 0, topK <= weight.dim(0)
+        else { return nil }
+        let rows = window.dim(1)
+        let experts = weight.dim(0)
+        let key = DenseRouterRowsKey(
+            geometry: DenseRouterKey(
+                hiddenSize: window.dim(2), experts: experts, topK: topK,
+                normTopK: normTopK, weightDType: weight.dtype), rows: rows)
+        lock.lock()
+        var region = denseRouterRowsRegions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                var indices: [MLXArray] = []
+                var scores: [MLXArray] = []
+                for row in 0 ..< rows {
+                    let input = args[0][0..., row ..< (row + 1), 0...]
+                    let gates = MLX.softmax(
+                        matmul(input, args[1].transposed()), axis: -1, precise: true)
+                    let kth = experts - topK
+                    let selected = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
+                    var probabilities = MLX.takeAlong(gates, selected, axis: -1)
+                    if normTopK {
+                        probabilities = probabilities / probabilities.sum(axis: -1, keepDims: true)
+                    }
+                    indices.append(selected)
+                    scores.append(probabilities)
+                }
+                return [concatenated(indices, axis: 1), concatenated(scores, axis: 1)]
+            }
+            denseRouterRowsRegions[key] = region
+        }
+        lock.unlock()
+        let outputs = region!([window, weight])
+        guard outputs.count == 2 else { return nil }
+        return (outputs[0], outputs[1])
+    }
+
+    /// Shared expert with f16 affine metadata against bf16 activations (Allosaurus 0.2: 4-bit, f16 scales). `sharedExpert`
+    /// admits bf16 metadata only, so this expert ran as separate uncompiled launches in every decode step. The 1-row
+    /// step uses plain 2-D products (MLX's 1-row kernels); a verify window ([1, rows, K], rows 2...8) uses one M = 1
+    /// product per row, the same per-row arithmetic, in one region.
+    static func sharedExpertRowsF16Metadata(
+        _ x: MLXArray, gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear,
+        gateBiases: MLXArray, upBiases: MLXArray, downBiases: MLXArray, sharedGateWeight: MLXArray
+    ) -> MLXArray? {
+        let rows = x.ndim == 3 && x.dim(0) == 1 ? x.dim(1) : 0
+        guard enabled, !CompiledDecodeTrace.isActive, (1 ... 8).contains(rows), x.dtype == .bfloat16 else {
+            return nil
+        }
+        if rows > 1, !FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "moe") {
+            return nil
+        }
+        for q in [gate, up, down] {
+            guard q.mode == .affine, q.bias == nil, q.scales.dtype == .float16,
+                q.groupSize == gate.groupSize, q.bits == gate.bits
+            else { return nil }
+        }
+        for b in [gateBiases, upBiases, downBiases] where b.dtype != .float16 { return nil }
+        guard sharedGateWeight.ndim == 2, sharedGateWeight.dim(1) == x.dim(2),
+            sharedGateWeight.dtype == .bfloat16 || sharedGateWeight.dtype == .float32
+        else { return nil }
+        let groupSize = gate.groupSize, bits = gate.bits
+        let key = "sharedF16|rows\(rows)|\(x.dim(-1))|\(gate.weight.dim(0))|\(groupSize)|\(bits)|\(sharedGateWeight.dtype)"
+        lock.lock()
+        var region = sharedRegions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                func project(_ v: MLXArray, _ w: Int) -> MLXArray {
+                    let k = v.dim(-1)
+                    let product = rows == 1
+                        ? quantizedMM(v.reshaped(1, k), args[w], scales: args[w + 1], biases: args[w + 2],
+                                      transpose: true, groupSize: groupSize, bits: bits, mode: .affine)
+                        : quantizedMM(v.reshaped(rows, 1, k), args[w][.newAxis], scales: args[w + 1][.newAxis],
+                                      biases: args[w + 2][.newAxis], transpose: true, groupSize: groupSize,
+                                      bits: bits, mode: .affine)
+                    return product.reshaped(1, rows, -1).asType(.bfloat16)
+                }
+                let activated = silu(project(args[0], 1)) * project(args[0], 4)
+                let shared = project(activated, 7)
+                let k = args[0].dim(-1)
+                let gateOutput = (rows == 1
+                    ? matmul(args[0].reshaped(1, k), args[10].transposed())
+                    : matmul(args[0].reshaped(rows, 1, k), args[10].transposed())).reshaped(1, rows, -1)
+                return [sigmoid(gateOutput) * shared]
+            }
+            sharedRegions[key] = region
+        }
+        lock.unlock()
+        let outputs = region!([
+            x, gate.weight, gate.scales, gateBiases, up.weight, up.scales, upBiases,
+            down.weight, down.scales, downBiases, sharedGateWeight,
+        ])
+        return outputs.first
+    }
+
     static func sharedExpert(
         _ x: MLXArray,
         gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
@@ -472,7 +633,14 @@ enum Qwen4ExpCompiledMoE {
         sharedGateWeight: MLXArray,
         groupSize: Int, bits: Int, mode: QuantizationMode
     ) -> MLXArray? {
-        guard enabled, !CompiledDecodeTrace.isActive, x.dim(1) == 1,
+        // One row: the AR step. 2...8 rows: native-MTP verify only (Flash verification scope), each row
+        // taking the 1-row step's arithmetic — M = 1 products per row ([rows, 1, K] batches) inside the
+        // same compiled region, so the fused silu*up and sigmoid*shared epilogues round exactly like AR.
+        // Outside the scope a multi-row call keeps its previous (uncompiled) route.
+        let rows = x.ndim == 3 && x.dim(0) == 1 ? x.dim(1) : 0
+        guard enabled, !CompiledDecodeTrace.isActive, (1 ... 8).contains(rows),
+            rows == 1
+                || FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "moe"),
             x.dtype == .bfloat16,
             [
                 gateScales, gateBiases, upScales, upBiases, downScales,
@@ -481,29 +649,45 @@ enum Qwen4ExpCompiledMoE {
             .allSatisfy({ $0.dtype == .bfloat16 })
                 && sharedGateWeight.dtype == .bfloat16
         else { return nil }
-        let key = "shared|\(x.dim(-1))|\(gateWeight.dim(0))|\(groupSize)|\(bits)|\(mode)"
+        let key = "shared|rows\(rows)|\(x.dim(-1))|\(gateWeight.dim(0))|\(groupSize)|\(bits)|\(mode)"
         lock.lock()
         var region = sharedRegions[key]
         if region == nil {
             region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
-                let gate = quantizedMM(
-                    args[0], args[1], scales: args[2], biases: args[3],
-                    transpose: true, groupSize: groupSize, bits: bits, mode: mode)
-                let up = quantizedMM(
-                    args[0], args[4], scales: args[5], biases: args[6],
-                    transpose: true, groupSize: groupSize, bits: bits, mode: mode)
-                let activated = silu(gate) * up
-                let shared = quantizedMM(
-                    activated, args[7], scales: args[8], biases: args[9],
-                    transpose: true, groupSize: groupSize, bits: bits, mode: mode)
-                let gateOutput = matmul(args[0], args[10].transposed())
+                if rows == 1 {
+                    let gate = quantizedMM(
+                        args[0], args[1], scales: args[2], biases: args[3],
+                        transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+                    let up = quantizedMM(
+                        args[0], args[4], scales: args[5], biases: args[6],
+                        transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+                    let activated = silu(gate) * up
+                    let shared = quantizedMM(
+                        activated, args[7], scales: args[8], biases: args[9],
+                        transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+                    let gateOutput = matmul(args[0], args[10].transposed())
+                    return [sigmoid(gateOutput) * shared]
+                }
+                func project(_ v: MLXArray, _ w: Int) -> MLXArray {
+                    let k = v.dim(-1)
+                    return quantizedMM(
+                        v.reshaped(rows, 1, k), args[w][.newAxis], scales: args[w + 1][.newAxis],
+                        biases: args[w + 2][.newAxis], transpose: true, groupSize: groupSize,
+                        bits: bits, mode: mode
+                    ).reshaped(1, rows, -1)
+                }
+                let activated = silu(project(args[0], 1)) * project(args[0], 4)
+                let shared = project(activated, 7)
+                let k = args[0].dim(-1)
+                let gateOutput = matmul(args[0].reshaped(rows, 1, k), args[10].transposed())
+                    .reshaped(1, rows, -1)
                 return [sigmoid(gateOutput) * shared]
             }
             sharedRegions[key] = region
         }
         if !didReportShared {
             didReportShared = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_moe_shared_expert=active shared_weight_inputs=true dtype=bfloat16\n"
                         .utf8))
@@ -521,7 +705,11 @@ enum Qwen4ExpCompiledMoE {
 
     private static let postRegion = vmlxTrustedCompile(shapeless: true) {
         (routed: MLXArray, scores: MLXArray, shared: MLXArray) -> MLXArray in
-        let combined = (routed * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        // Swift new-axis indexing records a concrete reshape target. That
+        // freezes the first batch width in this shapeless trace and crashes
+        // when a completed request shrinks the active batch. ExpandDims keeps
+        // the leading dimensions dynamic while retaining the compiled region.
+        let combined = (routed * expandedDimensions(scores, axis: -1)).sum(axis: -2)
         return combined + shared
     }
 
@@ -611,6 +799,15 @@ private func gatedDeltaOps(
     mask: MLXArray? = nil,
     roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
+    // An invalid operand (the result of an MLX operation that already failed
+    // under a recovering error handler) reads every dim as 0, and `Hv / Hk`
+    // below would then divide by zero and kill the process. Hand the failure
+    // on as invalid outputs so the request-level error check reports the
+    // originating MLX error instead.
+    guard q.isValid, k.isValid, v.isValid, g.isValid, beta.isValid else {
+        return (MLXArray.mlxNone, MLXArray.mlxNone)
+    }
+
     let B = q.dim(0)
     let T = q.dim(1)
     let Hk = q.dim(2)
@@ -837,6 +1034,217 @@ private func vlmGatedDeltaKernel(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - Fused MoE router tail (softmax + top-k + normalize, one dispatch)
+//
+// After the router gemv, `routerSelection` ran precise softmax, argPartition (a full GPU merge sort),
+// takeAlong, sum and divide: five latency-bound dispatches per MoE layer, 1.8 ms of a 48-layer Ornith
+// 122B decode step for 75 MB of router weights. This kernel does the tail in one threadgroup per row
+// and reproduces the op chain bit for bit:
+// - softmax: MLX `softmax_single_row` (block kernel) with its thread layout (N_READS = 4 consecutive
+//   values per thread, E/4 threads), fast::exp, simd/threadgroup reductions and T(ld * (1/sum));
+// - selection: argPartition is a stable ascending argsort, so `[kth...]` holds the top-k in ascending
+//   (value, index) order; picking the max (bf16 bits << 16 | index) key k times and writing the picks
+//   back to front gives the same indices in the same slot order (slot order matters: the routed
+//   reduction sums routes in slot order);
+// - normalization: MLX's T-accumulated slot-order sum of the selected T values, then T(v / sum).
+let routerTailKernel: MLXFast.MLXFastKernel = {
+    let source = """
+        auto row = threadgroup_position_in_grid.y;
+        auto lid = thread_position_in_threadgroup.x;
+        auto lane = thread_index_in_simdgroup;
+        auto sg = simdgroup_index_in_threadgroup;
+        constexpr int N_READS = 4;
+        threadgroup float local_max[32];
+        threadgroup float local_normalizer[32];
+        threadgroup uint keys[E];
+        threadgroup uint picks[K];
+
+        float ld[N_READS];
+        const device T* in = logits + row * E + lid * N_READS;
+        for (int i = 0; i < N_READS; i++) {
+          ld[i] = (lid * N_READS + i) < E ? float(in[i]) : Limits<float>::min;
+        }
+        if (sg == 0) {
+          local_max[lane] = Limits<float>::min;
+          local_normalizer[lane] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float maxval = Limits<float>::finite_min;
+        for (int i = 0; i < N_READS; i++) {
+          maxval = (maxval < ld[i]) ? ld[i] : maxval;
+        }
+        maxval = simd_max(maxval);
+        if (lane == 0) { local_max[sg] = maxval; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          maxval = simd_max(local_max[lane]);
+          if (lane == 0) { local_max[0] = maxval; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        maxval = local_max[0];
+        float normalizer = 0;
+        for (int i = 0; i < N_READS; i++) {
+          float exp_x = fast::exp(ld[i] - maxval);
+          ld[i] = exp_x;
+          normalizer += exp_x;
+        }
+        normalizer = simd_sum(normalizer);
+        if (lane == 0) { local_normalizer[sg] = normalizer; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          normalizer = simd_sum(local_normalizer[lane]);
+          if (lane == 0) { local_normalizer[0] = normalizer; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        normalizer = 1 / local_normalizer[0];
+        for (int i = 0; i < N_READS; i++) {
+          int e = lid * N_READS + i;
+          if (e < E) {
+            T p = T(ld[i] * normalizer);
+            keys[e] = (uint(as_type<ushort>(p)) << 16) | uint(e);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Top-K by repeated max over (value bits, index); probabilities are >= 0 so their bf16/f16
+        // bit patterns order like the values. Simdgroup 0 selects.
+        if (sg == 0) {
+          for (int k = 0; k < K; k++) {
+            uint best = 0;
+            for (int e = lane; e < E; e += 32) { best = max(best, keys[e]); }
+            best = simd_max(best);
+            if (lane == 0) {
+              picks[K - 1 - k] = best;
+              keys[best & 0xFFFF] = 0;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          if (lane == 0) {
+            // MLX `sum` over a short BF16 row (row_reduce_small): a T accumulator, slot order, each add
+            // rounded to T.
+            T sum = T(0);
+            for (int k = 0; k < K; k++) { sum = as_type<T>(ushort(picks[k] >> 16)) + sum; }
+            for (int k = 0; k < K; k++) {
+              T v = as_type<T>(ushort(picks[k] >> 16));
+              indices[row * K + k] = picks[k] & 0xFFFF;
+              scores[row * K + k] = NORM ? T(v / sum) : v;
+            }
+          }
+        }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_router_tail", inputNames: ["logits"], outputNames: ["indices", "scores"],
+        source: source)
+}()
+
+enum Qwen35RouterTail {
+    static let enabled = ProcessInfo.processInfo.environment["VMLX_QWEN35_ROUTER_TAIL"] != "0"
+
+    /// `logits` [..., E] (BF16/F16, E % 4 == 0, E <= 4096) -> (indices [..., K] uint32, scores [..., K]).
+    static func call(_ logits: MLXArray, topK: Int, normalize: Bool) -> (MLXArray, MLXArray)? {
+        let e = logits.dim(-1)
+        guard enabled, logits.dtype == .bfloat16 || logits.dtype == .float16,
+            e % 4 == 0, e <= 4096, e >= 32, (1 ... 32).contains(topK), topK <= e
+        else { return nil }
+        let rows = logits.size / e
+        let threads = ((e / 4 + 31) / 32) * 32
+        let leading = Array(logits.shape.dropLast())
+        let out = routerTailKernel(
+            [logits],
+            template: [("T", logits.dtype), ("E", e), ("K", topK), ("NORM", normalize)],
+            grid: (threads, rows, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [leading + [topK], leading + [topK]],
+            outputDTypes: [.uint32, logits.dtype])
+        return (out[0], out[1])
+    }
+}
+
+// MARK: - DFlash 2 tree GatedDelta
+//
+// One verify window holding a draft TREE: row r continues from its parent's state, not from row
+// r-1. Each thread keeps the state of every row in registers (`states[MAXW][n_per_t]`, Dk/32
+// floats per row) so a child reads its parent's state without touching device memory; only y is
+// written. The per-step arithmetic is the chain kernel's (`makeVLMGatedDeltaKernel`) verbatim, so
+// a chain-shaped tree produces the chain kernel's bits. The committed state is NOT produced here:
+// the commit replays the kept path from the pre-window state with the chain kernel.
+private let vlmGatedDeltaTreeKernel: MLXFast.MLXFastKernel = {
+    let source = """
+        auto n = thread_position_in_grid.z;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+        auto i_state = state_in + (hv_idx * Dv + dv_idx) * Dk;
+        float s0[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          s0[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
+        }
+        float states[MAXW][n_per_t];
+        const int W = rows[0];
+        for (int node = 0; node < W; ++node) {
+          const int parent = parents[node];
+          float state[n_per_t];
+          for (int i = 0; i < n_per_t; ++i) state[i] = parent < 0 ? s0[i] : states[parent][i];
+          auto q_ = q + (node * Hk + hk_idx) * Dk;
+          auto k_ = k + (node * Hk + hk_idx) * Dk;
+          auto v_ = v + (node * Hv + hv_idx) * Dv;
+          const float g_ = static_cast<float>(g[node * Hv + hv_idx]);
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * g_;
+            kv_mem += state[i] * k_[s_idx];
+          }
+          kv_mem = simd_sum(kv_mem);
+          auto beta_value = 1.0f
+              / (1.0f + metal::fast::exp(-static_cast<float>(b[node * Hv + hv_idx])));
+          auto delta = (v_[dv_idx] - kv_mem) * beta_value;
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + k_[s_idx] * delta;
+            out += state[i] * q_[s_idx];
+          }
+          out = simd_sum(out);
+          if (thread_index_in_simdgroup == 0) {
+            y[(node * Hv + hv_idx) * Dv + dv_idx] = static_cast<InT>(out);
+          }
+          for (int i = 0; i < n_per_t; ++i) states[node][i] = state[i];
+        }
+    """
+    return MLXFast.metalKernel(
+        name: "vlm_gated_delta_tree",
+        inputNames: ["q", "k", "v", "g", "b", "state_in", "parents", "rows"],
+        outputNames: ["y"],
+        source: source)
+}()
+
+/// y `[1, W, Hv, Dv]` for a draft tree (B == 1). `state` `[1, Hv, Dv, Dk]` float32.
+private func vlmGatedDeltaTree(
+    q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, b: MLXArray, state: MLXArray,
+    parents: [Int]
+) -> MLXArray {
+    let W = k.dim(1)
+    let Hk = k.dim(2)
+    let Dk = k.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    // Size register storage for the actual tree, including the chooser's
+    // 32-row candidates. Keep the existing specialization for small trees.
+    precondition(W > 0 && parents.count == W && Dk % 32 == 0)
+    let outputs = vlmGatedDeltaTreeKernel(
+        [q, k, v, g, b, state, MLXArray(parents.map(Int32.init)), MLXArray([Int32(W)])],
+        template: [
+            ("InT", q.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("MAXW", Swift.max(16, W)),
+        ],
+        grid: (32, Dv, Hv),
+        threadGroup: (32, 4, 1),
+        outputShapes: [[1, W, Hv, Dv]],
+        outputDTypes: [q.dtype])
+    return outputs[0]
+}
+
 private func gatedDeltaUpdate(
     q: MLXArray,
     k: MLXArray,
@@ -901,7 +1309,7 @@ private enum QwenGatedDeltaDTypeTrace {
         defer { lock.unlock() }
         guard !didReport else { return }
         didReport = true
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 "[QwenGDN] live_dtype_boundaries q=\(q.dtype) k=\(k.dtype) v=\(v.dtype) a=\(a.dtype) b=\(b.dtype) beta=fused_from_\(b.dtype) decay=\(decay.dtype) recurrent_state=\(state.dtype) output=\(q.dtype)\n"
                     .utf8))
@@ -1100,6 +1508,12 @@ public struct Qwen35Configuration: Codable, Sendable {
     /// Optional, like `Gemma4Configuration.visionConfig`. A text-only Qwen 3.5 bundle carries no
     /// `vision_config`, and while this was non-optional such a bundle could not DECODE at all.
     public let visionConfiguration: VisionConfiguration?
+    /// MiniCPM-V 4.7 (`model_type == "minicpmv4_7"`) carries a SigLIP tower instead of Qwen3-VL's; its
+    /// `vision_config` decodes here and `visionConfiguration` stays nil. Exactly one of the two is set for a
+    /// bundle with vision weights.
+    public var miniCPMVisionConfiguration: MiniCPMV47VisionConfiguration? = nil
+    /// MiniCPM-V 4.7 top-level merger/canvas fields (`insert_layer_id`, `downsample_mode`, marker ids).
+    public var miniCPMCanvas: MiniCPMV47CanvasConfiguration? = nil
     public let modelType: String
     private let _ignoreIndex: Int?
     public var ignoreIndex: Int { _ignoreIndex ?? -100 }
@@ -1134,6 +1548,60 @@ public struct Qwen35Configuration: Codable, Sendable {
         case _vocabSize = "vocab_size"
         case _eosTokenId = "eos_token_id"
     }
+
+    public static let miniCPMV47ModelType = "minicpmv4_7"
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        textConfiguration = try c.decode(TextConfiguration.self, forKey: .textConfiguration)
+        modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? ""
+        if modelType == Self.miniCPMV47ModelType {
+            visionConfiguration = nil
+            miniCPMVisionConfiguration = try c.decodeIfPresent(
+                MiniCPMV47VisionConfiguration.self, forKey: .visionConfiguration)
+            miniCPMCanvas = try MiniCPMV47CanvasConfiguration(from: decoder)
+        } else {
+            visionConfiguration = try c.decodeIfPresent(VisionConfiguration.self, forKey: .visionConfiguration)
+        }
+        _ignoreIndex = try c.decodeIfPresent(Int.self, forKey: ._ignoreIndex)
+        _imageTokenId = try c.decodeIfPresent(Int.self, forKey: ._imageTokenId)
+        _videoTokenId = try c.decodeIfPresent(Int.self, forKey: ._videoTokenId)
+        _imageTokenIndex = try c.decodeIfPresent(Int.self, forKey: ._imageTokenIndex)
+        _videoTokenIndex = try c.decodeIfPresent(Int.self, forKey: ._videoTokenIndex)
+        _visionStartTokenId = try c.decodeIfPresent(Int.self, forKey: ._visionStartTokenId)
+        _visionEndTokenId = try c.decodeIfPresent(Int.self, forKey: ._visionEndTokenId)
+        _vocabSize = try c.decodeIfPresent(Int.self, forKey: ._vocabSize)
+        _eosTokenId = try c.decodeIfPresent(IntOrIntArray.self, forKey: ._eosTokenId)
+    }
+
+    /// Whether any vision tower can be built from this configuration.
+    public var hasVisionConfiguration: Bool {
+        visionConfiguration != nil || miniCPMVisionConfiguration != nil
+    }
+}
+
+/// The vision module `Qwen35` carries in its `vision_tower` slot. Qwen3-VL's tower and MiniCPM-V 4.7's
+/// SigLIP tower + resampler both turn packed pixel patches into one LLM-embedding row per merged patch group,
+/// scattered onto the placeholder positions by the model.
+protocol Qwen35VisionPath: AnyObject {
+    /// Dtype pixels are cast to before entering the tower.
+    var visionDType: DType { get }
+    /// `[rows, llm hidden]`, crops/frames in input order.
+    func features(pixels: MLXArray, frames: [THW]) -> MLXArray
+    /// Rows `features` yields for these frames.
+    func mergedRowCount(for frames: [THW]) -> Int
+    /// Vision-side weight key/layout fixes, applied after the language-model remap.
+    func sanitizeVision(weights: [String: MLXArray]) -> [String: MLXArray]
+}
+
+extension Qwen3VLVision.VisionModel: Qwen35VisionPath {
+    var visionDType: DType { patchEmbed.proj.weight.dtype }
+    func features(pixels: MLXArray, frames: [THW]) -> MLXArray { self(pixels, gridTHW: frames).0 }
+    func mergedRowCount(for frames: [THW]) -> Int {
+        let divisor = max(1, spatialMergeSize * spatialMergeSize)
+        return frames.reduce(0) { $0 + $1.product / divisor }
+    }
+    func sanitizeVision(weights: [String: MLXArray]) -> [String: MLXArray] { sanitize(weights: weights) }
 }
 
 // MARK: - Language
@@ -1349,12 +1817,28 @@ enum Qwen35Language {
             super.init()
         }
 
+        /// MLX's vector SDPA (`sdpa_vector_2pass`, scaled_dot_product_attention.cpp) picks its key-block
+        /// count from the key count; on 's'-class GPUs (M5 Max) with 16 query heads: 64 up to 1,024 keys,
+        /// 128 up to 8,192, 256 up to 32,768, 512 up to 65,536, 1,024 above. A 2-row verify call is one
+        /// launch at the second row's key count, so when the first row's own decode step had fewer keys
+        /// across one of those steps it reduced in a different block split and the pair is not row-exact
+        /// (vmlx Python 201ac128 found the same pitfall). Conservative on other GPU classes: any of
+        /// these thresholds counts.
+        static func vectorSDPAKeyClassChanges(lastRowKeys: Int) -> Bool {
+            let thresholds = [1024, 8192, 16384, 32768, 65536]
+            return thresholds.contains(lastRowKeys - 1)
+        }
+
         func callAsFunction(
             _ x: MLXArray,
             mask: MLXArray?,
             cache: KVCache?,
-            positionIds: MLXArray?
+            positionIds: MLXArray?,
+            decisionStateTokenCount: Int? = nil
         ) -> MLXArray {
+            if let scope = DFlash2TreeScope.current, let cache, x.dim(0) == 1 {
+                return treeAttention(x, cache: cache, scope: scope)
+            }
             let B = x.dim(0)
             let L = x.dim(1)
 
@@ -1366,18 +1850,22 @@ enum Qwen35Language {
             // Off unless VMLX_MTP_VERIFY_TILE is set.
             let qProjOutput = Qwen4ExpVerifyTile.padded(
                 x, family: Qwen4ExpVerifyTile.Family.qwen35
-            ) { qProj($0) }
+            ) { qwen4ExpProjection(qProj, $0) }
             let qSplit = qProjOutput.reshaped(B, L, numAttentionHeads, -1).split(parts: 2, axis: -1)
             var queries = qSplit[0]
             let gate = qSplit[1].reshaped(B, L, -1)
 
             var keys = Qwen4ExpVerifyTile.padded(
                 x, family: Qwen4ExpVerifyTile.Family.qwen35
-            ) { kProj($0) }
+            ) { qwen4ExpProjection(kProj, $0) }
             var values = Qwen4ExpVerifyTile.padded(
                 x, family: Qwen4ExpVerifyTile.Family.qwen35
-            ) { vProj($0) }
+            ) { qwen4ExpProjection(vProj, $0) }
 
+            let captureLayer = Qwen4ExpRowExactCapture.currentLayer
+            Qwen4ExpRowExactCapture.part(captureLayer, "attn.q_proj", qProjOutput)
+            Qwen4ExpRowExactCapture.part(captureLayer, "attn.k_proj", keys)
+            Qwen4ExpRowExactCapture.part(captureLayer, "attn.v_proj", values)
             queries = qNorm(queries).transposed(0, 2, 1, 3)
             keys = kNorm(keys.reshaped(B, L, numKeyValueHeads, -1)).transposed(0, 2, 1, 3)
             values = values.reshaped(B, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
@@ -1426,7 +1914,11 @@ enum Qwen35Language {
                 q: queries, k: keys, cos: cosValues, sin: sinValues)
 
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
-            if let mask {
+            if let mask, Qwen35CausalPrefillMask.applies(
+                mask: mask, rows: L, batch: B, cache: cache, fullBufferCache: fullBufferCache)
+            {
+                attentionMask = .causal
+            } else if let mask {
                 // Full-buffer (Compilable) caches: mask and K/V both span the
                 // whole static buffer — pass through unsliced.
                 attentionMask =
@@ -1436,29 +1928,91 @@ enum Qwen35Language {
                 attentionMask = .none
             }
 
-            let output = JangHadamardAttention.attention(
-                queries: queries,
-                keys: keys,
-                values: values,
-                cache: cache,
-                scale: scale,
-                mask: attentionMask,
-                enabled: JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
-            )
+            let hadamard = JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
+            let attended: MLXArray
+            if let split = decisionStateTokenCount {
+                // Zero selects noncausal full attention; a positive value selects prefix-bidir.
+                // Only the explicit cache-free decision forward supplies this parameter.
+                precondition(cache == nil && split >= 0 && split < L)
+                func attend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray) -> MLXArray {
+                    let count = q.dim(2)
+                    var pieces: [MLXArray] = []
+                    // Match the reference query-only chunking. Every row still sees ALL keys;
+                    // this bounds fallback head-256 score allocation without windowing/truncation.
+                    for start in stride(from: 0, to: count, by: 2048) {
+                        let piece = MLXFast.scaledDotProductAttention(
+                            queries: q[0..., 0..., start..<min(start + 2048, count), 0...],
+                            keys: k, values: v, scale: scale, mask: .none)
+                        eval(piece)
+                        pieces.append(piece)
+                    }
+                    return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 2)
+                }
+                if split == 0 {
+                    attended = attend(queries, keys, values)
+                } else {
+                    let state = attend(queries[0..., 0..., 0..<split, 0...],
+                        keys[0..., 0..., 0..<split, 0...], values[0..., 0..., 0..<split, 0...])
+                    let question = attend(queries[0..., 0..., split..., 0...], keys, values)
+                    attended = concatenated([state, question], axis: 2)
+                }
+            } else if B == 1, (2...8).contains(L), !hadamard, let simple = cache,
+                type(of: simple) == KVCacheSimple.self,
+                FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "attn"),
+                L >= 3 || Self.vectorSDPAKeyClassChanges(lastRowKeys: simple.offset + L)
+            {
+                // Verify rows 3...8: one single-query attention per row over exactly the keys its AR step
+                // saw. With 16 query heads per KV head, `rows x 16 > 32` leaves MLX's vector kernel for the
+                // full SDPA kernel, so every row of a 3+-row verify differed from AR (Ornith 122B 4M, W=3
+                // row 0). Two rows stay on the vector kernel and match their decode steps, unless the
+                // pair straddles a key count where MLX changes the kernel's key-block split (see
+                // `vectorSDPAKeyClassChanges`); then each row is attended alone too.
+                let (cachedKeys, cachedValues) = simple.update(keys: keys, values: values)
+                let total = cachedKeys.dim(2)
+                attended = MLX.concatenated(
+                    (0 ..< L).map { row in
+                        let visible = total - L + row + 1
+                        return MLXFast.scaledDotProductAttention(
+                            queries: queries[0..., 0..., row ..< (row + 1), 0...],
+                            keys: cachedKeys[0..., 0..., ..<visible, 0...],
+                            values: cachedValues[0..., 0..., ..<visible, 0...],
+                            scale: scale, mask: .none)
+                    }, axis: 2)
+            } else {
+                attended = JangHadamardAttention.attention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    cache: cache,
+                    scale: scale,
+                    mask: attentionMask,
+                    enabled: hadamard
+                )
+            }
+            let output = attended
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
+            Qwen4ExpRowExactCapture.part(captureLayer, "attn.q_roped", queries.transposed(0, 2, 1, 3))
+            Qwen4ExpRowExactCapture.part(captureLayer, "attn.sdpa", output)
 
             return Qwen4ExpVerifyTile.padded(
                 compiledSigmoidMultiply(output, gate),
                 family: Qwen4ExpVerifyTile.Family.qwen35
-            ) { oProj($0) }
+            ) { qwen4ExpProjection(oProj, $0) }
         }
     }
 
     final class MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "gate_proj") var gateProj: Linear
-        @ModuleInfo(key: "down_proj") var downProj: Linear
-        @ModuleInfo(key: "up_proj") var upProj: Linear
+        // UnaryLayer, not Linear: dense JANGH bundles (Qwen3.8-27B JANGH2) install `JANGHDenseLinear` here
+        // (Qwen35JANGHPreparation). Affine/plain paths still take the Linear fast path in `project`.
+        @ModuleInfo(key: "gate_proj") var gateProj: UnaryLayer
+        @ModuleInfo(key: "down_proj") var downProj: UnaryLayer
+        @ModuleInfo(key: "up_proj") var upProj: UnaryLayer
+
+        private func project(_ module: UnaryLayer, _ x: MLXArray) -> MLXArray {
+            if let linear = module as? Linear { return qwen4ExpProjection(linear, x) }
+            return module(x)
+        }
 
         init(dimensions: Int, hiddenDimensions: Int) {
             _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -1469,7 +2023,11 @@ enum Qwen35Language {
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
             // Fused silu(gate) * up via compiled swiglu (1 Metal dispatch vs 2).
-            downProj(_vlmCompiledSwiGLU(gateProj(x), upProj(x)))
+            let gate = project(gateProj, x)
+            let up = project(upProj, x)
+            let activated = _vlmCompiledSwiGLU(gate, up)
+            let result = project(downProj, activated)
+            return result
         }
     }
 
@@ -1584,12 +2142,25 @@ enum Qwen35Language {
             super.init()
         }
 
+        private nonisolated(unsafe) static var didReportFusionSkipped = false
+
+        /// One line per process: the fused GDN decode projection was not built because the
+        /// projections are windows into a mapped safetensors shard (see `WeightBacking`).
+        static func reportFusionSkippedForMappedWeights() {
+            fusionDiagnosticLock.lock()
+            defer { fusionDiagnosticLock.unlock() }
+            guard !didReportFusionSkipped else { return }
+            didReportFusionSkipped = true
+            RuntimeDiagnostics.write(
+                Data("[Qwen4Exp] fused_gdn_decode_input_projections=skipped reason=mapped_shard_weights\n".utf8))
+        }
+
         private func ensureFusedDecodeInputProjection(
-            _ inputs: MLXArray
+            _ inputs: MLXArray, exactRowVerifier: Bool = false
         ) -> FusedDecodeInputProjection? {
             guard
                 RuntimeEnvironment.value("VMLX_QWEN4_EXP_FUSE_DECODE_INPUTS") != "0",
-                fuseDecodeInputProjections, inputs.dim(1) == 1,
+                fuseDecodeInputProjections, inputs.dim(1) == 1 || exactRowVerifier,
                 !CompiledDecodeTrace.isActive
             else { return nil }
 
@@ -1614,18 +2185,31 @@ enum Qwen35Language {
                 else { return nil }
 
                 let quantized = modules.map { $0 as! QuantizedLinear }
+                // The fused copy must REPLACE the four projections (rebindAsRows below). Weights that
+                // are windows into a mapped shard (the shipped mmap loader) cannot be released, so the
+                // copy would be a permanent duplicate: Qwen3.8-27B +4.1 GB for ~2 % decode. Skip.
+                // SPEED-CRITICAL (Flash-Next / Allosaurus MTP): this fusion is also the ONLY route to
+                // the bit-exact multi-row verify kernel. `WeightBacking.storage(of:)` must stay
+                // weights-only — counting the mapped f16 scales/biases there disabled this path for
+                // every qwen4_exp load (2026-10-11 → 2026-10-14 regression). Read the note on
+                // `WeightBacking.storage(of:)` before touching this guard.
+                guard WeightBacking.copyWouldReplace(WeightBacking.storage(of: quantized)) else {
+                    Self.reportFusionSkippedForMappedWeights()
+                    return nil
+                }
                 let weight = concatenated(quantized.map(\.weight), axis: 0)
                 let scales = concatenated(quantized.map(\.scales), axis: 0)
                 let biases = concatenated(
                     quantized.map { $0.biases ?? firstBiases }, axis: 0)
                 MLX.eval(weight, scales, biases)
+                WeightBacking.rebindAsRows(quantized, weight: weight, scales: scales, biases: biases)
                 fusedDecodeInputProjection = FusedDecodeInputProjection(
                     weight: weight, scales: scales, biases: biases,
                     groupSize: first.groupSize, bits: first.bits, mode: first.mode)
                 Self.fusionDiagnosticLock.lock()
                 if !Self.didReportDecodeInputFusion {
                     Self.didReportDecodeInputFusion = true
-                    FileHandle.standardError.write(
+                    RuntimeDiagnostics.write(
                         Data(
                             "[Qwen4Exp] fused_gdn_decode_input_projections=active dtype=\(inputs.dtype)\n"
                                 .utf8))
@@ -1636,11 +2220,15 @@ enum Qwen35Language {
             return fusedDecodeInputProjection
         }
 
-        private func fusedDecodeInputs(_ inputs: MLXArray) -> [MLXArray]? {
+        private func fusedDecodeInputs(
+            _ inputs: MLXArray, exactRowVerifier: Bool = false
+        ) -> [MLXArray]? {
             // Uniform-scheme fast path: the existing whole-4 fusion and its
             // native BF16-affine kernel, byte-for-byte the shipped behavior
             // (Flash Next / qwen4_exp bundles land here).
-            if let fusedDecodeInputProjection = ensureFusedDecodeInputProjection(inputs) {
+            if let fusedDecodeInputProjection = ensureFusedDecodeInputProjection(
+                inputs, exactRowVerifier: exactRowVerifier)
+            {
                 let splitIndices = [
                     convDim, convDim + valueDim, convDim + valueDim + numVHeads,
                 ]
@@ -1722,6 +2310,13 @@ enum Qwen35Language {
                 })
             else { return nil }
             let q = quantizedModules.map { $0! }
+            // Same rule as the uniform path: only fuse when the copy replaces the members.
+            // SPEED-CRITICAL: keep `WeightBacking.storage(of:)` weights-only (see its note) or
+            // Flash-Next / Allosaurus lose the fused verify path and MTP falls back to AR in the app.
+            guard WeightBacking.copyWouldReplace(WeightBacking.storage(of: q)) else {
+                Self.reportFusionSkippedForMappedWeights()
+                return nil
+            }
 
             func scheme(_ m: QuantizedLinear) -> String {
                 "\(m.groupSize)/\(m.bits)/\(m.mode)/\(m.scales.dtype)/\(m.biases!.dtype)"
@@ -1740,6 +2335,7 @@ enum Qwen35Language {
                     let scales = concatenated(mods.map(\.scales), axis: 0)
                     let biases = concatenated(mods.map { $0.biases! }, axis: 0)
                     MLX.eval(weight, scales, biases)
+                    WeightBacking.rebindAsRows(mods, weight: weight, scales: scales, biases: biases)
                     var splits: [Int] = []
                     var offset = 0
                     for m in mods.dropLast() {
@@ -1780,7 +2376,7 @@ enum Qwen35Language {
                     if case .fused(let members, _, _) = segment { return members.count }
                     return nil
                 }
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         "[Qwen4Exp] fused_gdn_decode_input_projections=active groups=\(fusedCounts) dtype=\(inputs.dtype)\n"
                             .utf8))
@@ -1824,7 +2420,9 @@ enum Qwen35Language {
                 headVDim: headVDim)
         }
 
-        private func compiledDecodeTail(_ output: MLXArray, gate: MLXArray) -> MLXArray? {
+        private func compiledDecodeTail(
+            _ output: MLXArray, gate: MLXArray, batchedRows: Bool = false
+        ) -> MLXArray? {
             guard fuseDecodeInputProjections,
                 jangAllowsRawQuantizedProjection(outProj),
                 let quantized = outProj as? QuantizedLinear,
@@ -1837,7 +2435,7 @@ enum Qwen35Language {
                 outWeight: quantized.weight, outScales: quantized.scales,
                 outBiases: biases, eps: norm.eps,
                 groupSize: quantized.groupSize, bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode, batchedRows: batchedRows)
         }
 
         /// One-shot (per process) diagnostic for a discarded incompatible
@@ -1863,8 +2461,30 @@ enum Qwen35Language {
             recordPrefixCommitStates: Bool = false,
             fuseQKNormalization: Bool = false
         ) -> MLXArray {
+            if let scope = DFlash2TreeScope.current, let cache, inputs.dim(0) == 1 {
+                return treeForward(inputs, cache: cache, scope: scope)
+            }
             let B = inputs.dim(0)
             let S = inputs.dim(1)
+            // Exact-row target verification only; AR and ordinary prefill retain their paths.
+            let exactRowVerifier =
+                FlashVerificationScope.usesRowExactVerification(
+                    inputShape: inputs.shape, site: "gdn")
+                && verifyTileFamily == Qwen4ExpVerifyTile.Family.qwen4Exp
+                && recordPrefixCommitStates && B == 1 && (2...8).contains(S)
+                && NativeMTPVerifierStatePolicy.mode == .inputCaptureStaged
+                && !CompiledDecodeTrace.isActive && inputs.dtype == .bfloat16
+                && hiddenSize == 2560 && numVHeads == 48 && numKHeads == 16
+                && headKDim == 128 && headVDim == 128
+                && [inProjQKV, inProjZ, inProjB, inProjA, outProj].allSatisfy { module in
+                    guard jangAllowsRawQuantizedProjection(module),
+                        let q = module as? QuantizedLinear else { return false }
+                    return (q.bits == 4 || q.bits == 6 || q.bits == 8)
+                        && q.bits == (inProjQKV as? QuantizedLinear)?.bits
+                        && q.groupSize == 64 && q.mode == .affine
+                        && q.scales.dtype == .float16 && q.biases?.dtype == .float16
+                        && q.bias == nil
+                }
 
             // A restored cache (paged/hybrid restore, prefix commit) can hand
             // back a slot whose shape no longer matches this layer — an
@@ -1884,6 +2504,7 @@ enum Qwen35Language {
                 convState = MLXArray.zeros(
                     [B, max(0, convKernelSize - 1), convDim], dtype: inputs.dtype)
             }
+
 
             // Staged verify (compiled DFlash 2): committed cache slots and
             // offset stay UNTOUCHED for the whole forward; everything the
@@ -1916,12 +2537,12 @@ enum Qwen35Language {
                     cache[0] = tail.dtype == inputs.dtype ? tail : tail.asType(inputs.dtype)
                 }
             } else {
-                let fusedInputs = fusedDecodeInputs(inputs)
-                var mixedQKV = fusedInputs?[0] ?? verifyTiled(inputs) { inProjQKV($0) }
-                z = (fusedInputs?[1] ?? verifyTiled(inputs) { inProjZ($0) }).reshaped(
+                let fusedInputs = fusedDecodeInputs(inputs, exactRowVerifier: exactRowVerifier)
+                var mixedQKV = fusedInputs?[0] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjQKV, $0) }
+                z = (fusedInputs?[1] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjZ, $0) }).reshaped(
                     B, S, numVHeads, headVDim)
-                b = fusedInputs?[2] ?? verifyTiled(inputs) { inProjB($0) }
-                a = fusedInputs?[3] ?? verifyTiled(inputs) { inProjA($0) }
+                b = fusedInputs?[2] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjB, $0) }
+                a = fusedInputs?[3] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjA, $0) }
 
                 if let mask {
                     mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
@@ -1939,7 +2560,14 @@ enum Qwen35Language {
                     }
                 }
 
-                let convOut = silu(conv1d(convInput))
+                let gdnCaptureLayer = Qwen4ExpRowExactCapture.currentLayer
+                Qwen4ExpRowExactCapture.part(gdnCaptureLayer, "gdn.qkv", mixedQKV)
+                Qwen4ExpRowExactCapture.part(gdnCaptureLayer, "gdn.z", z)
+                Qwen4ExpRowExactCapture.part(gdnCaptureLayer, "gdn.b", b)
+                Qwen4ExpRowExactCapture.part(gdnCaptureLayer, "gdn.a", a)
+                let convolution = conv1d(convInput)
+                let convOut = silu(convolution)
+                Qwen4ExpRowExactCapture.part(gdnCaptureLayer, "gdn.conv_silu", convOut)
                 let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
                 let q = split[0].reshaped(B, S, numKHeads, headKDim)
                 let k = split[1].reshaped(B, S, numKHeads, headKDim)
@@ -1972,6 +2600,7 @@ enum Qwen35Language {
                         * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
                 }
             }
+
 
             // Same defense as the conv slot: a mis-restored recurrent state
             // with the wrong rank/head dims crashes inside `gatedDeltaUpdate`
@@ -2007,6 +2636,9 @@ enum Qwen35Language {
                     && NativeMTPVerifierStatePolicy.shouldRoundGDNStateEachVerifierStep
             )
             let finalState = state!
+            Qwen4ExpRowExactCapture.part(Qwen4ExpRowExactCapture.currentLayer, "gdn.q_normed", qNormed)
+            Qwen4ExpRowExactCapture.part(Qwen4ExpRowExactCapture.currentLayer, "gdn.k_normed", kNormed)
+            Qwen4ExpRowExactCapture.part(Qwen4ExpRowExactCapture.currentLayer, "gdn.recurrence", out)
 
             if let cache {
                 if stageVerify {
@@ -2064,14 +2696,43 @@ enum Qwen35Language {
             // outProj is a row-independent matmul, so the whole output stage
             // may run at padded M and be sliced back afterwards. All cache
             // and staging writes above already saw only the real rows.
-            return verifyTiledOutput(out, gate: z) { paddedOut, paddedGate in
+            // Row-exact verify: each row's norm-gate + out_proj tail is the 1-row step's (the compiled tail's
+            // fused product switches kernels with M). Flash Next admits this through `exactRowVerifier`; any
+            // other GDN layer (Ornith / Qwen 3.5 trunks) through the active Flash verification scope.
+            let scopedRowExact =
+                !exactRowVerifier && B == 1 && (2...8).contains(S)
+                && FlashVerificationScope.usesRowExactVerification(inputShape: inputs.shape, site: "gdn")
+            if scopedRowExact, fuseDecodeInputProjections,
+                type(of: outProj) == QuantizedLinear.self,
+                let gated = Qwen4ExpCompiledGDNInputs.callTailGated(
+                    output: out, gate: z, sigmoidGate: norm.sigmoidGate, normWeight: norm.weight,
+                    eps: norm.eps)
+            {
+                // All verify rows' norm-gate in one region, then out_proj through the row-exact QMV (weights
+                // streamed once): bitwise the per-row compiled tail, without S weight streams.
+                return qwen4ExpProjection(outProj, gated)
+            }
+            if exactRowVerifier || scopedRowExact {
+                let rows = (0..<S).map { row -> MLXArray in
+                    let rowOutput = out[0..., row..<(row + 1), 0..., 0...]
+                    let rowGate = z[0..., row..<(row + 1), 0..., 0...]
+                    if let tail = compiledDecodeTail(rowOutput, gate: rowGate) { return tail }
+                    // Match the existing S1 fallback when its compiled tail is unavailable.
+                    let normed = norm(rowOutput, gate: rowGate)
+                    return outProj(normed.reshaped(normed.dim(0), normed.dim(1), -1))
+                }
+                let result = concatenated(rows, axis: 1)
+                return result
+            }
+            let result = verifyTiledOutput(out, gate: z) { paddedOut, paddedGate in
                 if let tail = compiledDecodeTail(paddedOut, gate: paddedGate) {
                     return tail
                 }
                 let normed = norm(paddedOut, gate: paddedGate)
-                return outProj(
-                    normed.reshaped(normed.dim(0), normed.dim(1), -1))
+                let projectionInput = normed.reshaped(normed.dim(0), normed.dim(1), -1)
+                return outProj(projectionInput)
             }
+            return result
         }
 
         /// Verify-tile M-pad for this layer's row-independent projections; a
@@ -2091,6 +2752,107 @@ enum Qwen35Language {
             return Qwen4ExpVerifyTile.padded(x, gate, family: verifyTileFamily) {
                 body($0, $1)
             }
+        }
+
+        /// DFlash 2 tree verify: every row runs its OWN root path. The depthwise conv reads each
+        /// row's path window (gathered rows of `[conv state; window]`), the recurrence runs the
+        /// tree kernel from the committed state, and nothing committed is written — the commit
+        /// replays the kept path (`commitTree`). Projections go through the same modules as the
+        /// chain verify (LaneQMM when installed).
+        private func treeForward(
+            _ inputs: MLXArray, cache: MambaCache, scope: DFlash2TreeScope
+        ) -> MLXArray {
+            let W = inputs.dim(1)
+            let diag = NativeMTPPhaseDiagnostics.enabled
+            var t = Date.timeIntervalSinceReferenceDate
+            func mark(_ phase: String, _ arrays: MLXArray...) {
+                guard diag else { return }
+                MLX.eval(arrays)
+                let now = Date.timeIntervalSinceReferenceDate
+                NativeMTPPhaseDiagnostics.record(phase, seconds: now - t)
+                t = now
+            }
+            let nKeep = max(0, convKernelSize - 1)
+            let convState: MLXArray
+            if let cached = cache[0], cached.ndim == 3, cached.dim(0) == 1, cached.dim(2) == convDim {
+                convState = cached
+            } else {
+                convState = MLXArray.zeros([1, nKeep, convDim], dtype: inputs.dtype)
+            }
+            let mixedQKV = qwen4ExpProjection(inProjQKV, inputs)
+            let z = qwen4ExpProjection(inProjZ, inputs).reshaped(1, W, numVHeads, headVDim)
+            let b = qwen4ExpProjection(inProjB, inputs)
+            let a = qwen4ExpProjection(inProjA, inputs)
+            let captureLayer = Qwen4ExpRowExactCapture.currentLayer
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.qkv", mixedQKV)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.z", z)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.b", b)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.a", a)
+            mark("tree_gdn_inproj", mixedQKV, z, b, a)
+            let source = concatenated([convState, mixedQKV], axis: 1)[0]  // [nKeep + W, convDim]
+            let windows = scope.convWindows(nKeep: nKeep)  // [W, nKeep + 1]
+            let gathered = take(source, windows.reshaped(-1), axis: 0)
+                .reshaped(W, nKeep + 1, convDim)
+            let convOut = silu(conv1d(gathered)).reshaped(1, W, convDim)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.conv_silu", convOut)
+            let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            let q = split[0].reshaped(1, W, numKHeads, headKDim)
+            let k = split[1].reshaped(1, W, numKHeads, headKDim)
+            let v = split[2].reshaped(1, W, numVHeads, headVDim)
+            let invScale = pow(Float(headKDim), -0.5)
+            let qNormed = MLXArray(pow(invScale, 2), dtype: q.dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormed = MLXArray(invScale, dtype: k.dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            var state = cache[1] ?? MLXArray.zeros([1, numVHeads, headVDim, headKDim], dtype: .float32)
+            if state.dtype != .float32 { state = state.asType(.float32) }
+            mark("tree_gdn_conv_norm", qNormed, kNormed, v)
+            let g = computeGatedDeltaG(aLog, a, dtBias)
+            let y = vlmGatedDeltaTree(
+                q: qNormed, k: kNormed, v: v, g: g, b: b, state: state,
+                parents: scope.plan.parents)
+            scope.records[ObjectIdentifier(cache)] = [qNormed, kNormed, v, a, b, mixedQKV, convState]
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.q_normed", qNormed)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.k_normed", kNormed)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.recurrence", y)
+            mark("tree_gdn_recurrence", y)
+            let out: MLXArray
+            if FlashVerificationScope.usesRowExactVerification(inputShape: inputs.shape, site: "gdn") {
+                out = concatenated((0..<W).map { row in
+                    let output = y[0..., row..<(row + 1), 0..., 0...]
+                    let gate = z[0..., row..<(row + 1), 0..., 0...]
+                    if let tail = compiledDecodeTail(output, gate: gate) { return tail }
+                    return outProj(norm(output, gate: gate).reshaped(1, 1, -1))
+                }, axis: 1)
+            } else {
+                out = outProj(norm(y, gate: z).reshaped(1, W, -1))
+            }
+            mark("tree_gdn_out", out)
+            return out
+        }
+
+        /// Keep `keptRows` (root path) of the last tree window: recurrent state = chain replay of
+        /// the kept rows from the untouched committed state; conv state = the last `nKeep` rows of
+        /// `[conv state; kept rows' projections]`.
+        func commitTree(cache: MambaCache, scope: DFlash2TreeScope, keptRows: [Int]) -> Bool {
+            guard let record = scope.records[ObjectIdentifier(cache)], record.count == 7,
+                !keptRows.isEmpty
+            else { return false }
+            let index = MLXArray(keptRows.map(Int32.init))
+            func rows(_ x: MLXArray) -> MLXArray { take(x, index, axis: 1) }
+            let (_, newState) = gatedDeltaUpdate(
+                q: rows(record[0]), k: rows(record[1]), v: rows(record[2]),
+                a: rows(record[3]), b: rows(record[4]),
+                aLog: aLog, dtBias: dtBias, state: cache[1], mask: nil)
+            cache[1] = newState
+            let nKeep = max(0, convKernelSize - 1)
+            if nKeep > 0 {
+                let source = concatenated([record[6], rows(record[5])], axis: 1)
+                let end = source.dim(1)
+                cache[0] = source[0..., (end - nKeep) ..< end, 0...]
+            }
+            cache.offset += keptRows.count
+            return true
         }
 
         /// Commit for the STAGED (compile-compatible) verify: the forward
@@ -2180,7 +2942,7 @@ enum Qwen35Language {
                 }
                 let diff = abs(prefixState - chained!).max().item(Float.self)
                 let scale = abs(chained!).max().item(Float.self)
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         String(
                             format:
@@ -2275,16 +3037,29 @@ enum Qwen35Language {
             layerIdx: Int = -1,
             allowFusedGateUpCache: Bool = true,
             compileDecodeRegions: Bool = false,
-            decodeEquivalentVerifierRows: Bool = false
+            decodeEquivalentVerifierRows: Bool = false,
+            routedExperts: (any WeightedRoutedExpertLayer)? = nil
         ) {
             self.normTopkProb = args.normTopkProb
             self.numExperts = args.numExperts
             self.topK = args.numExpertsPerTok
+            // The compiled router / shared-expert regions are independent of the switch, so a custom
+            // routed bank keeps them (speed parity); the bank itself is called eagerly via callRouted.
             self.compileDecodeRegions = compileDecodeRegions
             self.decodeEquivalentVerifierRows = decodeEquivalentVerifierRows
 
             _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
             let weightFormat = args.weightFormat.lowercased()
+            if let routedExperts {
+                _switchMLP.wrappedValue = routedExperts
+                _sharedExpert.wrappedValue = MLP(
+                    dimensions: args.hiddenSize,
+                    hiddenDimensions: args.sharedExpertIntermediateSize
+                )
+                _sharedExpertGate.wrappedValue = Linear(args.hiddenSize, 1, bias: false)
+                super.init()
+                return
+            }
             let usesTurboQuant =
                 weightFormat == "mxtq"
                 || weightFormat.hasPrefix("jangtq")
@@ -2328,6 +3103,22 @@ enum Qwen35Language {
 
         private func compiledRouter(_ x: MLXArray) -> (MLXArray, MLXArray)? {
             guard compileDecodeRegions else { return nil }
+            // Preserve the actual AR router region for each admitted verification row.
+            // Keep expert evaluation batched; do not change selection or sampling.
+            if FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "router"),
+                !CompiledDecodeTrace.isActive, x.dtype == .bfloat16,
+                !(gate is QuantizedLinear), gate.bias == nil
+            {
+                if let batched = denseRouterRows(x) { return batched }
+                var indices: [MLXArray] = []
+                var scores: [MLXArray] = []
+                for row in MLX.split(x, parts: x.dim(1), axis: 1) {
+                    guard let result = compiledRouter(row) else { return nil }
+                    indices.append(result.0)
+                    scores.append(result.1)
+                }
+                return (MLX.concatenated(indices, axis: 1), MLX.concatenated(scores, axis: 1))
+            }
             if let quantized = gate as? QuantizedLinear,
                 let biases = quantized.biases
             {
@@ -2343,6 +3134,19 @@ enum Qwen35Language {
         }
 
         private func compiledSharedExpert(_ x: MLXArray) -> MLXArray? {
+            if compileDecodeRegions,
+                let gate = sharedExpert.gateProj as? QuantizedLinear, type(of: gate) == QuantizedLinear.self,
+                let up = sharedExpert.upProj as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
+                let down = sharedExpert.downProj as? QuantizedLinear, type(of: down) == QuantizedLinear.self,
+                gate.scales.dtype == .float16,
+                let gateBiases = gate.biases, let upBiases = up.biases, let downBiases = down.biases,
+                sharedExpertGate.bias == nil, !(sharedExpertGate is QuantizedLinear),
+                let shared = Qwen4ExpCompiledMoE.sharedExpertRowsF16Metadata(
+                    x, gate: gate, up: up, down: down, gateBiases: gateBiases, upBiases: upBiases,
+                    downBiases: downBiases, sharedGateWeight: sharedExpertGate.weight)
+            {
+                return shared
+            }
             guard compileDecodeRegions,
                 let gate = sharedExpert.gateProj as? QuantizedLinear,
                 let up = sharedExpert.upProj as? QuantizedLinear,
@@ -2378,10 +3182,14 @@ enum Qwen35Language {
         func requiresDecodeEquivalentRows(_ x: MLXArray) -> Bool {
             let rows = x.size / x.dim(-1)
             guard decodeEquivalentVerifierRows,
-                compileDecodeRegions, (2 ... 4).contains(rows),
-                let affine = switchMLP as? SwitchGLU
+                compileDecodeRegions, (2 ... 4).contains(rows)
             else { return false }
-            return affine.hasUniformAffineQuantization(bits: 4, groupSize: 64)
+            if let affine = switchMLP as? SwitchGLU {
+                return affine.hasUniformAffineQuantization(bits: 4, groupSize: 64)
+            }
+            // Custom routed banks (JANGT trellis / JANGH codebook): the compiled router and shared-expert
+            // regions switch arithmetic with the row count, so a verify row would not reproduce its AR step.
+            return switchMLP is any WeightedRoutedExpertLayer
         }
 
         private func reportDecodeEquivalentRows() {
@@ -2389,13 +3197,93 @@ enum Qwen35Language {
             defer { Self.rowIsolationLogLock.unlock() }
             guard !Self.didReportRowIsolation else { return }
             Self.didReportRowIsolation = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
-                    "[Qwen4Exp] moe_verify_rows=decode_equivalent topology=q4g64\n"
+                    "[Qwen4Exp] moe_verify_rows=decode_equivalent topology=\(switchMLP is SwitchGLU ? "q4g64" : String(describing: type(of: switchMLP)))\n"
                         .utf8))
         }
 
+        /// Every verify row's router in one call, bitwise equal to the 1-row AR router (see
+        /// `Qwen4ExpCompiledMoE.denseRouterRows`). `nil` when the router is not the compiled dense one.
+        private func denseRouterRows(_ window: MLXArray) -> (indices: MLXArray, scores: MLXArray)? {
+            guard compileDecodeRegions, window.dtype == .bfloat16, !(gate is QuantizedLinear), gate.bias == nil
+            else { return nil }
+            return Qwen4ExpCompiledMoE.denseRouterRows(
+                window, weight: gate.weight, topK: topK, normTopK: normTopkProb)
+        }
+
+        /// Top-k expert indices and routing weights (the compiled router when it applies).
+        func routerSelection(_ x: MLXArray) -> (MLXArray, MLXArray) {
+            let captureLayer = Qwen4ExpRowExactCapture.currentLayer
+            Qwen4ExpRowExactCapture.part(captureLayer, "moe.router_input", x)
+            Qwen4ExpRowExactCapture.part(captureLayer, "moe.router_weight", gate.weight)
+            if let compiled = compiledRouter(x) { return compiled }
+            var gates: MLXArray
+            if x.ndim == 3, x.dim(0) == 1, (2...8).contains(x.dim(1)),
+                FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "router"),
+                type(of: gate) == Linear.self
+            {
+                // Verify rows: the dense router as one 1-row product per row. An M = rows product (or an
+                // M = 1 batch) takes a different matmul kernel than the AR step, so a verify row's scores
+                // differed in the last bit (Ornith 122B 4M layer 43, identical expert indices).
+                gates = MLX.concatenated(
+                    MLX.split(x, parts: x.dim(1), axis: 1).map { gate($0) }, axis: 1)
+            } else {
+                gates = gate(x)
+            }
+            if let fused = Qwen35RouterTail.call(gates, topK: topK, normalize: normTopkProb) {
+                return fused
+            }
+            gates = MLX.softmax(gates, axis: -1, precise: true)
+            let kth = gates.dim(-1) - topK
+            let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
+            var selected = MLX.takeAlong(gates, inds, axis: -1)
+            if normTopkProb {
+                selected = selected / selected.sum(axis: -1, keepDims: true)
+            }
+            return (inds, selected)
+        }
+
         func callAsFunction(_ x: MLXArray) -> MLXArray {
+            if requiresDecodeEquivalentRows(x),
+                let weighted = switchMLP as? any WeightedRoutedExpertLayer, !(switchMLP is SwitchGLU)
+            {
+                // Custom routed banks decode every (token, slot) on its own (JANGT / JANGH decode kernels), so
+                // only the router and shared expert need the 1-row step's shapes; the bank runs once for all
+                // verify rows (half the launches of a per-row block at two rows, bitwise the same rows).
+                let rows = x.size / x.dim(-1)
+                let hidden = x.dim(-1)
+                let window = x.reshaped(1, rows, hidden)
+                // Router per row: its dense product as an M = 1 batch did not reproduce the 1-row product bit
+                // for bit (Allosaurus 0.2, BENCH_ROWEXACT position 21); the shared expert's quantized products do.
+                if let sharedRows = compiledSharedExpert(window) {
+                    let routing: (indices: MLXArray, scores: MLXArray)
+                    if let batched = denseRouterRows(window) {
+                        routing = batched
+                    } else {
+                        let parts = MLX.split(window, parts: rows, axis: 1).map { routerSelection($0) }
+                        routing = (indices: MLX.concatenated(parts.map(\.0), axis: 1),
+                                   scores: MLX.concatenated(parts.map(\.1), axis: 1))
+                    }
+                    let routed = weighted.callRouted(window, indices: routing.indices, scores: routing.scores)
+                    reportDecodeEquivalentRows()
+                    return (routed + sharedRows).reshaped(x.shape)
+                }
+                let rowInputs = MLX.split(window, parts: rows, axis: 1)
+                var indices: [MLXArray] = [], scores: [MLXArray] = [], shared: [MLXArray] = []
+                for row in rowInputs {
+                    let (rowIndices, rowScores) = routerSelection(row)
+                    indices.append(rowIndices)
+                    scores.append(rowScores)
+                    shared.append(compiledSharedExpert(row)
+                        ?? compiledSigmoidGate(sharedExpertGate(row), sharedExpert(row)))
+                }
+                let routed = weighted.callRouted(
+                    x.reshaped(1, rows, hidden), indices: MLX.concatenated(indices, axis: 1),
+                    scores: MLX.concatenated(scores, axis: 1))
+                reportDecodeEquivalentRows()
+                return (routed + MLX.concatenated(shared, axis: 1)).reshaped(x.shape)
+            }
             if requiresDecodeEquivalentRows(x) {
                 let rows = x.size / x.dim(-1)
                 let hidden = x.dim(-1)
@@ -2408,21 +3296,10 @@ enum Qwen35Language {
                 return result
             }
 
-            let inds: MLXArray
-            let scores: MLXArray
-            if let compiled = compiledRouter(x) {
-                (inds, scores) = compiled
-            } else {
-                var gates = gate(x)
-                gates = MLX.softmax(gates, axis: -1, precise: true)
-                let kth = gates.dim(-1) - topK
-                inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
-                var selected = MLX.takeAlong(gates, inds, axis: -1)
-                if normTopkProb {
-                    selected = selected / selected.sum(axis: -1, keepDims: true)
-                }
-                scores = selected
-            }
+            let (inds, scores) = routerSelection(x)
+            let captureLayer = Qwen4ExpRowExactCapture.currentLayer
+            Qwen4ExpRowExactCapture.part(captureLayer, "moe.indices", inds)
+            Qwen4ExpRowExactCapture.part(captureLayer, "moe.scores", scores)
 
             let routed: MLXArray?
             let eagerCombined: MLXArray?
@@ -2443,6 +3320,10 @@ enum Qwen35Language {
                     routed = affine(x, inds)
                     eagerCombined = nil
                 }
+            } else if let weighted = switchMLP as? any WeightedRoutedExpertLayer {
+                // JANGH (and future custom) banks: router-weighted sum fused in the bank.
+                routed = nil
+                eagerCombined = weighted.callRouted(x, indices: inds, scores: scores)
             } else {
                 fatalError("Unsupported Qwen35 VLM MoE switch_mlp: \(type(of: switchMLP))")
             }
@@ -2454,20 +3335,41 @@ enum Qwen35Language {
                 return result
             }
             if let eagerCombined, let shared = compiledSharedExpert(x) {
-                return eagerCombined + shared
+                Qwen4ExpRowExactCapture.part(captureLayer, "moe.routed", eagerCombined)
+                Qwen4ExpRowExactCapture.part(captureLayer, "moe.shared", shared)
+                let result = eagerCombined + shared
+                return result
             }
             let combined =
                 eagerCombined
                 ?? (routed! * scores[.ellipsis, .newAxis]).sum(axis: -2)
             let sharedY = sharedExpert(x)
-            let gatedSharedY = compiledSigmoidGate(sharedExpertGate(x), sharedY)
-
-            return combined + gatedSharedY
+            let sharedGate: MLXArray
+            if x.ndim == 3, x.dim(0) == 1, (2...8).contains(x.dim(1)),
+                FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "moe"),
+                type(of: sharedExpertGate) == Linear.self
+            {
+                // Verify rows: the dense 1-wide shared-expert gate as one 1-row product per row; a single
+                // M = rows product takes a different matmul kernel than the AR step's M = 1 call (Ornith
+                // 122B 4M layer 9: mlp_out differed while router, routed bank and shared MLP matched).
+                sharedGate = MLX.concatenated(
+                    MLX.split(x, parts: x.dim(1), axis: 1).map { sharedExpertGate($0) }, axis: 1)
+            } else {
+                sharedGate = sharedExpertGate(x)
+            }
+            Qwen4ExpRowExactCapture.part(captureLayer, "moe.routed", combined)
+            Qwen4ExpRowExactCapture.part(captureLayer, "moe.shared_mlp", sharedY)
+            Qwen4ExpRowExactCapture.part(captureLayer, "moe.shared_gate", sharedGate)
+            let gatedSharedY = compiledSigmoidGate(sharedGate, sharedY)
+            let result = combined + gatedSharedY
+            return result
         }
     }
 
     final class DecoderLayer: Module {
         let isLinear: Bool
+        /// Model position of this block; used only by the row-exact capture taps (RunBench BENCH_ROWEXACT).
+        let layerIndex: Int
 
         @ModuleInfo(key: "self_attn") var selfAttn: Attention?
         @ModuleInfo(key: "linear_attn") var linearAttn: GatedDeltaNet?
@@ -2479,6 +3381,7 @@ enum Qwen35Language {
 
         init(_ args: Qwen35Configuration.TextConfiguration, layerIdx: Int) {
             self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
+            self.layerIndex = layerIdx
             let compiledDecodeRegions = shouldCompileDecodeRegions(args)
 
             if isLinear {
@@ -2526,7 +3429,8 @@ enum Qwen35Language {
             ssmMask: MLXArray?,
             cache: KVCache?,
             positionIds: MLXArray?,
-            recordPrefixCommitStates: Bool = false
+            recordPrefixCommitStates: Bool = false,
+            decisionStateTokenCount: Int? = nil
         ) -> MLXArray {
             let r: MLXArray
             if NativeMTPPhaseDiagnostics.enabled {
@@ -2541,22 +3445,29 @@ enum Qwen35Language {
                 } else {
                     r = selfAttn!(
                         inputLayerNorm(x), mask: attentionMask, cache: cache,
-                        positionIds: positionIds)
+                        positionIds: positionIds, decisionStateTokenCount: decisionStateTokenCount)
                 }
                 MLX.eval(r)
                 NativeMTPPhaseDiagnostics.record(
                     phase,
                     seconds: Date.timeIntervalSinceReferenceDate - start)
             } else if isLinear {
+                Qwen4ExpRowExactCapture.currentLayer = layerIndex
+                let normed = inputLayerNorm(x)
+                Qwen4ExpRowExactCapture.part(layerIndex, "input_norm", normed)
                 r = linearAttn!(
-                    inputLayerNorm(x),
+                    normed,
                     mask: ssmMask,
                     cache: cache as? MambaCache,
                     recordPrefixCommitStates: recordPrefixCommitStates)
             } else {
+                Qwen4ExpRowExactCapture.currentLayer = layerIndex
+                let normed = inputLayerNorm(x)
+                Qwen4ExpRowExactCapture.part(layerIndex, "input_norm", normed)
                 r = selfAttn!(
-                    inputLayerNorm(x), mask: attentionMask, cache: cache, positionIds: positionIds)
+                    normed, mask: attentionMask, cache: cache, positionIds: positionIds, decisionStateTokenCount: decisionStateTokenCount)
             }
+            Qwen4ExpRowExactCapture.part(layerIndex, "mixer_out", r)
 
             let h = x + r
             if NativeMTPPhaseDiagnostics.enabled {
@@ -2568,7 +3479,27 @@ enum Qwen35Language {
                     seconds: Date.timeIntervalSinceReferenceDate - start)
                 return h + out
             }
-            return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+            let mlpInput = postAttentionLayerNorm(h)
+            Qwen4ExpRowExactCapture.part(layerIndex, "mlp_input", mlpInput)
+            let mlpOut: MLXArray
+            if mlpInput.dim(1) > 8,
+                FlashVerificationScope.usesRowExactVerification(inputShape: mlpInput.shape)
+            {
+                mlpOut = concatenated(stride(from: 0, to: mlpInput.dim(1), by: 8).map { start in
+                    let end = min(start + 8, mlpInput.dim(1))
+                    return FlashVerificationScope.withVerification(inputShape: [1, end - start]) {
+                        RoutedExpertVerificationScope.withVerification(inputShape: [1, end - start]) {
+                            (mlp as! UnaryLayer)(mlpInput[0..., start..<end, 0...])
+                        }
+                    }
+                }, axis: 1)
+            } else {
+                mlpOut = (mlp as! UnaryLayer)(mlpInput)
+            }
+            Qwen4ExpRowExactCapture.part(layerIndex, "mlp_out", mlpOut)
+            let out = h + mlpOut
+            if Qwen4ExpRowExactCapture.enabled { Qwen4ExpRowExactCapture.layers.append(out) }
+            return out
         }
     }
 
@@ -2811,6 +3742,9 @@ enum Qwen35Language {
 
             var captured: [Int: MLXArray] = [:]
             captured.reserveCapacity(captureLayerIDs.count)
+            let pipelineTreeVerify = DFlash2TreeScope.current != nil
+                && !CompiledDecodeTrace.isActive
+                && ProcessInfo.processInfo.environment["VMLX_DFLASH2_TREE_PIPELINE"] != "0"
 
             for (index, layer) in layers.enumerated() {
                 let layerSSMMask = layer.isLinear ? ssmMask : nil
@@ -2824,6 +3758,12 @@ enum Qwen35Language {
                 )
                 if captureLayerIDs.contains(index) {
                     captured[index] = hiddenStates
+                }
+                // Tree verify runs eager: submit every 4 layers (and after layer 0) so the GPU
+                // starts while the host is still building the rest of the 64-layer graph — the
+                // donors' pipelined verify build. Same graph, same bits.
+                if pipelineTreeVerify, index + 1 < layers.count, index == 0 || index % 4 == 3 {
+                    asyncEval(hiddenStates)
                 }
             }
 
@@ -2855,13 +3795,13 @@ enum Qwen35Language {
                 hidden, family: Qwen4ExpVerifyTile.Family.qwen35
             ) { input in
                 if let lmHead {
-                    return lmHead(input)
+                    return qwen4ExpProjection(lmHead, input)
                 }
                 return model.embedTokens.asLinear(input)
             }
         }
 
-        init(_ config: Qwen35Configuration) {
+        init(_ config: Qwen35Configuration, headless: Bool = false) {
             self.config = config
             self.textConfig = config.textConfiguration
             self.modelType = config.textConfiguration.modelType
@@ -2871,13 +3811,13 @@ enum Qwen35Language {
                 count: config.textConfiguration.hiddenLayers
             )
 
-            if !config.textConfiguration.tieWordEmbeddings {
+            if !headless && !config.textConfiguration.tieWordEmbeddings {
                 _lmHead.wrappedValue = Linear(
                     config.textConfiguration.hiddenSize,
                     config.textConfiguration.vocabularySize,
                     bias: false)
             }
-            if config.textConfiguration.mtpNumHiddenLayers > 0 {
+            if !headless && config.textConfiguration.mtpNumHiddenLayers > 0 {
                 _mtp.wrappedValue = MTPModule(config.textConfiguration)
             }
             super.init()
@@ -2886,6 +3826,47 @@ enum Qwen35Language {
         func resetPositionState() {
             precomputedPositionIds = nil
             ropeDeltas = nil
+            restoredPrefixPositionsArmed = false
+        }
+
+        /// True from ``armRestoredPrefixPositions(inputIds:imageGridTHW:videoGridTHW:)`` until the
+        /// prefill that follows a cache restore has consumed the last prompt position. While set,
+        /// `prepare` keeps the plan instead of resetting it and `resolvedPositionIds` slices it.
+        fileprivate var restoredPrefixPositionsArmed = false
+
+        /// M-RoPE positions and decode delta of the request's FULL prompt (all tokens, every media
+        /// grid), for a request whose prefix was restored from the cache. The suffix then takes
+        /// exactly the positions a cold prefill gives it: after a restored image its text continues
+        /// from the compressed media positions (not offset + index), and an image in the suffix is
+        /// placed after the restored text. Decode continues from offset + the full prompt's delta.
+        func armRestoredPrefixPositions(
+            inputIds: MLXArray, imageGridTHW: [THW]?, videoGridTHW: [THW]?
+        ) {
+            let ids = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
+            let computed: MLXArray
+            let deltas: MLXArray
+            if let canvas = config.miniCPMCanvas {
+                (computed, deltas) = MiniCPMV47Canvas.ropeIndex(
+                    inputIds: ids,
+                    imageGrids: imageGridTHW,
+                    videoGrids: videoGridTHW,
+                    imageTokenId: config.imageTokenId,
+                    videoTokenId: config.videoTokenId,
+                    canvas: canvas)
+            } else {
+                (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
+                    inputIds: ids,
+                    imageGridTHW: imageGridTHW,
+                    videoGridTHW: videoGridTHW,
+                    spatialMergeSize: config.visionConfiguration?.spatialMergeSize ?? 1,
+                    imageTokenId: config.imageTokenId,
+                    videoTokenId: config.videoTokenId,
+                    visionStartTokenId: config.visionStartTokenId,
+                    attentionMask: nil)
+            }
+            precomputedPositionIds = computed
+            ropeDeltas = deltas
+            restoredPrefixPositionsArmed = true
         }
 
         fileprivate func resolvedPositionIds(
@@ -2897,6 +3878,21 @@ enum Qwen35Language {
             videoGridTHW: [THW]?,
             resetForMedia: Bool
         ) -> MLXArray? {
+            if restoredPrefixPositionsArmed {
+                restoredPrefixPositionsArmed = false
+                if providedPositionIds == nil, let plan = precomputedPositionIds,
+                    let cache, let faCache = cache[model.faIdx],
+                    graphOffsetArray(for: faCache) == nil
+                {
+                    let start = faCache.offset
+                    let end = start + inputs.dim(1)
+                    if end <= plan.dim(2) {
+                        // Stay armed for the next prefill chunk until the prompt is consumed.
+                        restoredPrefixPositionsArmed = end < plan.dim(2)
+                        return plan[0..., 0..., start ..< end]
+                    }
+                }
+            }
             if resetForMedia {
                 precomputedPositionIds = nil
                 ropeDeltas = nil
@@ -2968,6 +3964,21 @@ enum Qwen35Language {
                         positionIds =
                             precomputedPositionIds[
                                 0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
+                    } else if let canvas = config.miniCPMCanvas,
+                        imageGridTHW != nil || videoGridTHW != nil
+                    {
+                        // MiniCPM-V 4.7 canvas M-RoPE: thumbnail stretched over the slice canvas, markers
+                        // pinned to its corners (`MiniCPMV4_7Model.get_rope_index`).
+                        let (computed, deltas) = MiniCPMV47Canvas.ropeIndex(
+                            inputIds: inputs,
+                            imageGrids: imageGridTHW,
+                            videoGrids: videoGridTHW,
+                            imageTokenId: config.imageTokenId,
+                            videoTokenId: config.videoTokenId,
+                            canvas: canvas)
+                        positionIds = computed
+                        precomputedPositionIds = computed
+                        ropeDeltas = deltas
                     } else {
                         let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
                             inputIds: inputs,
@@ -3019,7 +4030,8 @@ enum Qwen35Language {
             positionIds providedPositionIds: MLXArray? = nil,
             pixelValues: MLXArray? = nil,
             imageGridTHW: [THW]? = nil,
-            videoGridTHW: [THW]? = nil
+            videoGridTHW: [THW]? = nil,
+            lastRowLogits: Bool = false
         ) -> LMOutput {
             let positionIds = resolvedPositionIds(
                 inputs: inputs,
@@ -3036,6 +4048,13 @@ enum Qwen35Language {
                 cache: cache,
                 positionIds: positionIds
             )
+            // The last call of a CHUNKED prefill only needs the next-token row (its callers already
+            // receive just the final chunk's rows and read the last one): the LM head over every row
+            // of a 2,048-row chunk is ~3 TFLOP and a [rows, 248k] logits buffer for nothing. A prompt
+            // that fits one window keeps full-prompt logits (Qwen35MediaPrefillTests contract).
+            if lastRowLogits, out.dim(1) > 1 {
+                out = out[0..., (out.dim(1) - 1)..., 0...]
+            }
 
             out = headLogits(out)
 
@@ -3119,18 +4138,29 @@ enum Qwen35Language {
                 cache: cacheOpt,
                 positionIds: positionIds,
                 recordPrefixCommitStates: recordPrefixCommitStates)
+            let normed = model.norm(hidden)
             let logits: MLXArray
             if NativeMTPPhaseDiagnostics.enabled {
                 let start = Date.timeIntervalSinceReferenceDate
-                logits = headLogits(model.norm(hidden))
+                logits = headLogits(normed)
                 MLX.eval(logits)
                 NativeMTPPhaseDiagnostics.record(
                     "vlm_lm_head",
                     seconds: Date.timeIntervalSinceReferenceDate - start)
             } else {
-                logits = headLogits(model.norm(hidden))
+                logits = headLogits(normed)
             }
-            return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
+            // The hidden handed to the MTP head: post-final-norm for routed-MoE Qwen 3.5 (Ornith), the
+            // trunk's own pre-norm hidden otherwise. vmlx Python ec3618d6 measured the MoE head
+            // accepting more with the post-norm input (teacher-forced code 71.5 -> 76.6 %, live D1
+            // 71.0 -> 73.8 %). The logits are unchanged (one final norm either way).
+            return NativeMTPForwardResult(
+                logits: logits, hiddenStates: Self.mtpUsesPostNormHidden(textConfig) ? normed : hidden)
+        }
+
+        static func mtpUsesPostNormHidden(_ config: Qwen35Configuration.TextConfiguration) -> Bool {
+            config.numExperts > 0
+                && ProcessInfo.processInfo.environment["VMLX_QWEN35_MTP_HIDDEN"] != "pre"
         }
 
         func nativeMTPForward(
@@ -3154,20 +4184,27 @@ enum Qwen35Language {
                     seconds: Date.timeIntervalSinceReferenceDate - blockStart)
 
                 let headStart = Date.timeIntervalSinceReferenceDate
-                let logits = headLogits(mtp.norm(hidden))
+                let normed = mtp.norm(hidden)
+                let logits = headLogits(normed)
                 MLX.eval(logits)
                 NativeMTPPhaseDiagnostics.record(
                     "vlm_mtp_lm_head",
                     seconds: Date.timeIntervalSinceReferenceDate - headStart)
-                return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
+                return NativeMTPForwardResult(
+                    logits: logits,
+                    hiddenStates: Self.mtpUsesPostNormHidden(textConfig) ? normed : hidden)
             }
             let hidden = mtp.preNormHidden(
                 hiddenStates: hiddenStates,
                 nextTokenIds: nextTokenIds,
                 embedTokens: model.embedTokens,
                 cache: cache)
-            let logits = headLogits(mtp.norm(hidden))
-            return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
+            let normed = mtp.norm(hidden)
+            let logits = headLogits(normed)
+            // Chained drafts feed the head's post-`mtp.norm` output, matching the trunk hidden it was
+            // seeded with (see `textOnlyForwardWithHidden`).
+            return NativeMTPForwardResult(
+                logits: logits, hiddenStates: Self.mtpUsesPostNormHidden(textConfig) ? normed : hidden)
         }
 
         func makeCache(maxKVSize: Int?) -> [KVCache] {
@@ -3187,12 +4224,34 @@ enum Qwen35Language {
 // MARK: - Model
 
 public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel,
-    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping
+    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping,
+    SafetensorsLoadKeyExcluding
 {
-    @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel?
+    /// Dense JANGH bank tensors (`*.tq2_packed` / `*.tq2_scales`) owned by installed `JANGHDenseLinear`
+    /// modules; the generic safetensors loader must not try to bind them. Empty for ordinary bundles.
+    public var customDenseTensorNames: Set<String> = []
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        !customDenseTensorNames.isEmpty && customDenseTensorNames.contains(key)
+    }
+
+    /// Qwen3-VL's `Qwen3VLVision.VisionModel` or MiniCPM-V 4.7's `MiniCPMV47Vision.Tower`, both conforming to
+    /// `Qwen35VisionPath`; one module slot because both bundles store their tower under `vision_tower.`.
+    @ModuleInfo(key: "vision_tower") private var visionModel: Module?
+    fileprivate var visionPath: (any Qwen35VisionPath)? { visionModel as? any Qwen35VisionPath }
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
     public let config: Qwen35Configuration
+
+    /// Routed-MoE backbones prefill 2048-token chunks: each chunk's expert
+    /// matmuls then see ~64 rows per expert instead of ~16, while the GDN
+    /// recurrence and attention cost per token stay the same. Ornith 1.5 122B
+    /// (JANG_4M, 15,750-token prompt, M5 Max): 512 -> 864 tok/s, 2048 -> 1187
+    /// tok/s, 4096 -> 1216 tok/s; peak process footprint 3.4 / 6.2 / 10.3 GB.
+    /// 2048 keeps most of the speed for a quarter of 4096's extra memory.
+    /// Dense backbones keep the library default.
+    public var recommendedPrefillStepSize: Int? {
+        config.textConfiguration.numExperts > 0 ? 2048 : nil
+    }
 
     /// What this instance actually carries. Same contract as the other converted families.
     public let modalities: Set<ModelRuntimeRequestModality>
@@ -3206,7 +4265,10 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     public static func constructibleModalities(
         of config: Qwen35Configuration
     ) -> Set<ModelRuntimeRequestModality> {
-        config.visionConfiguration != nil ? [.text, .vision, .video] : [.text]
+        if config.visionConfiguration != nil { return [.text, .vision, .video] }
+        // MiniCPM-V 4.7: images only. Its video path (frames stacked onto one canvas image) is not ported.
+        if config.miniCPMVisionConfiguration != nil { return [.text, .vision] }
+        return [.text]
     }
 
 
@@ -3217,7 +4279,9 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     ) -> Set<ModelRuntimeRequestModality> {
         var m: Set<ModelRuntimeRequestModality> = []
         if components.contains(.languageCore) { m.insert(.text) }
-        if components.contains(.visionTower) { m.formUnion([.vision, .video]) }
+        if components.contains(.visionTower) {
+            m.formUnion(config.miniCPMVisionConfiguration != nil ? [.vision] : [.vision, .video])
+        }
         return m
     }
 
@@ -3250,27 +4314,42 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         self.init(config, plan: try Self.resolveConstruction(config, requesting: requesting))
     }
 
-    /// The one real initialiser. Private on purpose: a plan can only come from
-    /// `resolveConstruction`, so no caller can hand this an empty or unsupported selection.
-    private init(_ config: Qwen35Configuration, plan: ResolvedConstructionPlan) {
+    /// Keep the designated initializer module-internal. With a private initializer,
+    /// optimized inherited convenience initialization can allocate a Qwen35 rather
+    /// than its Qwen35MoE subclass, bypassing the MoE sanitizer through LanguageModel.
+    /// External callers still use the public initializers and resolveConstruction.
+    init(_ config: Qwen35Configuration, plan: ResolvedConstructionPlan, decisionBackbone: Bool = false) {
         self.plan = plan
         self.config = config
         // Built first, so the capability report can be COLLECTED from what actually exists rather
         // than copied from the plan. A tower that did not get built — because the caller narrowed
         // the request, or because the configuration had no vision stanza — cannot contribute, so
         // the report cannot claim a lane the instance lacks.
-        var tower: Qwen3VLVision.VisionModel?
+        var tower: (any ModelCapabilityProviding)?
         if let vision = config.visionConfiguration, plan.builds(.visionTower) {
-            tower = Qwen3VLVision.VisionModel(vision)
-            _visionModel.wrappedValue = tower
+            // D3's trained vision MLP declares GELU-tanh, not the legacy sigmoid approximation.
+            // Preserve the existing generative constructor until its separate regression lane.
+            let built = Qwen3VLVision.VisionModel(vision,
+                mlpActivation: decisionBackbone ? (vision.hiddenAct == "gelu" ? .none : .tanh) : .fast)
+            tower = built
+            _visionModel.wrappedValue = built
+        } else if let vision = config.miniCPMVisionConfiguration, plan.builds(.visionTower) {
+            let built = MiniCPMV47Vision.Tower(
+                vision, canvas: config.miniCPMCanvas ?? MiniCPMV47CanvasConfiguration(),
+                llmHidden: config.textConfiguration.hiddenSize)
+            tower = built
+            _visionModel.wrappedValue = built
         }
-        _languageModel.wrappedValue = Qwen35Language.LanguageModel(config)
+        _languageModel.wrappedValue = Qwen35Language.LanguageModel(config, headless: decisionBackbone)
 
         // The components declare their own contribution; `.video` is added here because it needs
-        // this model's video token id, which the encoder knows nothing about.
+        // this model's video token id, which the encoder knows nothing about. MiniCPM-V 4.7's tower
+        // serves images only (its video path is not ported), so it never gains `.video`.
         var provided = Set<ModelRuntimeRequestModality>.provided(by: [tower])
         provided.insert(.text)  // this family's core is a text LM
-        if provided.contains(.vision), config.videoTokenId != nil { provided.insert(.video) }
+        if provided.contains(.vision), config.videoTokenId != nil, config.miniCPMVisionConfiguration == nil {
+            provided.insert(.video)
+        }
         self.modalities = provided
         super.init()
     }
@@ -3278,6 +4357,45 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     /// What was actually built. Kept so `prepare` and `sanitize` can ask about MODULES rather than
     /// re-deriving them from lanes.
     public let plan: ResolvedConstructionPlan
+
+    convenience init(decisionConfiguration config: Qwen35Configuration) throws {
+        self.init(config, plan: try Self.resolveConstruction(config, requesting: nil), decisionBackbone: true)
+    }
+
+    /// Cache-free decision forward. GDN remains causal, full attention does not.
+    /// This path never projects vocabulary logits or allocates a conversation KV cache.
+    func decisionHidden(input: LMInput, stateTokenCount: Int?) throws -> MLXArray {
+        let ids = input.text.tokens
+        var hidden = languageModel.model.embedTokens(ids)
+        let imageFrames = input.image?.frames
+        let videoFrames = input.video?.frames
+        let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
+        var pixels: [MLXArray] = []
+        if let image = input.image { pixels.append(image.pixels) }
+        if let video = input.video { pixels.append(video.pixels) }
+        if !pixels.isEmpty {
+            guard let visionPath else { throw VLMError.processing("Decision media requires the vision tower") }
+            let features = visionPath.features(
+                pixels: concatenated(pixels).asType(visionPath.visionDType), frames: frames)
+            (hidden, _) = try mergeInputIdsWithImageFeatures(
+                imageFeatures: features.asType(hidden.dtype), imageRowCount: mergedRowCount(for: imageFrames),
+                inputEmbeds: hidden, inputIds: ids, imageTokenIndex: config.imageTokenIndex,
+                videoTokenIndex: config.videoTokenIndex)
+        }
+        let axes = try D3MRoPE.positions(tokens: ids.asArray(Int32.self).map(Int.init),
+            images: imageFrames ?? [], videos: videoFrames ?? [],
+            merge: config.visionConfiguration?.spatialMergeSize ?? 1,
+            imageToken: config.imageTokenId, videoToken: config.videoTokenId ?? -1)
+        let positions = stacked(axes.map { MLXArray($0) }).expandedDimensions(axis: 1)
+        for layer in languageModel.model.layers {
+            try Task.checkCancellation()
+            hidden = layer(hidden, attentionMask: nil, ssmMask: nil, cache: nil,
+                positionIds: positions, decisionStateTokenCount: stateTokenCount ?? 0)
+            // Bound activation ownership to one block rather than the entire eager graph.
+            eval(hidden)
+        }
+        return languageModel.model.norm(hidden)
+    }
 
     public var vocabularySize: Int { config.vocabSize }
 
@@ -3380,10 +4498,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     /// vision tower's output rows: each `THW` frame yields
     /// `t*h*w / spatialMergeSize^2` rows.
     private func mergedRowCount(for frames: [THW]?) -> Int {
-        guard let frames, let vision = config.visionConfiguration else { return 0 }
-        let merge = vision.spatialMergeSize
-        let divisor = max(1, merge * merge)
-        return frames.reduce(0) { $0 + $1.product / divisor }
+        guard let frames, let visionPath else { return 0 }
+        return visionPath.mergedRowCount(for: frames)
     }
 
     private func nonZero(_ mask: MLXArray) -> [Int] {
@@ -3423,8 +4539,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 + "(modalities: \(modalities.modalityDescription)). "
                 + "Load with .vision requested, or send text only.")
         }
-        let visionDType =
-            visionModel?.patchEmbed.proj.weight.dtype ?? languageModel.model.embedTokens.weight.dtype
+        let visionDType = visionPath?.visionDType ?? languageModel.model.embedTokens.weight.dtype
         var pixelParts: [MLXArray] = []
 
         if let image = input.image {
@@ -3441,12 +4556,12 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
         var inputEmbeddings: MLXArray?
 
-        if let pixelValues, let visionModel,
+        if let pixelValues, let visionPath,
             let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
                 .nilIfEmpty
         {
             let textEmbeds = languageModel.model.embedTokens(inputIds)
-            let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
+            let visionHidden = visionPath.features(pixels: pixelValues, frames: frames)
             let visionFeatures = visionHidden.asType(textEmbeds.dtype)
 
             let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
@@ -3458,7 +4573,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 videoTokenIndex: config.videoTokenIndex
             )
             inputEmbeddings = mergedEmbeds
-        } else {
+        } else if !languageModel.restoredPrefixPositionsArmed {
             languageModel.resetPositionState()
         }
 
@@ -3507,7 +4622,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 inputIds[0..., offset...],
                 inputsEmbeds: inputEmbeddings[0..., offset..., 0...],
                 cache: typedCache,
-                positionIds: positions[0..., 0..., offset...]))
+                positionIds: positions[0..., 0..., offset...],
+                lastRowLogits: true))
         }
 
         // Chunked text-only prefill so the UI prefill counter advances instead
@@ -3560,7 +4676,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 positionIds: nil,
                 pixelValues: nil,
                 imageGridTHW: nil,
-                videoGridTHW: nil
+                videoGridTHW: nil,
+                lastRowLogits: true
             )
             return .logits(output)
         }
@@ -3669,6 +4786,9 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
     public var nativeMTPAvailable: Bool { languageModel.mtp != nil }
 
+    static let rowExactVerify =
+        ProcessInfo.processInfo.environment["VMLX_QWEN35_ROW_EXACT_VERIFY"] != "0"
+
     public func makeNativeMTPCache() -> [KVCache] {
         languageModel.mtp?.makeCache() ?? []
     }
@@ -3684,10 +4804,22 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         _ inputs: MLXArray,
         cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        languageModel.textOnlyForwardWithHidden(
-            inputs,
-            cache: cache,
-            recordPrefixCommitStates: true)
+        // Native-MTP target verification (rows 2...8): every projection, router and shared expert takes
+        // the single-row step's arithmetic per row (FlashVerificationScope sites), and routed experts take
+        // the single-token reduction (RoutedExpertVerificationScope). Without the Flash scope a verify row
+        // ran MLX's multi-row qmv for the 8-bit trunk projections, which differs from the 1-row kernel in
+        // the last bit (Ornith 122B layer 0: in_proj_qkv / in_proj_z), so greedy MTP diverged from AR within
+        // ~50 tokens. `VMLX_QWEN35_ROW_EXACT_VERIFY=0` restores the previous (non-exact) verify.
+        let body = {
+            RoutedExpertVerificationScope.withVerification(inputShape: inputs.shape) {
+                self.languageModel.textOnlyForwardWithHidden(
+                    inputs,
+                    cache: cache,
+                    recordPrefixCommitStates: true)
+            }
+        }
+        guard Self.rowExactVerify else { return body() }
+        return FlashVerificationScope.withVerification(inputShape: inputs.shape, operation: body)
     }
 
     public func nativeMTPForward(
@@ -3814,10 +4946,13 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
         // With no tower built, the bundle's vision weights have no destination — drop them
         // rather than hand them to a module that does not exist.
-        guard let visionModel else {
-            return sanitized.filter { !$0.key.contains("visual") && !$0.key.contains("vision_tower") }
+        guard let visionPath else {
+            // `merger.` is MiniCPM-V's top-level resampler (Qwen keeps its merger under the tower).
+            return sanitized.filter {
+                !$0.key.contains("visual") && !$0.key.contains("vision_tower") && !$0.key.hasPrefix("merger.")
+            }
         }
-        return visionModel.sanitize(weights: sanitized)
+        return visionPath.sanitizeVision(weights: sanitized)
     }
 
     private static func mtpNormWeightsNeedShift(_ weights: [String: MLXArray]) -> Bool {
@@ -3916,7 +5051,7 @@ extension Qwen35: NativeMTPProposalHeadInstalling {
     public func installNativeMTPProposalHead(
         bits: Int, calibratedDraft: ProposalHeadCalibratedDraft?
     ) {
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[ProposalHead] qwen3_5 head is stamp-eligible (q\(bits)) but draft "
                 + "routing is not implemented for this family yet; drafting stays "
                 + "on the full head\n").utf8))
@@ -3932,5 +5067,657 @@ extension Qwen35: JangHadamardRuntimeModel {
             throw JangLoaderError.loadFailed(
                 "Hadamard Qwen3.5 requires an untied dense model without MTP")
         }
+    }
+}
+
+#if DEBUG
+/// Saved-operand diagnostic only. No model construction or production dispatch changes.
+final class Qwen4ExpGDNReplayBridge {
+    private let inputs: [QuantizedLinear]
+    private let output: QuantizedLinear
+    private let norm: Qwen35Language.RMSNormGated
+    private let eps: Float
+
+    init(weights: [String: MLXArray], eps: Float) throws {
+        let names = ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"]
+        let expected = Set(names.flatMap { n in ["\(n).weight", "\(n).scales", "\(n).biases"] } + ["norm.weight"])
+        guard expected.isSubset(of: Set(weights.keys)), eps > 0 else {
+            throw NSError(domain: "GDNReplay exact affine bank contract", code: 1)
+        }
+        var modules: [QuantizedLinear] = []
+        for (index, name) in names.enumerated() {
+            let w = weights[name + ".weight"]!
+            let s = weights[name + ".scales"]!
+            let b = weights[name + ".biases"]!
+            let dimensions = [(10240, 2560), (6144, 2560), (48, 2560), (48, 2560), (2560, 6144)][index]
+            guard w.shape == [dimensions.0, dimensions.1 / 8], w.dtype == .uint32,
+                s.shape == [dimensions.0, dimensions.1 / 64], s.dtype == .float16,
+                b.shape == s.shape, b.dtype == .float16
+            else { throw NSError(domain: "GDNReplay q4/g64/F16 bank geometry", code: 2) }
+            modules.append(QuantizedLinear(
+                weight: w, scales: s, biases: b, groupSize: 64, bits: 4, mode: .affine))
+        }
+        let normWeight = weights["norm.weight"]!
+        guard normWeight.shape == [128], normWeight.dtype == .bfloat16 else {
+            throw NSError(domain: "GDNReplay norm geometry", code: 3)
+        }
+        inputs = Array(modules.prefix(4))
+        output = modules[4]
+        norm = Qwen35Language.RMSNormGated(dimensions: 128, eps: eps, sigmoidGate: true)
+        try norm.update(parameters: ModuleParameters.unflattened(["weight": normWeight]), verify: .all)
+        self.eps = eps
+    }
+
+    func projections(_ x: MLXArray, grouped: Bool) -> [MLXArray] {
+        if grouped {
+            let result = Qwen4ExpBF16Affine.dense(
+                x, concatenated(inputs.map(\.weight), axis: 0),
+                scales: concatenated(inputs.map(\.scales), axis: 0),
+                biases: concatenated(inputs.map { $0.biases! }, axis: 0),
+                groupSize: 64, bits: 4, mode: .affine)
+            return MLX.split(result, indices: [10240, 16384, 16432], axis: -1)
+        }
+        return inputs.map { $0(x) }
+    }
+
+    func batchedTail(_ x: MLXArray, gate: MLXArray) throws -> MLXArray {
+        guard x.ndim == 4, x.dim(0) == 1, (2...8).contains(x.dim(1)), gate.shape == x.shape,
+            let result = Qwen4ExpCompiledGDNInputs.callTail(
+                output: x.reshaped(x.dim(1), 1, x.dim(2), x.dim(3)),
+                gate: gate.reshaped(gate.dim(1), 1, gate.dim(2), gate.dim(3)),
+                sigmoidGate: true, normWeight: norm.weight,
+                outWeight: output.weight, outScales: output.scales, outBiases: output.biases!,
+                eps: eps, groupSize: 64, bits: 4, mode: .affine, batchedRows: true)
+        else { throw NSError(domain: "GDNReplay batched compiled tail unavailable", code: 5) }
+        return result.reshaped(1, x.dim(1), -1)
+    }
+
+    func tail(_ x: MLXArray, gate: MLXArray, compiled: Bool) throws -> MLXArray {
+        if compiled {
+            guard let result = Qwen4ExpCompiledGDNInputs.callTail(
+                output: x, gate: gate, sigmoidGate: true, normWeight: norm.weight,
+                outWeight: output.weight, outScales: output.scales, outBiases: output.biases!,
+                eps: eps, groupSize: 64, bits: 4, mode: .affine)
+            else { throw NSError(domain: "GDNReplay actual compiled tail unavailable", code: 4) }
+            return result
+        }
+        let normalized = norm(x, gate: gate)
+        return output(normalized.reshaped(normalized.dim(0), normalized.dim(1), -1))
+    }
+}
+#endif
+extension Qwen35Language.Attention {
+    /// DFlash 2 tree verify: rows sit at `start + depth` (siblings share a position) and each row
+    /// attends to the committed prefix plus exactly its own root path. All W rows are appended to
+    /// the cache; `compactTreeWindow` keeps the accepted path at commit.
+    func treeAttention(_ x: MLXArray, cache: KVCache, scope: DFlash2TreeScope) -> MLXArray {
+        let L = x.dim(1)
+        let start = cache.offset + scope.positionDelta
+        let qSplit = qwen4ExpProjection(qProj, x).reshaped(1, L, numAttentionHeads, -1).split(parts: 2, axis: -1)
+        let gate = qSplit[1].reshaped(1, L, -1)
+        var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+        var keys = kNorm(qwen4ExpProjection(kProj, x).reshaped(1, L, numKeyValueHeads, -1)).transposed(0, 2, 1, 3)
+        let values = qwen4ExpProjection(vProj, x).reshaped(1, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
+        let (cosValues, sinValues) = rotaryEmbedding(
+            x: values, positionIds: scope.plan.positionIds(start: start))
+        (queries, keys) = Qwen35Language.applyMultimodalRotaryPosEmb(
+            q: queries, k: keys, cos: cosValues, sin: sinValues)
+        let hadamard = JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
+        if !hadamard, type(of: cache) == KVCacheSimple.self,
+            FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "attn")
+        {
+            let prefix = cache.offset
+            let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+            var outputs: [MLXArray] = []
+            for row in 0..<L {
+                let path = scope.plan.paths[row]
+                let contiguous = path.enumerated().allSatisfy { $0.offset == $0.element }
+                let rowKeys: MLXArray
+                let rowValues: MLXArray
+                if contiguous {
+                    rowKeys = cachedKeys[0..., 0..., ..<(prefix + path.count), 0...]
+                    rowValues = cachedValues[0..., 0..., ..<(prefix + path.count), 0...]
+                } else {
+                    let indices = MLXArray(path.map { Int32(prefix + $0) })
+                    rowKeys = concatenated([cachedKeys[0..., 0..., ..<prefix, 0...],
+                                            take(cachedKeys, indices, axis: 2)], axis: 2)
+                    rowValues = concatenated([cachedValues[0..., 0..., ..<prefix, 0...],
+                                              take(cachedValues, indices, axis: 2)], axis: 2)
+                }
+                let attended = MLXFast.scaledDotProductAttention(
+                    queries: queries[0..., 0..., row..<(row + 1), 0...],
+                    keys: rowKeys, values: rowValues, scale: scale, mask: .none)
+                // A branched path needs a contiguous prefix+ancestor gather for MLX's vector kernel.
+                // Settle it here so multiple full-prefix temporaries cannot accumulate across rows.
+                if !contiguous { MLX.eval(attended) }
+                outputs.append(attended)
+            }
+            let output = concatenated(outputs, axis: 2).transposed(0, 2, 1, 3).reshaped(1, L, -1)
+            return qwen4ExpProjection(oProj, compiledSigmoidMultiply(output, gate))
+        }
+        if MultiRowDecodeAttention.enabled, !hadamard, type(of: cache) == KVCacheSimple.self, L <= 16 {
+            // Draft-tree verify through the multi-row kernel: prefix fully visible, window by root path.
+            let prefix = cache.offset
+            let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+            let attended: MLXArray
+            if MultiRowDecodeAttention.eligible(queries: queries, keys: cachedKeys, values: cachedValues) {
+                attended = MultiRowDecodeAttention.attend(
+                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                    windowBits: scope.multiRowWindowBits)
+            } else {
+                attended = MLXFast.scaledDotProductAttention(
+                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                    mask: .array(scope.attentionMask(prefix: prefix, dtype: queries.dtype)))
+            }
+            return qwen4ExpProjection(oProj, compiledSigmoidMultiply(attended.transposed(0, 2, 1, 3).reshaped(1, L, -1), gate))
+        }
+        let mask = scope.attentionMask(prefix: cache.offset, dtype: queries.dtype)
+        let output = JangHadamardAttention.attention(
+            queries: queries, keys: keys, values: values, cache: cache, scale: scale,
+            mask: .array(mask),
+            enabled: hadamard
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(1, L, -1)
+        return qwen4ExpProjection(oProj, compiledSigmoidMultiply(output, gate))
+    }
+}
+
+
+// MARK: - DFlash 2 draft-tree verify (dense Qwen3.5 / Qwen3.8-27B)
+
+extension Qwen35: DFlash2TreeVerifyModel {
+    public func dflash2TreeForward(
+        _ inputs: MLXArray, cache: [KVCache], captureLayerIDs: Set<Int>, scope: DFlash2TreeScope
+    ) -> (MLXArray, [Int: MLXArray]) {
+        scope.positionDelta = dflash2PositionDelta
+        let forward = {
+            DFlash2TreeScope.with(scope) {
+                self.languageModel.textOnlyForwardCapturing(
+                    inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+            }
+        }
+        // Routed Qwen3.5 targets need the same projection/expert/attention arithmetic as their
+        // single-row verifier. Dense targets retain their separately qualified tree path.
+        guard config.textConfiguration.numExperts > 0 else { return forward() }
+        return FlashVerificationScope.withTreeVerification(inputShape: inputs.shape) {
+            RoutedExpertVerificationScope.withTreeVerification(inputShape: inputs.shape, operation: forward)
+        }
+    }
+
+    public func dflash2CommitTree(cache: [KVCache], scope: DFlash2TreeScope, keptRows: [Int])
+        -> Bool
+    {
+        let window = scope.plan.rows
+        for (index, layer) in languageModel.model.layers.enumerated() {
+            guard index < cache.count else { return false }
+            if layer.isLinear {
+                guard let mamba = cache[index] as? MambaCache, let gdn = layer.linearAttn,
+                    gdn.commitTree(cache: mamba, scope: scope, keptRows: keptRows)
+                else { return false }
+            } else {
+                guard let kv = cache[index] as? KVCacheSimple,
+                    kv.compactTreeWindow(window: window, keptRows: keptRows)
+                else { return false }
+            }
+        }
+        return true
+    }
+
+    public func dflash2SupportsTree(cache: [KVCache]) -> Bool {
+        let layers = languageModel.model.layers
+        guard cache.count >= layers.count else { return false }
+        for (index, layer) in layers.enumerated() {
+            if layer.isLinear {
+                guard cache[index] is MambaCache, let gdn = layer.linearAttn,
+                    gdn.headKDim % 32 == 0
+                else { return false }
+            } else {
+                // Exact type: subclasses (compilable / quantized / rotating) store rows differently.
+                guard type(of: cache[index]) == KVCacheSimple.self else { return false }
+            }
+        }
+        return true
+    }
+}
+
+/// Test probe for the tree GatedDelta kernel: (tree y, chain y over the same rows).
+public enum Qwen35DFlash2TreeKernelProbe {
+    public static func tree(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, b: MLXArray, state: MLXArray,
+        parents: [Int]
+    ) -> MLXArray {
+        vlmGatedDeltaTree(q: q, k: k, v: v, g: g, b: b, state: state, parents: parents)
+    }
+
+    /// The production chain kernel (same inputs, rows in order) → (y, final state).
+    public static func chain(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, b: MLXArray, state: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        vlmGatedDeltaKernel(q: q, k: k, v: v, g: g, b: b, state: state)
+    }
+}
+
+/// Verify-cost attribution on real weights: per-layer ms of each sub-op at a given row count
+/// (each timed alone, eval'd, median of `reps`). Diagnostic only (RunBench BENCH_PARTS).
+/// Prefill chunks attend with the fused kernel's own causal mode instead of the equivalent explicit
+/// mask array. The model builds that array itself (`createAttentionMask(..., returnArray: true)`), and
+/// for a plain single-sequence `KVCacheSimple` it is exactly the lower-right causal mask of the chunk
+/// against every cached key — what `.causal` computes without reading a `[rows, keys]` mask. Fused
+/// D=256 attention for a 2048-row chunk: 272 -> 234 ms at 131,072 keys, 135 -> 115 ms at 65,536.
+/// Verify widths (< 32 rows), batches, compiled full-buffer and windowed caches keep the array.
+/// `VMLX_QWEN35_CAUSAL_PREFILL_MASK=0` restores the array everywhere.
+enum Qwen35CausalPrefillMask {
+    static let enabled = RuntimeEnvironment.value("VMLX_QWEN35_CAUSAL_PREFILL_MASK") != "0"
+
+    static func applies(
+        mask: MLXArray, rows: Int, batch: Int, cache: KVCache?, fullBufferCache: Bool
+    ) -> Bool {
+        guard enabled, rows >= 32, batch == 1, !fullBufferCache, let cache,
+            type(of: cache) == KVCacheSimple.self, mask.ndim == 2
+        else { return false }
+        // The model's causal mask for this chunk: rows x (cached keys + rows).
+        return mask.dim(0) == rows && mask.dim(1) == cache.offset + rows
+    }
+}
+
+public enum Qwen35DFlash2PartsProbe {
+    public static func run(model: Any, rowsList: [Int], reps: Int) -> [String] {
+        guard let m = model as? Qwen35 else { return ["[PARTS] not a Qwen35 VLM model"] }
+        let layers = m.languageModel.model.layers
+        guard let gdnLayer = layers.first(where: { $0.isLinear }), let gdn = gdnLayer.linearAttn,
+            let attnLayer = layers.first(where: { !$0.isLinear }), let attn = attnLayer.selfAttn
+        else { return ["[PARTS] layer kinds missing"] }
+        let hidden = gdn.hiddenSize
+        var lines: [String] = []
+        // `BENCH_PARTS_INNER` (default 1) evaluates that many independent calls of a part in one
+        // `eval`, so per-call launch/sync overhead amortizes and the result is the part's GPU
+        // throughput (what it costs inside a whole decode step).
+        let inner = max(1, Int(ProcessInfo.processInfo.environment["BENCH_PARTS_INNER"] ?? "1") ?? 1)
+        func time(_ body: () -> [MLXArray]) -> Double {
+            var samples: [Double] = []
+            for rep in 0 ..< (reps + 2) {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                MLX.eval((0 ..< inner).flatMap { _ in body() })
+                let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000 / Double(inner)
+                if rep >= 2 { samples.append(ms) }
+            }
+            samples.sort()
+            return samples[samples.count / 2]
+        }
+        for rows in rowsList {
+            let x = (MLXRandom.normal([1, rows, hidden]) * 0.05).asType(.bfloat16)
+            MLX.eval(x)
+            let nKeep = max(0, gdn.convKernelSize - 1)
+            let plan = DFlash2TreePlan(tokens: Array(0 ..< rows), parents: Array(-1 ..< (rows - 1)))
+            let windows = plan.convWindows(nKeep: nKeep)
+            let mixed = gdn.inProjQKV(x)
+            let a = gdn.inProjA(x)
+            let b = gdn.inProjB(x)
+            let convState = MLXArray.zeros([1, nKeep, gdn.convDim], dtype: .bfloat16)
+            MLX.eval(mixed, a, b, windows)
+            let convOut = silu(gdn.conv1d(
+                take(concatenated([convState, mixed], axis: 1)[0], windows.reshaped(-1), axis: 0)
+                    .reshaped(rows, nKeep + 1, gdn.convDim))).reshaped(1, rows, gdn.convDim)
+            let split = MLX.split(convOut, indices: [gdn.keyDim, 2 * gdn.keyDim], axis: -1)
+            let q = split[0].reshaped(1, rows, gdn.numKHeads, gdn.headKDim)
+            let k = split[1].reshaped(1, rows, gdn.numKHeads, gdn.headKDim)
+            let v = split[2].reshaped(1, rows, gdn.numVHeads, gdn.headVDim)
+            let g = computeGatedDeltaG(gdn.aLog, a, gdn.dtBias)
+            let state = MLXArray.zeros(
+                [1, gdn.numVHeads, gdn.headVDim, gdn.headKDim], dtype: .float32)
+            let y = (MLXRandom.normal([1, rows, gdn.numVHeads, gdn.headVDim]) * 0.1)
+                .asType(.bfloat16)
+            let z = gdn.inProjZ(x).reshaped(1, rows, gdn.numVHeads, gdn.headVDim)
+            MLX.eval(q, k, v, g, y, z)
+            var parts: [(String, Double)] = []
+            // 36 chained GDN layer forwards (each output feeds the next, real caches), one eval: the
+            // serial cost of a decode step's GDN stack including dispatch gaps (`/36` per layer).
+            let chainCaches = (0 ..< 36).map { _ in MambaCache() }
+            parts.append(("gdn_chain36", time {
+                var h = x
+                for cache in chainCaches { h = h + gdn(h, cache: cache) * 0.01 }
+                return [h]
+            }))
+            // The same chain with only the five GDN projections (in_proj qkv/z/b/a + out_proj), and with
+            // only the two big ones: how much of the stack is projection streaming vs everything else.
+            parts.append(("proj5_chain36", time {
+                var h = x
+                for _ in 0 ..< 36 {
+                    let zz = gdn.inProjZ(h)
+                    let side = gdn.inProjQKV(h).sum(axis: -1, keepDims: true)
+                        + gdn.inProjB(h).sum(axis: -1, keepDims: true)
+                        + gdn.inProjA(h).sum(axis: -1, keepDims: true)
+                    h = h + gdn.outProj(zz) * 0.01 + side * 0
+                }
+                return [h]
+            }))
+            parts.append(("proj2_chain36", time {
+                var h = x
+                for _ in 0 ..< 36 {
+                    let side = gdn.inProjQKV(h).sum(axis: -1, keepDims: true)
+                    h = h + gdn.outProj(gdn.inProjZ(h)) * 0.01 + side * 0
+                }
+                return [h]
+            }))
+            parts.append(("moe_chain48", time {
+                var h = x
+                for _ in 0 ..< 48 {
+                    h = h + (gdnLayer.mlp as! UnaryLayer)(gdnLayer.postAttentionLayerNorm(h)) * 0.01
+                }
+                return [h]
+            }))
+            if let moe = gdnLayer.mlp as? Qwen35Language.SparseMoeBlock {
+                // MoE stack pieces, chained 48 deep like the real step.
+                parts.append(("router_chain48", time {
+                    var h = x
+                    for _ in 0 ..< 48 {
+                        let (i, sc) = moe.routerSelection(h)
+                        h = h + (sc.sum(axis: -1, keepDims: true) + i.asType(.bfloat16).sum(axis: -1, keepDims: true) * 0).asType(h.dtype) * 0.01
+                    }
+                    return [h]
+                }))
+                let (fixedIdx, fixedScores) = moe.routerSelection(x)
+                MLX.eval(fixedIdx, fixedScores)
+                if let affine = moe.switchMLP as? SwitchGLU {
+                    parts.append(("routed_chain48", time {
+                        var h = x
+                        for _ in 0 ..< 48 {
+                            let r = affine.qwen4ExpReduced(h, indices: fixedIdx, scores: fixedScores)
+                                ?? (affine(h, fixedIdx) * fixedScores[.ellipsis, .newAxis]).sum(axis: -2)
+                            h = h + r * 0.01
+                        }
+                        return [h]
+                    }))
+                }
+                parts.append(("shared_chain48", time {
+                    var h = x
+                    for _ in 0 ..< 48 {
+                        h = h + sigmoid(moe.sharedExpertGate(h)) * moe.sharedExpert(h) * 0.01
+                    }
+                    return [h]
+                }))
+            }
+            parts.append(("gdn_inproj4", time {
+                [gdn.inProjQKV(x), gdn.inProjZ(x), gdn.inProjB(x), gdn.inProjA(x)]
+            }))
+            parts.append(("gdn_conv", time {
+                [silu(gdn.conv1d(
+                    take(concatenated([convState, mixed], axis: 1)[0], windows.reshaped(-1), axis: 0)
+                        .reshaped(rows, nKeep + 1, gdn.convDim)))]
+            }))
+            parts.append(("gdn_qknorm_g", time {
+                [MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6),
+                 MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6),
+                 computeGatedDeltaG(gdn.aLog, a, gdn.dtBias)]
+            }))
+            parts.append(("gdn_rec_chain", time {
+                [vlmGatedDeltaKernel(q: q, k: k, v: v, g: g, b: b, state: state).0]
+            }))
+            parts.append(("gdn_rec_tree", time {
+                [vlmGatedDeltaTree(q: q, k: k, v: v, g: g, b: b, state: state,
+                                   parents: plan.parents)]
+            }))
+            parts.append(("gdn_normgate_out", time {
+                let normed = gdn.norm(y, gate: z)
+                return [gdn.outProj(normed.reshaped(1, rows, -1))]
+            }))
+            parts.append(("mlp", time { [(gdnLayer.mlp as! UnaryLayer)(x)] }))
+            if let moe = gdnLayer.mlp as? Qwen35Language.SparseMoeBlock {
+                parts.append(("moe_router", time { [moe.gate(x)] }))
+                parts.append(("moe_shared", time {
+                    [moe.sharedExpert(x), moe.sharedExpertGate(x)]
+                }))
+            }
+            // Decode attention over BENCH_PARTS_CTX cached keys (default 4096), Ornith geometry.
+            let ctx = Int(ProcessInfo.processInfo.environment["BENCH_PARTS_CTX"] ?? "4096") ?? 4096
+            let sdpaK = (MLXRandom.normal([1, attn.numKeyValueHeads, ctx, attn.headDim]) * 0.5)
+                .asType(.bfloat16)
+            let sdpaV = (MLXRandom.normal([1, attn.numKeyValueHeads, ctx, attn.headDim]) * 0.5)
+                .asType(.bfloat16)
+            let sdpaQ = (MLXRandom.normal([1, attn.numAttentionHeads, rows, attn.headDim]) * 0.5)
+                .asType(.bfloat16)
+            MLX.eval(sdpaK, sdpaV, sdpaQ)
+            parts.append(("attn_sdpa", time {
+                [MLXFast.scaledDotProductAttention(
+                    queries: sdpaQ, keys: sdpaK, values: sdpaV, scale: 0.0625,
+                    mask: rows > 1 ? .causal : .none)]
+            }))
+            parts.append(("attn_proj", time {
+                [attn.qProj(x), attn.kProj(x), attn.vProj(x)]
+            }))
+            parts.append(("attn_oproj", time {
+                [attn.oProj(MLXRandom.normal([1, rows, attn.numAttentionHeads * attn.headDim])
+                    .asType(.bfloat16))]
+            }))
+            parts.append(("layernorms2", time {
+                [gdnLayer.inputLayerNorm(x), gdnLayer.postAttentionLayerNorm(x)]
+            }))
+            parts.append(("lm_head", time { [m.projectToLogits(x)] }))
+            // Achieved bandwidth per projection bit width (every MLP projection of every layer).
+            var byBits: [Int: (bytes: Double, ms: Double)] = [:]
+            for layer in layers {
+                guard let mlp = layer.mlp as? Qwen35Language.MLP else { continue }
+                for module in [mlp.gateProj, mlp.upProj, mlp.downProj] {
+                    guard let q = module as? QuantizedLinear else { continue }
+                    let input = q === (mlp.downProj as AnyObject)
+                        ? (MLXRandom.normal([1, rows, q.weight.dim(1) * 32 / q.bits]) * 0.05)
+                            .asType(.bfloat16)
+                        : x
+                    MLX.eval(input)
+                    let ms = time { [module(input)] }
+                    let bytes = Double(q.weight.nbytes + q.scales.nbytes + (q.biases?.nbytes ?? 0))
+                    let previous = byBits[q.bits] ?? (0, 0)
+                    byBits[q.bits] = (previous.bytes + bytes, previous.ms + ms)
+                }
+            }
+            lines.append("[PARTS] rows=\(rows) mlp by bits: " + byBits.sorted { $0.key < $1.key }.map {
+                String(format: "%dbit %.0fMB %.2fms %.0fGB/s", $0.key, $0.value.bytes / 1e6,
+                       $0.value.ms, $0.value.bytes / 1e6 / $0.value.ms)
+            }.joined(separator: " | "))
+            let gdnCount = layers.filter(\.isLinear).count
+            let attnCount = layers.count - gdnCount
+            lines.append(
+                "[PARTS] rows=\(rows) per-layer ms: "
+                    + parts.map { String(format: "%@=%.3f", $0.0, $0.1) }.joined(separator: " "))
+            let total = parts.reduce(0.0) { sum, part in
+                switch part.0 {
+                case let n where n.hasPrefix("gdn_rec_tree"): return sum
+                case let n where n.hasPrefix("gdn_"): return sum + part.1 * Double(gdnCount)
+                case "moe_router", "moe_shared", "gdn_chain36", "proj5_chain36", "proj2_chain36",
+                    "moe_chain48", "router_chain48", "routed_chain48", "shared_chain48": return sum
+                case "mlp", "layernorms2": return sum + part.1 * Double(layers.count)
+                case let n where n.hasPrefix("attn_"): return sum + part.1 * Double(attnCount)
+                default: return sum + part.1
+                }
+            }
+            lines.append(String(format: "[PARTS] rows=%d model-scaled serial total=%.1f ms", rows, total))
+        }
+        return lines
+    }
+}
+
+/// Native MTP in chats that carry images or video. The native forwards (`textOnlyForwardWithHidden`:
+/// AR steps, verify windows, bridges) resolve positions through `resolvedPositionIds` with the
+/// prefill's `ropeDeltas`, so they continue at the media-shifted M-RoPE positions exactly like the
+/// normal decode step. `Qwen35RestoredMediaPositionTests.nativeForwardsAfterImagePrefill` pins it.
+/// Without this conformance every turn after the first image of a conversation ran AR (Ornith 122B
+/// in-app 4k->128k session S5, 2026-10-20: MTP on turns 1-2, off on all 13 later turns).
+extension Qwen35: NativeMTPMediaCapable {}
+
+extension Qwen35: PrefixCacheInvariantModel {
+    /// Qwen-VL M-RoPE gives every token before the first media placeholder the text position equal
+    /// to its index (the media compression only shifts what follows), the GDN recurrence and
+    /// attention are causal, and media embeddings are spliced only at placeholders. So the state at
+    /// a boundary before the first placeholder is the text-only prompt's state. The suffix that
+    /// carries the media is positioned from the full prompt (`RestoredPrefixPositionModel`), which
+    /// is what made this unsafe before. MiniCPM-V's canvas positions are not covered: false there.
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { config.miniCPMCanvas == nil }
+
+    /// A restored exact-prefix row holds the KV, conv and F32 GDN state of exactly those tokens:
+    /// the forward is causal and the row was written from them alone, so whatever the request
+    /// appends next (a forced tool-selection tail included) cannot have influenced it. Proven on the
+    /// Qwen 3.5 hybrid fixture (`Qwen35HadamardCacheTests`): a reopened disk checkpoint continues
+    /// bitwise equal to the cold cache, and a required-tool request now restores into exactly the
+    /// state the ordinary warm request reaches. Without it, every tool_choice=required turn
+    /// re-prefilled the whole history (Ornith 122B in the app: 24,143 tokens, 20.6 s, with the
+    /// previous turn's 23,861-token boundary on disk).
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+}
+
+extension Qwen35: MediaItemPrefixCacheModel {
+    /// Each image owns `t*h*w / merge²` image-pad placeholders and `t*h*w` pixel rows; each video
+    /// owns that many video-pad placeholders (its frame runs may be separated by timestamp text) and
+    /// rows. Placeholders are assigned to items in order; any count mismatch returns nil.
+    public func mediaItemSpans(in input: LMInput, tokenIds: [Int]) -> [MediaItemSpan]? {
+        guard config.miniCPMCanvas == nil, input.video?.embeddingTokenCount == nil else { return nil }
+        let merge = config.visionConfiguration?.spatialMergeSize ?? 1
+        let perToken = max(1, merge * merge)
+        func spans(_ kind: MediaItemSpan.Kind, tokenId: Int, frames: [THW]?) -> [MediaItemSpan]? {
+            let positions = tokenIds.indices.filter { tokenIds[$0] == tokenId }
+            guard let frames, !frames.isEmpty else { return positions.isEmpty ? [] : nil }
+            var out: [MediaItemSpan] = []
+            var next = 0
+            var row = 0
+            for (index, frame) in frames.enumerated() {
+                let count = frame.product / perToken
+                guard count > 0, frame.product % perToken == 0, next + count <= positions.count
+                else { return nil }
+                out.append(MediaItemSpan(
+                    kind: kind,
+                    tokenRange: positions[next] ..< (positions[next + count - 1] + 1),
+                    pixelRows: row ..< (row + frame.product),
+                    frameIndex: index))
+                next += count
+                row += frame.product
+            }
+            return next == positions.count ? out : nil
+        }
+        guard let images = spans(.image, tokenId: config.imageTokenId, frames: input.image?.frames),
+            let videos = spans(.video, tokenId: config.videoTokenId, frames: input.video?.frames),
+            input.image.map({ $0.pixels.dim(0) == images.last?.pixelRows.upperBound }) ?? true,
+            input.video.map({ $0.pixels.dim(0) == videos.last?.pixelRows.upperBound }) ?? true
+        else { return nil }
+        let all = (images + videos).sorted { $0.tokenRange.lowerBound < $1.tokenRange.lowerBound }
+        for (a, b) in zip(all, all.dropFirst()) where a.tokenRange.upperBound > b.tokenRange.lowerBound {
+            return nil
+        }
+        return all.isEmpty ? nil : all
+    }
+}
+
+extension Qwen35: RestoredPrefixPositionModel {
+    /// A restored prefix of a media request: arm the full prompt's M-RoPE plan so the suffix (text
+    /// after a restored image, or an image after restored text) gets cold-prefill positions and
+    /// decode continues from the full prompt's delta. Text-only and cold requests reset as before.
+    public func prepareRestoredPrefixPositions(fullInput: LMInput, restoredTokenCount: Int) {
+        guard restoredTokenCount > 0, fullInput.image != nil || fullInput.video != nil else {
+            languageModel.resetPositionState()
+            return
+        }
+        languageModel.armRestoredPrefixPositions(
+            inputIds: fullInput.text.tokens,
+            imageGridTHW: fullInput.image?.frames,
+            videoGridTHW: fullInput.video?.frames)
+    }
+}
+
+extension Qwen35: DFlash2MediaPrefillModel {
+    public var dflash2SupportsRestoredMediaSuffix: Bool { config.miniCPMCanvas == nil }
+
+    public func dflash2MediaPrefill(
+        _ input: LMInput, cache: [KVCache], captureLayerIDs: Set<Int>, stepSize: Int,
+        restoredPrefix: Int, boundary: Int?, onBoundary: () -> Void,
+        onChunk: ([Int: MLXArray]) -> Void
+    ) throws -> MLXArray {
+        let inputIds = input.text.tokens
+        guard let visionPath else {
+            throw VLMError.processing("media prefill needs the vision tower")
+        }
+        let visionDType = visionPath.visionDType
+        var pixelParts: [MLXArray] = []
+        var imageFrames: [THW]?
+        var videoFrames: [THW]?
+        if let image = input.image {
+            pixelParts.append(image.pixels.asType(visionDType))
+            imageFrames = image.frames
+        }
+        if let video = input.video {
+            pixelParts.append(video.pixels.asType(visionDType))
+            videoFrames = video.frames
+        }
+        guard !pixelParts.isEmpty,
+            let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
+                .nilIfEmpty
+        else { throw VLMError.processing("media prefill without image or video pixels") }
+        let total = inputIds.dim(1)
+        let start = Swift.max(0, Swift.min(restoredPrefix, total - 1))
+        let textEmbeds = languageModel.model.embedTokens(inputIds)
+        let embeddings: MLXArray
+        let suffixTokens = inputIds[0..., start...].reshaped(-1).asArray(Int.self)
+        if start > 0, !input.cacheHitSuffixContainsMediaPlaceholder(suffixTokens) {
+            // Restored prefix holds every media span: the suffix is text only.
+            embeddings = textEmbeds
+        } else {
+            // A restored text prefix can precede new media. Merge features exactly as in
+            // a cold prefill; only rows after `start` are forwarded below. Full-prompt
+            // M-RoPE positions must still include all previous image/video grids.
+            let visionHidden = visionPath.features(pixels: concatenated(pixelParts), frames: frames)
+            embeddings = try mergeInputIdsWithImageFeatures(
+                imageFeatures: visionHidden.asType(textEmbeds.dtype),
+                imageRowCount: mergedRowCount(for: imageFrames),
+                inputEmbeds: textEmbeds,
+                inputIds: inputIds,
+                imageTokenIndex: config.imageTokenIndex,
+                videoTokenIndex: config.videoTokenIndex
+            ).0
+        }
+        // Full-prompt M-RoPE positions from token ids + media grids (no pixels), resolved ONCE:
+        // this sets the request's decode delta, and a restored prefix's suffix continues at
+        // exactly the positions a full prefill would have used. `cache: nil` — the table is
+        // for the WHOLE prompt from position 0, independent of what the cache already holds.
+        guard let positions = languageModel.resolvedPositionIds(
+            inputs: inputIds, cache: nil, mask: nil, providedPositionIds: nil,
+            imageGridTHW: imageFrames, videoGridTHW: videoFrames, resetForMedia: true)
+        else { throw VLMError.processing("media prefill could not resolve M-RoPE positions") }
+        let typedCache = castCache(cache)
+        MLX.eval(embeddings, positions)
+        let step = Swift.max(1, stepSize)
+        var offset = start
+        var lastLogits: MLXArray?
+        while offset < total {
+            try Task.checkCancellation()
+            var end = Swift.min(total, offset + step)
+            if let boundary, offset < boundary, end > boundary { end = boundary }
+            let (hidden, captured) = languageModel.model.callAsFunctionCapturing(
+                inputIds[0..., offset ..< end],
+                inputsEmbeds: embeddings[0..., offset ..< end, 0...],
+                cache: typedCache,
+                positionIds: positions[0..., 0..., offset ..< end],
+                captureLayerIDs: captureLayerIDs)
+            onChunk(captured)
+            if end == boundary {
+                MLX.eval(cache)
+                onBoundary()
+            }
+            if end == total {
+                lastLogits = languageModel.headLogits(hidden[0..., (end - offset - 1)..., 0...])
+            } else {
+                MLX.eval(cache)
+                MLX.Memory.clearCache()
+            }
+            offset = end
+        }
+        guard let lastLogits else { throw VLMError.processing("empty media prompt") }
+        return lastLogits
+    }
+
+    public var dflash2PositionDelta: Int {
+        guard let deltas = languageModel.ropeDeltas else { return 0 }
+        return deltas.reshaped(-1)[0].item(Int.self)
+    }
+
+    public func dflash2ResetPositionState() {
+        languageModel.resetPositionState()
     }
 }

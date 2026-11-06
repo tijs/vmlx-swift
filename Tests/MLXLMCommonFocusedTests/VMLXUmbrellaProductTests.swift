@@ -238,6 +238,12 @@ struct VMLXUmbrellaProductTests {
             """.utf8
         )
         .write(to: root.appendingPathComponent("model.safetensors.index.json"))
+        // Detection counts tensors physically present in shard headers, not index entries alone.
+        try MTPRuntimeFocusedTests.writeHeaderOnlyShards(
+            [
+                "model.layers.64.mtp_fc.weight": "model-00001-of-00001.safetensors",
+                "vision_tower.blocks.0.attn.qkv.weight": "model-00001-of-00001.safetensors",
+            ], in: root)
 
         let trace = try ModelRuntimeDetectionSnapshot(modelDirectory: root)
 

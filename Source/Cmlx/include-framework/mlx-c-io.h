@@ -77,6 +77,15 @@ int mlx_array_new_mmap_file_region(
     const int* shape,
     int dim,
     mlx_dtype dtype);
+int mlx_array_new_mmap_file_region_named(
+    mlx_array* res,
+    const char* file,
+    uint64_t offset,
+    size_t length,
+    const int* shape,
+    int dim,
+    mlx_dtype dtype,
+    const char* tensor_name);
 int mlx_save_writer(mlx_io_writer out_stream, const mlx_array a);
 int mlx_save(const char* file, const mlx_array a);
 int mlx_save_gguf(const char* file, mlx_io_gguf gguf);

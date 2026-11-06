@@ -1,4 +1,6 @@
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -194,6 +196,18 @@ public struct QwenVL {
         in promptTokens: [Int], frames: [THW], paddingToken: String, mergeSize: Int,
         tokenizer: any Tokenizer
     ) throws -> [Int] {
+        try expandPaddingTokens(
+            in: promptTokens, frames: frames, paddingToken: paddingToken,
+            mergeSize: mergeSize, tokenizer: tokenizer,
+            boundaries: .init(all: [], stable: [])).tokens
+    }
+
+    /// Carry already-proven template boundaries through placeholder expansion.
+    /// A boundary inside an opaque media span is unusable and is discarded.
+    static func expandPaddingTokens(
+        in promptTokens: [Int], frames: [THW], paddingToken: String, mergeSize: Int,
+        tokenizer: any Tokenizer, boundaries: CanonicalChatCacheBoundaries
+    ) throws -> (tokens: [Int], boundaries: CanonicalChatCacheBoundaries) {
         // Replace single padding token with correct number for each image or video frame
         let placeholderRanges = paddingPlaceholderRanges(
             in: promptTokens,
@@ -225,7 +239,20 @@ public struct QwenVL {
         if currentIndex < promptTokens.endIndex {
             result.append(contentsOf: promptTokens[currentIndex...])
         }
-        return result
+        func remap(_ boundary: Int) -> Int? {
+            guard boundary > 0, boundary < promptTokens.count else { return nil }
+            var mapped = boundary
+            for (range, replacement) in zip(placeholderRanges, replacementSequences) {
+                if boundary > range.lowerBound, boundary < range.upperBound { return nil }
+                if range.upperBound <= boundary {
+                    mapped += replacement.count - range.count
+                }
+            }
+            return mapped
+        }
+        return (result, CanonicalChatCacheBoundaries(
+            all: boundaries.all.compactMap(remap),
+            stable: boundaries.stable.compactMap(remap)))
     }
 
     /// Placeholder token ids for `LMInput.mediaTokenIds`, resolved from the

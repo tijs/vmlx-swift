@@ -98,6 +98,8 @@ public struct LMInput {
     /// the actual request contract instead of accepting a tool-shaped object by
     /// name alone.
     public let toolSchemas: [ToolSpec]?
+    /// GLM-only canonical selection metadata. Never changes ordinary cache salts.
+    public let canonicalRequiredToolContext: CanonicalRequiredToolContext?
 
     /// Additional prompt-prefix lengths that are safe to store in the cache.
     ///
@@ -239,7 +241,8 @@ public struct LMInput {
         cacheStablePrefixTokenCounts: [Int] = [],
         cachePromptIntent: CachePromptIntent = .generation,
         cacheRestorePolicy: CacheRestorePolicy = .standard,
-        toolSchemas: [ToolSpec]? = nil
+        toolSchemas: [ToolSpec]? = nil,
+        canonicalRequiredToolContext: CanonicalRequiredToolContext? = nil
     ) {
         self.init(
             text: .init(tokens: tokens, mask: mask, tokenIds: tokenIds),
@@ -248,7 +251,8 @@ public struct LMInput {
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             cachePromptIntent: cachePromptIntent,
             cacheRestorePolicy: cacheRestorePolicy,
-            toolSchemas: toolSchemas)
+            toolSchemas: toolSchemas,
+            canonicalRequiredToolContext: canonicalRequiredToolContext)
     }
 
     public init(
@@ -261,7 +265,8 @@ public struct LMInput {
         cacheStablePrefixTokenCounts: [Int] = [],
         cachePromptIntent: CachePromptIntent = .generation,
         cacheRestorePolicy: CacheRestorePolicy = .standard,
-        toolSchemas: [ToolSpec]? = nil
+        toolSchemas: [ToolSpec]? = nil,
+        canonicalRequiredToolContext: CanonicalRequiredToolContext? = nil
     ) {
         self.text = text
         self.image = image
@@ -274,6 +279,7 @@ public struct LMInput {
         self.cachePromptIntent = cachePromptIntent
         self.cacheRestorePolicy = cacheRestorePolicy
         self.toolSchemas = toolSchemas
+        self.canonicalRequiredToolContext = canonicalRequiredToolContext
     }
 
     public func withToolSchemas(_ schemas: [ToolSpec]?) -> LMInput {
@@ -288,7 +294,8 @@ public struct LMInput {
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             cachePromptIntent: cachePromptIntent,
             cacheRestorePolicy: cacheRestorePolicy,
-            toolSchemas: schemas)
+            toolSchemas: schemas,
+            canonicalRequiredToolContext: canonicalRequiredToolContext)
     }
 
     /// Return an otherwise-identical input with an explicit prompt intent.
@@ -304,7 +311,8 @@ public struct LMInput {
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             cachePromptIntent: intent,
             cacheRestorePolicy: cacheRestorePolicy,
-            toolSchemas: toolSchemas)
+            toolSchemas: toolSchemas,
+            canonicalRequiredToolContext: canonicalRequiredToolContext)
     }
 
     /// Return an otherwise-identical input with an explicit restore policy.
@@ -320,7 +328,8 @@ public struct LMInput {
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             cachePromptIntent: cachePromptIntent,
             cacheRestorePolicy: policy,
-            toolSchemas: toolSchemas)
+            toolSchemas: toolSchemas,
+            canonicalRequiredToolContext: canonicalRequiredToolContext)
     }
 }
 
@@ -333,6 +342,43 @@ public extension LMInput {
     /// back to full prefill.
     var hasMediaContent: Bool {
         image != nil || video != nil || audio != nil
+    }
+
+    /// Build a fresh-prefill input for an exact cache boundary. Opaque media
+    /// tensors belong to their complete placeholder span: omit them before
+    /// that span, keep them after it, and decline a boundary inside it.
+    /// Model-side token pruning and undeclared media IDs cannot be partitioned.
+    func inputForCacheBoundary(tokens: [Int], fullPromptTokenIds: [Int]) -> LMInput? {
+        guard !tokens.isEmpty else { return nil }
+        var keepMedia = false
+        if hasMediaContent {
+            guard !requiresPostPrepareCacheKey,
+                  tokens.count <= fullPromptTokenIds.count,
+                  tokens.elementsEqual(fullPromptTokenIds.prefix(tokens.count)),
+                  let mediaTokenIds, !mediaTokenIds.isEmpty
+            else { return nil }
+            let media = Set(mediaTokenIds)
+            let inHead = tokens.contains(where: media.contains)
+            let inTail = fullPromptTokenIds.dropFirst(tokens.count).contains(where: media.contains)
+            guard inHead != inTail else { return nil }
+            keepMedia = inHead
+        }
+        var boundaryMask: MLXArray?
+        if let mask = text.mask {
+            guard mask.size == fullPromptTokenIds.count else { return nil }
+            let flat = mask.reshaped(-1)[..<tokens.count]
+            boundaryMask = mask.ndim >= 2 ? flat[.newAxis, 0...] : flat
+        }
+        return LMInput(
+            text: Text(tokens: MLXArray(tokens.map(Int32.init)).reshaped(1, tokens.count),
+                       mask: boundaryMask, tokenIds: tokens),
+            image: keepMedia ? image : nil,
+            video: keepMedia ? video : nil,
+            audio: keepMedia ? audio : nil,
+            mediaTokenIds: mediaTokenIds, cacheScopeSalt: cacheScopeSalt,
+            cachePromptIntent: cachePromptIntent, cacheRestorePolicy: cacheRestorePolicy,
+            toolSchemas: toolSchemas,
+            canonicalRequiredToolContext: canonicalRequiredToolContext)
     }
 
     /// Whether a hybrid-cache snapshot taken at `boundary` can safely carry
@@ -463,6 +509,16 @@ public protocol LanguageModel: Module {
     /// casts and must not receive the loader's blanket BF16 materialization.
     var preservesCheckpointParameterDTypes: Bool { get }
 
+    /// Versioned cache namespace for models whose floating KV storage must
+    /// survive disk/paged restore without the legacy FP16-to-BF16 conversion.
+    /// This preserves the stored dtype, not a forced activation precision.
+    var cacheStorageDTypeIdentity: String? { get }
+
+    /// Model-owned namespace for the arithmetic that produces persisted KV/recurrent state.
+    /// Bump only when forward semantics change, not for equivalent kernel/scheduling speedups.
+    /// Nil preserves existing keys for models with no declared arithmetic revision.
+    var cacheComputationIdentity: String? { get }
+
     /// Whether the entire forward can be traced by the generic MLX compiler.
     /// Host routing or file-backed row selection may require eager scheduling
     /// even when individual device kernels support compilation.
@@ -475,6 +531,11 @@ public protocol LanguageModel: Module {
     /// retain request concurrency in its queue without entering an invalid
     /// batched forward.
     var maximumSupportedDecodeBatchSize: Int? { get }
+
+    /// Prefill chunk size measured fastest for this architecture. Hosts apply it
+    /// only when neither the request nor a per-model tuning record picks one;
+    /// `nil` keeps ``GenerateParameters/prefillStepSize``'s library default.
+    var recommendedPrefillStepSize: Int? { get }
 
     /// Prepare the cache state and consume the ``LMInput``.
     ///
@@ -528,11 +589,15 @@ public protocol LanguageModel: Module {
 
 extension LanguageModel {
     public var preservesCheckpointParameterDTypes: Bool { false }
+    public var cacheStorageDTypeIdentity: String? { nil }
+    public var cacheComputationIdentity: String? { nil }
     public var supportsWholeForwardCompilation: Bool { true }
 
     /// Most standard-attention and wrapped recurrent-cache architectures use
     /// the batch engine's configured width.
     public var maximumSupportedDecodeBatchSize: Int? { nil }
+
+    public var recommendedPrefillStepSize: Int? { nil }
 
     public func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput

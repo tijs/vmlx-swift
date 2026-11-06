@@ -130,7 +130,7 @@ public func maybeReDeriveSSMState(
     // tree visible.
     func log(_ status: String) {
         let line = "[vmlx][cache/ssm-rederive] \(status) hybrid=\(coordinator.isHybrid) genGP=\(genPromptLen) promptLen=\(promptTokenIds.count) enabled=\(enableSSMReDerive)\n"
-        FileHandle.standardError.write(Data(line.utf8))
+        RuntimeDiagnostics.write(Data(line.utf8))
     }
 
     guard enableSSMReDerive else { log("skip/disabled"); return }
@@ -204,10 +204,11 @@ public func captureCleanSSMStateInline(
 ) {
     func log(_ status: String) {
         let line = "[vmlx][cache/ssm-rederive] inline-capture/\(status) hybrid=\(coordinator.isHybrid) genGP=\(genPromptLen) promptLen=\(promptTokenIds.count) enabled=\(enableSSMReDerive)\n"
-        FileHandle.standardError.write(Data(line.utf8))
+        RuntimeDiagnostics.write(Data(line.utf8))
     }
 
     guard enableSSMReDerive else { log("skip/disabled"); return }
+    guard coordinator.canPersistBoundaries else { log("skip/storage-disabled"); return }
     guard coordinator.isHybrid else { log("skip/not-hybrid"); return }
     guard genPromptLen > 0 else { log("skip/no-gen-prompt"); return }
     guard promptTokenIds.count > genPromptLen else {
@@ -314,7 +315,9 @@ public func reDeriveSSMStates(
     @unknown default:
         break
     }
-    MLX.eval(freshCache)
+    // Lazy materialization can fail after prepare/replayForward has returned.
+    // Do not return companion state after an evaluation error was merely logged.
+    try withError { MLX.eval(freshCache) }
 
     let states = extractSSMStates(from: freshCache)
     return states.isEmpty ? nil : states
@@ -388,7 +391,9 @@ public func reDeriveSSMStatesAtBoundaries(
                 // forward fails throws here, and the store publishes nothing.
                 _ = try model.replayForward(tokenArray, cache: freshCache)
             }
-            MLX.eval(freshCache)
+            // INVARIANT: an evaluation failure aborts this replay before the
+            // cursor advances or any later boundary can be published.
+            try withError { MLX.eval(freshCache) }
             cursor = end
             Memory.clearCache()
         }
@@ -406,7 +411,7 @@ public func reDeriveSSMStatesAtBoundaries(
         let live = extractSSMStates(from: freshCache)
         if !live.isEmpty {
             let owned = live.map { $0 * 1 }
-            MLX.eval(owned)
+            try withError { MLX.eval(owned) }
             out[boundary] = owned
         }
     }
@@ -465,7 +470,7 @@ public func reDeriveAndStoreSSMStatesAtPromptBoundaries(
     func trace(_ message: String) {
         guard RuntimeEnvironment.flag("VMLX_SSM_REDERIVE_TRACE")
         else { return }
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data("[vmlx][cache/ssm-rederive] prompt-boundaries/\(message) hybrid=\(coordinator.isHybrid) promptLen=\(promptTokenIds.count)\n".utf8))
     }
     guard coordinator.isHybrid, !promptTokenIds.isEmpty else { return [:] }
@@ -597,7 +602,7 @@ public func reDeriveAndStoreSSMStatesAtPromptBoundaries(
         return statesByBoundary.merging(presentByBoundary) { derived, _ in derived }
     } catch {
         let line = "[vmlx][cache/ssm-rederive] prompt-boundaries/fail \(error) promptLen=\(promptTokenIds.count)\n"
-        FileHandle.standardError.write(Data(line.utf8))
+        RuntimeDiagnostics.write(Data(line.utf8))
         return [:]
     }
 }

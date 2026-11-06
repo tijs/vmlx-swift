@@ -254,6 +254,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				".clang-format",
+				".github/workflows/runtime-compatibility.yml",
 				.gitignore,
 				ACKNOWLEDGMENTS.md,
 				CMakeLists.txt,
@@ -361,6 +362,7 @@
 				python/mlxvariants.py,
 				python/type_private_generator.py,
 				python/vector_generator.py,
+				tests/gather_qmm.c,
 			);
 			target = C3AE8EE52EAAA3C5000BD280 /* Cmlx */;
 		};
@@ -388,6 +390,7 @@
 				".github/scripts/update-bypass-list.js",
 				.github/workflows/build_and_test.yml,
 				.github/workflows/documentation.yml,
+				".github/workflows/fork-runtime-contracts.yml",
 				.github/workflows/release.yml,
 				.github/workflows/update_bypass_list.yml,
 				.gitignore,
@@ -397,7 +400,6 @@
 				CITATION.cff,
 				CLAUDE.md,
 				CMakeLists.txt,
-				CODE_OF_CONDUCT.md,
 				CONTRIBUTING.md,
 				LICENSE,
 				MANIFEST.in,
@@ -433,13 +435,16 @@
 				benchmarks/python/distributed_bench.py,
 				benchmarks/python/einsum_bench.py,
 				benchmarks/python/fft_bench.py,
+				benchmarks/python/gated_delta_bench.py,
 				benchmarks/python/gather_bench.py,
 				benchmarks/python/gather_mm_bench.py,
 				benchmarks/python/gather_qmm_bench.py,
+				benchmarks/python/gather_qqmm_bench.py,
 				benchmarks/python/hadamard_bench.py,
 				benchmarks/python/large_gemm_bench.py,
 				benchmarks/python/layer_norm_bench.py,
 				benchmarks/python/masked_scatter.py,
+				benchmarks/python/qqmm_bench.py,
 				benchmarks/python/rms_norm_bench.py,
 				benchmarks/python/rope_bench.py,
 				benchmarks/python/scatter_bench.py,
@@ -448,6 +453,8 @@
 				benchmarks/python/segmented_mm_bench.py,
 				benchmarks/python/single_ops.py,
 				benchmarks/python/slice_update_bench.py,
+				benchmarks/python/swiglu_bench.py,
+				benchmarks/python/swiglu_qmm_bench.py,
 				benchmarks/python/synchronize_bench.py,
 				benchmarks/python/time_utils.py,
 				cmake/FindCUDNN.cmake,
@@ -651,6 +658,7 @@
 				mlx/backend/cuda/binary/remainder.cu,
 				mlx/backend/cuda/binary/subtract.cu,
 				mlx/backend/cuda/binary_two.cu,
+				mlx/backend/cuda/cholesky.cu,
 				mlx/backend/cuda/compiled.cpp,
 				mlx/backend/cuda/conv.cpp,
 				mlx/backend/cuda/conv/conv.h,
@@ -669,6 +677,8 @@
 				mlx/backend/cuda/cuda_utils.h,
 				mlx/backend/cuda/cudnn_utils.cpp,
 				mlx/backend/cuda/cudnn_utils.h,
+				mlx/backend/cuda/cusolver_utils.cpp,
+				mlx/backend/cuda/cusolver_utils.h,
 				mlx/backend/cuda/custom_kernel.cpp,
 				mlx/backend/cuda/cutlass_utils.cuh,
 				mlx/backend/cuda/delayload.cpp,
@@ -814,6 +824,8 @@
 				mlx/backend/cuda/utils.cpp,
 				mlx/backend/cuda/utils.h,
 				mlx/backend/cuda/vector_types.cuh,
+				mlx/backend/cuda/wddm.cpp,
+				mlx/backend/cuda/wddm.h,
 				mlx/backend/cuda/worker.cpp,
 				mlx/backend/cuda/worker.h,
 				mlx/backend/gpu/CMakeLists.txt,
@@ -847,6 +859,8 @@
 				mlx/backend/metal/kernels/conv.metal,
 				mlx/backend/metal/kernels/copy.h,
 				mlx/backend/metal/kernels/copy.metal,
+				mlx/backend/metal/kernels/cross_entropy.h,
+				mlx/backend/metal/kernels/cross_entropy.metal,
 				mlx/backend/metal/kernels/defines.h,
 				mlx/backend/metal/kernels/dot.h,
 				mlx/backend/metal/kernels/dot.metal,
@@ -863,6 +877,11 @@
 				mlx/backend/metal/kernels/fp_quantized.metal,
 				mlx/backend/metal/kernels/fp_quantized_nax.h,
 				mlx/backend/metal/kernels/fp_quantized_nax.metal,
+				mlx/backend/metal/kernels/gated_delta_update.h,
+				mlx/backend/metal/kernels/gated_delta_update.metal,
+				mlx/backend/metal/kernels/gated_delta_update_nax.h,
+				mlx/backend/metal/kernels/gated_delta_update_nax.metal,
+				mlx/backend/metal/kernels/gather_mm_offsets.metal,
 				mlx/backend/metal/kernels/gemv.h,
 				mlx/backend/metal/kernels/gemv.metal,
 				mlx/backend/metal/kernels/gemv_masked.h,
@@ -948,6 +967,8 @@
 				mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_splitk.metal,
 				mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_splitk_nax.h,
 				mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_splitk_nax.metal,
+				mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_thin_nax.h,
+				mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_thin_nax.metal,
 				mlx/backend/metal/kernels/steel/gemm/loader.h,
 				mlx/backend/metal/kernels/steel/gemm/mma.h,
 				mlx/backend/metal/kernels/steel/gemm/nax.h,
@@ -1019,6 +1040,7 @@
 				mlx/distributed/jaccl/lib/jaccl/tcp.h,
 				mlx/distributed/jaccl/lib/jaccl/threadpool.h,
 				mlx/distributed/jaccl/lib/jaccl/types.h,
+				mlx/distributed/jaccl/no_jaccl.cpp,
 				mlx/distributed/mpi/CMakeLists.txt,
 				mlx/distributed/mpi/mpi.cpp,
 				mlx/distributed/mpi/mpi.h,
@@ -1159,6 +1181,7 @@
 				python/tests/test_eval.py,
 				python/tests/test_export_import.py,
 				python/tests/test_fast.py,
+				python/tests/test_fast_gated_delta.py,
 				python/tests/test_fast_sdpa.py,
 				python/tests/test_fft.py,
 				python/tests/test_graph.py,
@@ -1187,6 +1210,7 @@
 				tests/blas_tests.cpp,
 				tests/compile_tests.cpp,
 				tests/creations_tests.cpp,
+				tests/cuda_tests.cpp,
 				tests/custom_vjp_tests.cpp,
 				tests/device_tests.cpp,
 				tests/einsum_tests.cpp,
@@ -1203,6 +1227,7 @@
 				tests/residency_tests.cpp,
 				tests/scheduler_tests.cpp,
 				tests/tests.cpp,
+				tests/upstream_metal_kernel_tests.cpp,
 				tests/utils_tests.cpp,
 				tests/vmap_tests.cpp,
 			);
@@ -1300,6 +1325,7 @@
 				metal/cexpf.h,
 				metal/complex.h,
 				metal/copy.h,
+				metal/cross_entropy.h,
 				metal/defines.h,
 				metal/dot.h,
 				metal/erf.h,
@@ -1311,6 +1337,8 @@
 				metal/fp8.h,
 				metal/fp_quantized.h,
 				metal/fp_quantized_nax.h,
+				metal/gated_delta_update.h,
+				metal/gated_delta_update_nax.h,
 				metal/gemv.h,
 				metal/gemv_masked.h,
 				metal/hadamard.h,
@@ -1367,6 +1395,7 @@
 				metal/steel/gemm/kernels/steel_gemm_segmented_nax.h,
 				metal/steel/gemm/kernels/steel_gemm_splitk.h,
 				metal/steel/gemm/kernels/steel_gemm_splitk_nax.h,
+				metal/steel/gemm/kernels/steel_gemm_thin_nax.h,
 				metal/steel/gemm/loader.h,
 				metal/steel/gemm/mma.h,
 				metal/steel/gemm/nax.h,
@@ -1518,6 +1547,11 @@
 		C3AE8EDE2EAAA21C000BD280 /* xcconfig */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = xcconfig;
+			sourceTree = "<group>";
+		};
+		A829ED2F51B74947A4DD7161 /* distributed */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = distributed;
 			sourceTree = "<group>";
 		};
 		C3AE90232EAAA47E000BD280 /* json */ = {
@@ -1702,6 +1736,7 @@
 		C3AE8EFC2EAAA40E000BD280 /* Cmlx */ = {
 			isa = PBXGroup;
 			children = (
+				A829ED2F51B74947A4DD7161 /* distributed */,
 				C3CB25472EB11EFE0029A645 /* framework */,
 				C3CBF2682EAC23BA0029A645 /* fmt */,
 				C3CBE24A2EABF7870029A645 /* include-framework */,
@@ -1828,6 +1863,7 @@
 				C3AE97872EAAAAAD000BD280 /* mlx-conditional */,
 				C3AE98112EAAAAAD000BD280 /* mlx-generated */,
 				C3AE9D992EAAAB29000BD280 /* mlx-c */,
+				A829ED2F51B74947A4DD7161 /* distributed */,
 				C3CB25472EB11EFE0029A645 /* framework */,
 				C3CBE24A2EABF7870029A645 /* include-framework */,
 				C3CBF2682EAC23BA0029A645 /* fmt */,

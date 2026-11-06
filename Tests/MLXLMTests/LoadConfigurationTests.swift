@@ -18,135 +18,6 @@ import Testing
 @Suite("LoadConfiguration", .serialized)
 struct LoadConfigurationTests {
 
-    // MARK: - JangPressPolicy.resolve precedence
-
-    /// `.disabled` always resolves to disabled options regardless of
-    /// bundle facts or env state.
-    @Test("disabled policy ignores facts and env")
-    func disabledIgnoresFacts() {
-        let huge = LoadBundleFacts(
-            totalSafetensorsBytes: 200 * 1024 * 1024 * 1024,  // 200 GB
-            isRouted: true,
-            physicalMemory: 128 * 1024 * 1024 * 1024)
-
-        let withEnv = withEnvironmentValue("JANGPRESS", "70") {
-            JangPressPolicy.disabled.resolve(facts: huge)
-        }
-        #expect(withEnv.enabled == false)
-
-        let withoutEnv = withEnvironmentValue("JANGPRESS", nil) {
-            JangPressPolicy.disabled.resolve(facts: huge)
-        }
-        #expect(withoutEnv.enabled == false)
-    }
-
-    /// `.enabled(coldFraction:)` always wins over env.
-    @Test("explicit enabled wins over JANGPRESS env")
-    func explicitEnabledWinsOverEnv() {
-        let facts = LoadBundleFacts.tiny
-        let opts = withEnvironmentValue("JANGPRESS", "off") {
-            JangPressPolicy.enabled(coldFraction: 0.5).resolve(facts: facts)
-        }
-        #expect(opts.enabled == true)
-        #expect(opts.compressPct == 50)
-    }
-
-    /// `.enabled(coldFraction:)` clamps fraction to [0.0, 0.95].
-    @Test("enabled clamps coldFraction to [0.0, 0.95]")
-    func enabledClamps() {
-        let facts = LoadBundleFacts.tiny
-
-        let high = JangPressPolicy.enabled(coldFraction: 1.5).resolve(facts: facts)
-        #expect(high.compressPct == 95)
-
-        let low = JangPressPolicy.enabled(coldFraction: -0.3).resolve(facts: facts)
-        #expect(low.compressPct == 0)
-    }
-
-    // MARK: - JangPressPolicy.auto + env precedence
-
-    /// `.auto(envFallback: true)` honors `JANGPRESS=70`.
-    @Test("auto envFallback honors JANGPRESS=70")
-    func autoHonorsNumericEnv() {
-        let opts = withEnvironmentValue("JANGPRESS", "70") {
-            JangPressPolicy.auto(envFallback: true).resolve(facts: .tiny)
-        }
-        #expect(opts.enabled == true)
-        #expect(opts.compressPct == 70)
-    }
-
-    /// `.auto(envFallback: true)` honors `JANGPRESS=off`.
-    @Test("auto envFallback honors JANGPRESS=off")
-    func autoHonorsOffEnv() {
-        let big = LoadBundleFacts(
-            totalSafetensorsBytes: 100 * 1024 * 1024 * 1024,
-            isRouted: true,
-            physicalMemory: 128 * 1024 * 1024 * 1024)
-
-        let opts = withEnvironmentValue("JANGPRESS", "off") {
-            JangPressPolicy.auto(envFallback: true).resolve(facts: big)
-        }
-        #expect(opts.enabled == false)
-    }
-
-    /// Garbage env values (not 0/off/false/0..95) fall through to the
-    /// threshold rule.
-    @Test("auto envFallback falls through on bad env value")
-    func autoFallsThroughOnBadEnv() {
-        let big = LoadBundleFacts(
-            totalSafetensorsBytes: 100 * 1024 * 1024 * 1024,
-            isRouted: true,
-            physicalMemory: 128 * 1024 * 1024 * 1024)
-
-        let opts = withEnvironmentValue("JANGPRESS", "banana") {
-            JangPressPolicy.auto(envFallback: true).resolve(facts: big)
-        }
-        // Threshold is met (routed AND > 0.5 × physical) → enabled@70
-        #expect(opts.enabled == true)
-        #expect(opts.compressPct == 70)
-    }
-
-    /// `.auto(envFallback: false)` ignores env entirely.
-    @Test("auto envFallback=false ignores JANGPRESS env")
-    func autoNoEnvIgnoresEnv() {
-        let opts = withEnvironmentValue("JANGPRESS", "70") {
-            JangPressPolicy.auto(envFallback: false).resolve(facts: .tiny)
-        }
-        // .tiny doesn't meet threshold → disabled
-        #expect(opts.enabled == false)
-    }
-
-    /// Threshold rule: enable iff routed AND bundle > 0.5 × physical.
-    @Test("auto threshold enables only when routed AND large")
-    func autoThresholdRule() {
-        // routed but tiny — disabled
-        let routedTiny = LoadBundleFacts(
-            totalSafetensorsBytes: 1 * 1024 * 1024 * 1024,
-            isRouted: true,
-            physicalMemory: 128 * 1024 * 1024 * 1024)
-        #expect(
-            JangPressPolicy.auto(envFallback: false)
-                .resolve(facts: routedTiny).enabled == false)
-
-        // dense but huge — disabled (no routed pool to compress)
-        let denseHuge = LoadBundleFacts(
-            totalSafetensorsBytes: 200 * 1024 * 1024 * 1024,
-            isRouted: false,
-            physicalMemory: 128 * 1024 * 1024 * 1024)
-        #expect(
-            JangPressPolicy.auto(envFallback: false)
-                .resolve(facts: denseHuge).enabled == false)
-
-        // routed AND large — enabled at default 70
-        let routedHuge = LoadBundleFacts(
-            totalSafetensorsBytes: 100 * 1024 * 1024 * 1024,
-            isRouted: true,
-            physicalMemory: 128 * 1024 * 1024 * 1024)
-        let opts = JangPressPolicy.auto(envFallback: false).resolve(facts: routedHuge)
-        #expect(opts.enabled == true)
-        #expect(opts.compressPct == 70)
-    }
-
     // MARK: - ResidentCap.resolve
 
     @Test("ResidentCap.unlimited resolves to nil")
@@ -179,29 +50,18 @@ struct LoadConfigurationTests {
 
     // MARK: - LoadConfiguration default + off
 
-    @Test("LoadConfiguration.default = JangPress disabled (opt-in), 70% caps, mmap on")
+    @Test("LoadConfiguration.default retains memory caps and canonical mmap")
     func defaultConfig() {
         let cfg = LoadConfiguration.default
-        #expect(cfg.jangPress == .disabled)
         #expect(cfg.maxResidentBytes == .fraction(0.70))
         #expect(cfg.memoryLimit == .fraction(0.70))
-        #expect(cfg.useMmapSafetensors == true)
+        #expect(cfg.useMmapSafetensors == false)
         #expect(cfg.deepseekV4ActivationQAT == nil)
     }
 
-    @Test("LoadConfiguration.experimentalJangPressAuto = .auto + 70% caps + mmap on")
-    func experimentalAutoConfig() {
-        let cfg = LoadConfiguration.experimentalJangPressAuto
-        #expect(cfg.jangPress == .auto(envFallback: true))
-        #expect(cfg.maxResidentBytes == .fraction(0.70))
-        #expect(cfg.memoryLimit == .fraction(0.70))
-        #expect(cfg.useMmapSafetensors == true)
-    }
-
-    @Test("LoadConfiguration.off = disabled JangPress + unlimited everything")
+    @Test("LoadConfiguration.off uses unlimited caps and materialized weights")
     func offConfig() {
         let cfg = LoadConfiguration.off
-        #expect(cfg.jangPress == .disabled)
         #expect(cfg.maxResidentBytes == .unlimited)
         #expect(cfg.memoryLimit == .unlimited)
         #expect(cfg.useMmapSafetensors == false)
@@ -237,7 +97,7 @@ struct LoadConfigurationTests {
         #expect(!explicitlyOff)
     }
 
-    @Test("JANGTQ load keeps tq tensors raw and protects mmap residency")
+    @Test("JANGTQ load keeps raw tensors and dtype policy independent of storage")
     func jangtqLoadDoesNotSkipWholeModelBFloat16Conversion() throws {
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -245,15 +105,9 @@ struct LoadConfigurationTests {
             contentsOf: repository.appendingPathComponent("Libraries/MLXLMCommon/Load.swift"),
             encoding: .utf8)
 
-        #expect(source.contains("let mmapSafetensorsActive = envFlag(\"MLX_SAFETENSORS_MMAP\")"))
-        // `RuntimeEnvironment.flag` replaced the raw `envFlag` here and names only the current
-        // spelling; the legacy `VMLINUX_` name is still honoured, derived centrally by
-        // `RuntimeEnvironment.legacyName(of:)`. See `RuntimeEnvironmentSourceCoverageTests`.
-        #expect(source.contains(
-            "let allowJANGTQMmapBFloat16 = RuntimeEnvironment.flag(\"VMLX_JANGTQ_BF16_MMAP\")"))
-        #expect(source.contains("let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)"))
-        #expect(source.contains("!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16"))
-        #expect(source.contains("|| autoJANGTQMmapBFloat16"))
+        #expect(!source.contains("let mmapSafetensorsActive"))
+        #expect(source.contains("let preserveJANGAffineDtypes = !isJANGTQNative"))
+        #expect(source.contains("(!isJANGTQNative || autoJANGTQMmapBFloat16)"))
         #expect(source.contains("func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool"))
         #expect(source.contains("modelType == \"nemotron_h\""))
         #expect(source.contains("modelType == \"qwen3_5_moe\""))
@@ -290,6 +144,106 @@ struct LoadConfigurationTests {
 
         let s = MemoryStatus.snapshot()
         #expect(s.memoryLimit == target)
+    }
+
+    @Test(
+        "Unlimited total budget resets stale limits; finite budgets remain explicit",
+        arguments: [
+            ResidentCap.fraction(0.60), .absolute(32 << 30),
+            .absolute(1 << 20), .absolute(96 << 30),
+        ])
+    func unlimitedTotalBudgetTransition(finite: ResidentCap) throws {
+        let priorMemoryLimit = MLX.Memory.memoryLimit
+        let priorCacheLimit = MLX.Memory.cacheLimit
+        defer {
+            MLX.Memory.memoryLimit = priorMemoryLimit
+            MLX.Memory.cacheLimit = priorCacheLimit
+        }
+        let physical: UInt64 = 128 << 30
+        let recommended = 80 << 30
+        // The backend constructor uses min(0.95 * RAM, 1.5 * working set).
+        // Supplying facts exercises that existing default without allocations.
+        let expectedNative = Int(min(0.95 * Double(physical), 1.5 * Double(recommended)))
+        let requestedFinite = try #require(finite.resolve(physicalMemory: physical))
+        let expectedFinite = max(1 << 30, min(Int(requestedFinite), recommended))
+        MLX.Memory.cacheLimit = 64 << 20
+
+        applyLoadProcessMemoryLimit(
+            finite, physicalMemory: physical, recommendedWorkingSetBytes: recommended)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedFinite)
+        let restored = applyLoadProcessMemoryLimit(
+            .unlimited, physicalMemory: physical, recommendedWorkingSetBytes: recommended)
+        #expect(restored == expectedNative)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedNative)
+        #expect(MLX.Memory.cacheLimit == 64 << 20)
+
+        // Returning from No Automatic Limits must apply the selected cap too.
+        applyLoadProcessMemoryLimit(
+            finite, physicalMemory: physical, recommendedWorkingSetBytes: recommended)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedFinite)
+        #expect(MLX.Memory.cacheLimit == 64 << 20)
+    }
+
+    @Test("Unlimited total budget uses the native physical-memory ceiling")
+    func unlimitedTotalBudgetUsesNativePhysicalCeiling() {
+        let priorMemoryLimit = MLX.Memory.memoryLimit
+        defer { MLX.Memory.memoryLimit = priorMemoryLimit }
+        let physical: UInt64 = 128 << 30
+        let recommended = 112 << 30
+        let expectedNative = Int(min(0.95 * Double(physical), 1.5 * Double(recommended)))
+        MLX.Memory.memoryLimit = 64 << 30
+        let restored = applyLoadProcessMemoryLimit(
+            .unlimited, physicalMemory: physical, recommendedWorkingSetBytes: recommended)
+        #expect(restored == expectedNative)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedNative)
+    }
+
+    @Test("Decision loader applies Strict to unlimited to finite against the real allocator")
+    func decisionLoaderClearsStaleTotalLimit() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("decision-limit-transition-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(#"{"model_type":"llama"}"#.utf8)
+            .write(to: directory.appendingPathComponent("config.json"))
+
+        let priorMemoryLimit = MLX.Memory.memoryLimit
+        let priorCacheLimit = MLX.Memory.cacheLimit
+        defer {
+            MLX.Memory.memoryLimit = priorMemoryLimit
+            MLX.Memory.cacheLimit = priorCacheLimit
+        }
+        let physical = HostPhysicalMemory.bytes
+        let recommended = try #require(MLX.GPU.maxRecommendedWorkingSetBytes())
+        let expectedNative = Int(min(0.95 * Double(physical), 1.5 * Double(recommended)))
+        let expectedStrict = max(1 << 30, min(Int(Double(physical) * 0.60), recommended))
+        var strict = LoadConfiguration(
+            maxResidentBytes: .absolute(64 << 20), memoryLimit: .fraction(0.60))
+        strict.keepModelInMemory = false
+        MLX.Memory.cacheLimit = 32 << 20
+        let strictResources = DecisionLoadResources(directory: directory, configuration: strict)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedStrict)
+        #expect(MLX.Memory.cacheLimit == 64 << 20)
+        #expect(strictResources.previousAllocatorCacheLimit == 32 << 20)
+        // The owner restores only the load-time pool, matching its contract.
+        MLX.Memory.cacheLimit = try #require(strictResources.previousAllocatorCacheLimit)
+
+        var unlimited = LoadConfiguration.off
+        unlimited.keepModelInMemory = false
+        let unlimitedResources = DecisionLoadResources(
+            directory: directory, configuration: unlimited)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedNative)
+        #expect(MLX.Memory.cacheLimit == 32 << 20)
+        #expect(unlimitedResources.previousAllocatorCacheLimit == nil)
+
+        var finite = LoadConfiguration(
+            maxResidentBytes: .unlimited, memoryLimit: .absolute(2 << 30))
+        finite.keepModelInMemory = false
+        let finiteResources = DecisionLoadResources(directory: directory, configuration: finite)
+        #expect(MemoryStatus.snapshot().memoryLimit == max(1 << 30, min(2 << 30, recommended)))
+        #expect(MLX.Memory.cacheLimit == 32 << 20)
+        #expect(finiteResources.previousAllocatorCacheLimit == nil)
+        withExtendedLifetime((strictResources, unlimitedResources, finiteResources)) {}
     }
 
     @Test("Resident-pool policy clears stale process-wide MLX limits",
@@ -654,50 +608,6 @@ struct LoadConfigurationTests {
             modelDirectory: mixed))
     }
 
-    // MARK: - JangPressStatus.disabled
-
-    @Test("JangPressRuntime.none.status() == .disabled")
-    func runtimeNoneStatus() {
-        let s = JangPressRuntime.none.status()
-        #expect(s == .disabled)
-        #expect(s.enabled == false)
-        #expect(s.coldFraction == nil)
-        #expect(s.tilesUnderManagement == 0)
-    }
-
-    @Test("JangPressRuntime with appliedOptions surfaces coldFraction")
-    func appliedOptionsSurfaceColdFraction() {
-        // Construct a synthetic runtime that has appliedOptions but
-        // no actual mmap tier (we don't need a real bundle here —
-        // we're testing the status mapping, not the tier behavior).
-        let opts = JangPressLoadOptions(
-            enabled: true, compressPct: 70, backend: .none)
-        let runtime = JangPressRuntime(
-            mmap: nil, embed: nil, appliedOptions: opts)
-
-        // Without isActive=true (no mmap or embed tier attached) the
-        // status returns .disabled — that's by-design honest signaling.
-        // Verify by attaching a real-style runtime that's "active":
-        // since both tiers are nil we can't isActive=true via the
-        // public surface. Instead, prove the status function reads
-        // appliedOptions when isActive: pull coldFraction directly.
-        #expect(runtime.appliedOptions?.compressPct == 70)
-        #expect(runtime.isActive == false)
-        // Confirmed: the field is set, but isActive gates status output.
-        // The bundled JangPressActivationTests cover the active-runtime
-        // path with a real synthetic bundle.
-        _ = runtime.status()  // smoke
-    }
-
-    @Test("JangPressLoadOptions equality + clamping round-trip")
-    func loadOptionsClampInit() {
-        let a = JangPressLoadOptions(enabled: true, compressPct: 70)
-        let b = JangPressLoadOptions(enabled: true, compressPct: 70)
-        #expect(a == b)
-        let clamped = JangPressLoadOptions(enabled: true, compressPct: 200)
-        #expect(clamped.compressPct == 100)
-    }
-
     // MARK: - Helpers
 
     /// Create a temp bundle directory pre-populated with the given
@@ -801,45 +711,163 @@ private func withEnvironmentValue<R>(
     return block()
 }
 
-/// Qwen3.8 Flash Next JANG must never be cold-compressed by the auto
-/// threshold: its directory bytes include the 20–29 GiB SSD-served PLE table,
-/// so whole-bundle size overstates resident need, and the family's runtime
-/// contract keeps every non-PLE compute weight resident.
-@Suite struct Qwen4ExpJangPressExclusionTests {
-    private var flashNextFacts: LoadBundleFacts {
-        LoadBundleFacts(
-            totalSafetensorsBytes: 96 << 30,
-            isRouted: true,
-            physicalMemory: 128 << 30,
-            modelType: "qwen4_exp",
-            jangFormat: "jang_v2",
-            declaredComputeDType: "bfloat16",
-            numRoutedExperts: 512,
-            topK: 10)
+/// The Qwen4Exp n-gram table is read from SSD on demand; residency, materialization and the JANGH scheduling
+/// allowance must size against the GPU-resident weights only (Allosaurus: 32.5 GB of an 88 GB bundle).
+@Suite("Load facts separate SSD-resident n-gram tables")
+struct LoadBundleFactsNGramTests {
+    @Test("n-gram embedding shards are excluded from GPU-resident weight bytes")
+    func ngramBytesExcluded() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("facts-ngram-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(#"{"model_type":"qwen4_exp"}"#.utf8).write(to: root.appendingPathComponent("config.json"))
+        let header: [String: Any] = [
+            "language_model.layers.0.ple.ngram_embedding.shards.0.weight":
+                ["dtype": "U32", "shape": [1000], "data_offsets": [0, 4000]],
+            "language_model.layers.0.ple.key_proj.weight": ["dtype": "F16", "shape": [500], "data_offsets": [4000, 5000]],
+            "language_model.layers.0.mlp.gate.weight": ["dtype": "F16", "shape": [1000], "data_offsets": [5000, 7000]],
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(bytes)
+        file.append(Data(count: 7000))
+        try file.write(to: root.appendingPathComponent("model.safetensors"))
+
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.ssdResidentTableBytes == 4000)
+        #expect(facts.totalSafetensorsBytes == UInt64(file.count))
+        #expect(facts.gpuResidentWeightBytes == UInt64(file.count) - 4000)
     }
 
-    @Test("auto threshold resolves DISABLED for Flash-Next despite 96GB routed")
-    func autoDisabledForFlashNext() {
-        let opts = withEnvironmentValue("JANGPRESS", nil) {
-            withEnvironmentValue("MLXPRESS", nil) {
-                JangPressPolicy.auto(envFallback: true).resolve(facts: flashNextFacts)
-            }
-        }
-        #expect(opts.enabled == false)
+    @Test("invalid n-gram offsets cannot trap or subtract absent payload bytes",
+        arguments: [[-1, 4], [Int.min, Int.max], [0, Int.max], [4, 3], [0, 17]])
+    func invalidNGramOffsetsAreNotSubtracted(offsets: [Int]) throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("facts-ngram-invalid-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        // A valid sibling cannot establish that a malformed shard has a
+        // trustworthy layout. Keep the entire shard in the resident estimate.
+        let header: [String: Any] = [
+            "language_model.layers.0.ple.ngram_embedding.shards.0.weight":
+                ["dtype": "U32", "shape": [1], "data_offsets": offsets],
+            "language_model.layers.0.ple.ngram_embedding.shards.1.weight":
+                ["dtype": "U32", "shape": [1], "data_offsets": [12, 16]],
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(bytes)
+        file.append(Data(count: 16))
+        try file.write(to: root.appendingPathComponent("model.safetensors"))
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.ssdResidentTableBytes == 0)
+        #expect(facts.gpuResidentWeightBytes == UInt64(file.count))
     }
 
-    @Test("the threshold itself is unchanged for other routed big bundles")
-    func thresholdUnchangedElsewhere() {
-        let other = LoadBundleFacts(
-            totalSafetensorsBytes: 96 << 30,
-            isRouted: true,
-            physicalMemory: 128 << 30)
-        let opts = withEnvironmentValue("JANGPRESS", nil) {
-            withEnvironmentValue("MLXPRESS", nil) {
-                JangPressPolicy.auto(envFallback: true).resolve(facts: other)
-            }
-        }
-        #expect(opts.enabled == true)
-        #expect(opts.compressPct == 70)
+    @Test("truncated n-gram payload remains in the conservative resident estimate")
+    func truncatedNGramPayloadIsNotSubtracted() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("facts-ngram-short-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let header: [String: Any] = [
+            "language_model.layers.0.ple.ngram_embedding.shards.0.weight":
+                ["dtype": "U32", "shape": [4], "data_offsets": [0, 16]],
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(bytes)
+        file.append(Data(count: 15))
+        try file.write(to: root.appendingPathComponent("model.safetensors"))
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.ssdResidentTableBytes == 0)
+        #expect(facts.gpuResidentWeightBytes == UInt64(file.count))
+    }
+
+    @Test("overlapping SSD table spans never reduce the resident estimate",
+        arguments: [[[0, 64], [0, 64]], [[0, 48], [32, 64]]])
+    func overlappingNGramSpansAreNotSubtracted(spans: [[Int]]) throws {
+        let header: [String: Any] = [
+            "model.layers.0.ple.ngram_embedding.first":
+                ["dtype": "U8", "shape": [spans[0][1] - spans[0][0]], "data_offsets": spans[0]],
+            "model.layers.1.ple.ngram_embedding.second":
+                ["dtype": "U8", "shape": [spans[1][1] - spans[1][0]], "data_offsets": spans[1]],
+        ]
+        try assertInvalidTableSpansAreConservative(header)
+    }
+
+    @Test("an SSD descriptor cannot discount bytes aliased by compute weights")
+    func computeAliasIsNotSubtracted() throws {
+        try assertInvalidTableSpansAreConservative([
+            "model.layers.0.ple.ngram_embedding.table":
+                ["dtype": "U8", "shape": [64], "data_offsets": [0, 64]],
+            "model.layers.0.mlp.weight":
+                ["dtype": "U8", "shape": [64], "data_offsets": [0, 64]],
+        ])
+    }
+
+    private func assertInvalidTableSpansAreConservative(_ header: [String: Any]) throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("facts-ngram-overlap-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(bytes)
+        file.append(Data(count: 64))
+        try file.write(to: root.appendingPathComponent("model.safetensors"))
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.ssdResidentTableBytes == 0)
+        #expect(facts.gpuResidentWeightBytes == UInt64(file.count))
+    }
+
+    @Test("impossible SSD totals retain the full resident estimate",
+        arguments: [UInt64(10), UInt64(11), UInt64.max])
+    func invalidSSDTotalIsConservative(ssdBytes: UInt64) {
+        var facts = LoadBundleFacts(totalSafetensorsBytes: 10, isRouted: false, physicalMemory: 100)
+        facts.ssdResidentTableBytes = ssdBytes
+        #expect(facts.gpuResidentWeightBytes == 10)
+    }
+
+    @Test("malformed compute descriptors cannot validate an SSD discount")
+    func malformedComputeSpanIsConservative() throws {
+        try assertInvalidTableSpansAreConservative([
+            "model.layers.0.ple.ngram_embedding.table":
+                ["dtype": "U8", "shape": [16], "data_offsets": [0, 16]],
+            "model.layers.0.mlp.weight":
+                ["dtype": "U8", "shape": [65], "data_offsets": [-1, 64]],
+        ])
+    }
+
+    @Test("an unreadable sibling shard prevents a partial bundle discount")
+    func unreadableSiblingKeepsEveryByteResident() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("facts-ngram-sibling-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let header = try JSONSerialization.data(withJSONObject: [
+            "model.layers.0.ple.ngram_embedding.table":
+                ["dtype": "U8", "shape": [64], "data_offsets": [0, 64]],
+        ])
+        var length = UInt64(header.count).littleEndian
+        var shard = withUnsafeBytes(of: &length) { Data($0) }
+        shard.append(header)
+        shard.append(Data(count: 64))
+        try shard.write(to: root.appendingPathComponent("model-00001-of-00002.safetensors"))
+        try Data(count: 16).write(to: root.appendingPathComponent("model-00002-of-00002.safetensors"))
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.totalSafetensorsBytes == UInt64(shard.count + 16))
+        #expect(facts.ssdResidentTableBytes == 0)
+        #expect(facts.gpuResidentWeightBytes == UInt64(shard.count + 16))
+    }
+
+    @Test("bundles without an n-gram table keep every byte as weights")
+    func noNGramTable() {
+        var facts = LoadBundleFacts(totalSafetensorsBytes: 10, isRouted: false, physicalMemory: 100)
+        #expect(facts.gpuResidentWeightBytes == 10)
+        facts.ssdResidentTableBytes = 20
+        #expect(facts.gpuResidentWeightBytes == 10)
     }
 }

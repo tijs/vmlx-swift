@@ -24,6 +24,10 @@ public enum Qwen4ExpFusedAffineMoE {
         inputDimensions: 2560, expertDimensions: 640, routes: 10)
     private static let ornith35Shape = Shape(
         inputDimensions: 2048, expertDimensions: 512, routes: 8)
+    /// Draft qualification: q4g64 BF16 only. See runtime/ornith-122b-affine-kernel.md
+    /// for numerical coverage and the outstanding model/app promotion gates.
+    private static let ornith122BShape = Shape(
+        inputDimensions: 3072, expertDimensions: 1024, routes: 8)
     /// GLM-5.3 (`glm5_next`): hidden 4096, `moe_intermediate_size` 2048, 8 of 288 experts routed.
     ///
     /// Added with the parity coverage this comment asks for — `Qwen4ExpFusedAffineMoEShapeTests`
@@ -35,7 +39,7 @@ public enum Qwen4ExpFusedAffineMoE {
     /// compute.
     private static let glm5NextShape = Shape(
         inputDimensions: 4096, expertDimensions: 2048, routes: 8)
-    private static let supportedShapes = [qwen4ExpShape, ornith35Shape, glm5NextShape]
+    private static let supportedShapes = [qwen4ExpShape, ornith35Shape, ornith122BShape, glm5NextShape]
     private static let supportedBits = Set([2, 3, 4, 5, 6])
     /// 128 joins 32 and 64 for GLM-5.3, whose 2-bit expert projections are grouped at 128.
     ///
@@ -271,7 +275,7 @@ public enum Qwen4ExpFusedAffineMoE {
         defer { reportLock.unlock() }
         guard !didReportConstructionRejection else { return }
         didReportConstructionRejection = true
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 ("[Qwen4Exp] fused_affine_moe_decode=construction_rejected"
                     + " gate=\(gate.inputDims)x\(gate.outputDims):\(gate.bits)b:g\(gate.groupSize):\(gate.mode):\(gate.weight.dtype):\(gate.scales.dtype):\(String(describing: gate.biases?.dtype))"
@@ -287,7 +291,7 @@ public enum Qwen4ExpFusedAffineMoE {
         defer { reportLock.unlock() }
         guard !didReportInvocationRejection else { return }
         didReportInvocationRejection = true
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 ("[Qwen4Exp] fused_affine_moe_decode=invocation_rejected"
                     + " input=\(input.shape):\(input.dtype):size\(input.size)"
@@ -311,7 +315,7 @@ public enum Qwen4ExpFusedAffineMoE {
         diag += " affine_metadata=bf16_or_f16 router_scores=bf16_or_f32"
         diag += " accumulator=float32"
         diag += " weighted_down=true\n"
-        FileHandle.standardError.write(Data(diag.utf8))
+        RuntimeDiagnostics.write(Data(diag.utf8))
     }
 
     private static func supports(_ projection: QuantizedSwitchLinear) -> Bool {
@@ -329,7 +333,8 @@ public enum Qwen4ExpFusedAffineMoE {
             && projection.biases?.dtype == metadataDType
     }
 
-    /// - Parameter swigluLimit: clamp applied to `silu(gate)` before the up-projection multiply,
+    /// - Parameter swigluLimit: upper bound on raw gate and symmetric bounds on raw up,
+    ///   applied before SiLU and multiplication,
     ///   for models that set one (GLM-5.3's `swiglu_limit` is 10.0). `nil` means unclamped, which is
     ///   what Qwen4-Exp and Ornith use and leaves their generated kernel unchanged.
     public static func makeReducer(
@@ -350,6 +355,17 @@ public enum Qwen4ExpFusedAffineMoE {
             return nil
         }
         let shape = matched
+        // The 122B bundle has a different geometry from the older Ornith.
+        // Admit only its measured affine layout; other quantization/storage
+        // combinations retain the generic implementation until qualified.
+        if shape == ornith122BShape,
+            ![gate, up, down].allSatisfy({
+                $0.bits == 4 && $0.groupSize == 64
+                    && $0.scales.dtype == .bfloat16 && $0.biases?.dtype == .bfloat16
+            })
+        {
+            return nil
+        }
         guard enabled,
             supportedShapes.contains(shape),
             geometryIsRepresentable(shape, gate: gate, up: up, down: down),
@@ -391,9 +407,19 @@ public enum Qwen4ExpFusedAffineMoE {
             // BF16 activation/result contract.
             let rows = input.size / shape.inputDimensions
             let leadingShape = Array(input.shape.dropLast())
+            // Extra verifier rows must retain the single-row expert arithmetic: every row is its own
+            // grid slice here, so the kernel IS the 1-row step per row. Ornith (Qwen3.5 MoE) native-MTP
+            // verify enters the same scope; without it a 2-row verify fell back to the generic gather +
+            // BF16 sum and differed from AR in the MoE output (Ornith 122B 4M, layer 9).
+            // Keep ordinary prefill and other model geometries on their existing routes.
+            let rowLimit =
+                [qwen4ExpShape, ornith35Shape, ornith122BShape].contains(shape)
+                    && FlashVerificationScope.usesRowExactVerification(
+                        inputShape: input.shape, site: "moe")
+                ? 8 : maximumRows
             guard input.dtype == .bfloat16,
                 scores.dtype == .bfloat16 || scores.dtype == .float32,
-                rows >= 1, rows <= maximumRows,
+                rows >= 1, rows <= rowLimit,
                 input.size == rows * shape.inputDimensions,
                 input.dim(-1) == shape.inputDimensions,
                 indices.size == rows * shape.routes, indices.dim(-1) == shape.routes,

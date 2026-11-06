@@ -33,8 +33,19 @@ public enum CacheDetail: String, Sendable {
     case paged
     /// The on-disk L2 cache.
     case disk
+    /// An entry of the disk tier kept resident in RAM after its store or an earlier read (the
+    /// opt-in RAM tier, see ``DiskCache/residentByteBudget``). Restored exactly like ``disk`` (the
+    /// hit carries `diskArrays`); only the source of the bytes differs.
+    case memory
+    /// An entry of the disk tier whose file is still being written (write-behind): served from the
+    /// writer's payload, the same content-addressed bytes the file will hold. Not resident: it
+    /// occurs with the SSD-only default, and the payload is released once the file lands.
+    case diskPending
     /// No cache tier had a match.
     case miss
+
+    /// The hit carries a disk-tier payload (`diskArrays`): ``disk``, ``memory`` or ``diskPending``.
+    public var isDiskTierEntry: Bool { self == .disk || self == .memory || self == .diskPending }
 }
 
 // MARK: - CacheFetchResult
@@ -267,6 +278,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         } else {
             self.diskCache = nil
         }
+        self.diskCache?.writeBehind = config.diskWriteBehind
+        self.diskCache?.residentByteBudget = config.usePagedCache ? 0 : max(0, config.residentEntryBytes)
         self.diskRootKey = self.diskCache?.cacheDir.standardizedFileURL.path
 
         self.ssmStateCache = SSMStateCache(
@@ -380,7 +393,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         // "no companions" would commit, mark the root done, and leave every
         // companion in it uncounted for good. Not committed; retried later.
         guard let companions = companionStore.listedQuotaEntries() else {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk-index] companion import reason=\(reason) committed=false "
                     + "companion directory could not be listed or examined\n").utf8))
             return false
@@ -412,7 +425,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 "unindexedPayloadsRemoved=\(counts.unindexedPayloadsRemoved)",
             ]
             let line = "[vmlx][cache/disk-index] companion import " + fields.joined(separator: " ") + "\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
         return summary != nil
     }
@@ -539,31 +552,86 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// active resume point; do not write a large row merely to evict it again.
     func storeCanonicalCheckpoint(
         tokens: [Int], cache: [KVCache], chunkSize: Int,
-        requestSalt: String?, chainId: String?
+        requestSalt: String?, chainId: String?,
+        canonicalModel: (any CanonicalRequiredToolCacheModel)? = nil,
+        requiredResumeTokens: [Int]? = nil, ordinaryRequestSalt: String? = nil
     ) {
-        guard config.enableDiskCache, let diskCache,
+        guard canonicalModel == nil || !Task.isCancelled, config.enableDiskCache, let diskCache,
             diskCache.indexHasReplayChunkColumn, ssmStateCache.diskStore != nil,
             let chainId, !chainId.isEmpty,
             let contract = CanonicalPrefillCheckpoint(chunkSize: chunkSize),
             !tokens.isEmpty, tokens.count % chunkSize == 0,
             !cache.isEmpty,
-            cache.allSatisfy({ ($0 is KVCacheSimple || $0 is RotatingKVCache) && $0.offset == tokens.count }),
+            canonicalModel.map({ $0.validateCanonicalRequiredToolCache(cache, boundary: tokens.count) })
+                ?? cache.allSatisfy({ ($0 is KVCacheSimple || $0 is RotatingKVCache) && $0.offset == tokens.count }),
             CacheStoreBudget.canStore(cache)
         else { return }
         CombinedDiskCacheQuotaLock.shared.lock()
         defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+        let resumeRows = diskCache.quotaEntries(retiringInvalidRecords: false)
+            .filter { $0.chainId == chainId && !$0.isCanonicalCheckpoint }
+        // A GLM acceleration seed is optional: a normal active resume point
+        // must already exist and remain beside it. Never replace that contract.
+        if canonicalModel != nil {
+            guard let resume = requiredResumeTokens, resume.count > tokens.count,
+                  resume.starts(with: tokens),
+                  hasValidatedDiskEntry(tokens: resume, mediaSalt: ordinaryRequestSalt) else { return }
+            let resumeHash = DiskCache.hashTokens(resume, modelKey: diskCache.modelKey, mediaSalt: ordinaryRequestSalt)
+            guard resumeRows.contains(where: { $0.isResumeBoundary && $0.hash == resumeHash }) else { return }
+        }
         let arrays = TQDiskSerializer.serialize(cache: cache, preserveStandardKVStorageDType: true)
         let bytes = IndexedBytes.total(arrays.values.map { Int64($0.nbytes) })
         let cap = Int64(max(1, diskCache.maxSizeBytes))
         // A conservative header allowance avoids writing right at the cap.
-        let resumeBytes = diskCache.quotaEntries(retiringInvalidRecords: false)
-            .filter { $0.chainId == chainId && !$0.isCanonicalCheckpoint }
-            .map { IndexedBytes.sum($0.bytes, $0.companionBytes) }.max() ?? 0
+        let resumeBytes = resumeRows.map { IndexedBytes.sum($0.bytes, $0.companionBytes) }.max() ?? 0
         guard IndexedBytes.sum(IndexedBytes.sum(bytes, resumeBytes), 131_072) <= cap else { return }
         diskCache.storeCanonicalCheckpoint(
             tokens: tokens, arrays: arrays, contract: contract,
             requestSalt: requestSalt, chainId: chainId, enforceQuota: false)
         enforceCombinedDiskQuotaLocked(activeChain: chainId)
+    }
+
+    /// Qualified solo required-tool continuation only. Unknown context, ordinary
+    /// namespace rows, altered chunk schedules and incomplete typed state miss.
+    func restoreCanonicalRequiredToolPrefix(
+        input: LMInput, model: any CanonicalRequiredToolCacheModel,
+        cache: [KVCache], parameters: GenerateParameters, ordinarySalt: String?,
+        structuralBoundary: Int
+    ) -> (cache: [KVCache], boundary: Int)? {
+        guard !Task.isCancelled, config.enableDiskCache, let diskCache,
+              cache.allSatisfy({ $0.offset == 0 && $0.state.isEmpty }),
+              let ids = input.text.tokenIds, structuralBoundary > 0, structuralBoundary < ids.count,
+              input.cachePrefixTokenCounts.contains(structuralBoundary),
+              let chunk = model.canonicalRequiredToolChunkSize(parameters: parameters),
+              let contract = CanonicalPrefillCheckpoint(chunkSize: chunk),
+              let salt = canonicalRequiredToolSalt(input: input, model: model, parameters: parameters,
+                  cache: cache, ordinarySalt: ordinarySalt),
+              let entry = diskCache.fetchCanonicalCheckpoint(
+                  targetTokens: Array(ids.prefix(structuralBoundary)), contract: contract, requestSalt: salt),
+              contract.canContinue(seedTokens: entry.tokens, targetTokens: Array(ids.prefix(structuralBoundary)),
+                  storedChunkSize: chunk)
+        else { return nil }
+        var staged = cache.map { $0.copy() }
+        let boundary = MLXCacheIOLock.withSerializedMLXCacheIO { () -> Int in
+            let dtype = entry.arrays[TQDiskSerializer.preserveStandardKVStorageDTypeKey]
+            guard dtype?.size == 1, dtype?.dtype == .int32, dtype?.item(Int32.self) == 1 else { return 0 }
+            let count = restoreFromDiskArrays(entry.arrays, into: &staged, requirePromptBoundary: true)
+            guard count == entry.tokens.count, model.validateCanonicalRequiredToolCache(staged, boundary: count) else { return 0 }
+            MLX.eval(staged)
+            return count
+        }
+        guard !Task.isCancelled, boundary == entry.tokens.count,
+              validateRestoredCacheBoundary(staged, matchedTokens: boundary, restoredTokens: boundary, detail: "canonical_required")
+        else {
+            diskCache.markRestoreRejected(tokens: entry.tokens,
+                mediaSalt: contract.storageSalt(requestSalt: salt), countedHit: false)
+            return nil
+        }
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            RuntimeDiagnostics.write(Data(
+                "[vmlx][cache/canonical-required] accepted=\(boundary) layers=\(staged.count) chunk=\(chunk)\n".utf8))
+        }
+        return (staged, boundary)
     }
 
     /// Whether a prompt-boundary store has any tier to land in. With both tiers
@@ -578,7 +646,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// Reserve before copying. The snapshot is optional and never evicts
     /// another tier or calls back under the budget lock. Typed N-1 captures
     /// have a separate persistence contract and do not pass through here.
-    func retainExactPromptSnapshot(from cache: [KVCache]) -> RetainedPromptCacheSnapshot? {
+    func retainExactPromptSnapshot(from cache: [KVCache], copy: Bool = true) -> RetainedPromptCacheSnapshot? {
         guard canPersistBoundaries,
             diskCache != nil || !cacheCannotUsePagedCoordinatorRestore(cache)
                 || cacheCanUsePagedWithRotatingCompanion(cache),
@@ -596,7 +664,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             return nil
         }
         return RetainedPromptCacheSnapshot(
-            cache: makePromptBoundaryCacheSnapshot(from: cache),
+            cache: copy ? makePromptBoundaryCacheSnapshot(from: cache) : cache,
             account: promptSnapshotAccount, bytes: bytes)
     }
 
@@ -611,6 +679,11 @@ public final class CacheCoordinator: @unchecked Sendable {
             if incompatible {
                 _requiresPagedBoundaryCompanion = false
             }
+        }
+        // A model the paged tier cannot hold gets its RAM tier from the disk tier's resident
+        // entries instead (with the paged tier off they are on for every model already).
+        if config.usePagedCache, let diskCache {
+            diskCache.residentByteBudget = incompatible ? max(0, config.residentEntryBytes) : 0
         }
     }
 
@@ -819,11 +892,25 @@ public final class CacheCoordinator: @unchecked Sendable {
         mediaSalt: String? = nil,
         skipExactDiskBoundary: Bool = false,
         preferredDiskBoundaries: [Int] = [],
-        chainId: String? = nil
+        chainId: String? = nil,
+        mediaIndependentPrefix: MediaIndependentPrefix? = nil
     ) -> CacheFetchResult {
+        /// The salts a boundary may be stored under, in probe order. A boundary
+        /// at or before the first media token of a request whose model declares
+        /// the pre-media state media-independent (``MediaIndependentPrefix``)
+        /// is keyed under the text-only salt — the rows an earlier text turn of
+        /// the chat wrote — and is probed there first; the request salt is still
+        /// tried after it for rows this build or an older one wrote under it.
+        func saltsToProbe(boundary: Int) -> [String?] {
+            guard let prefix = mediaIndependentPrefix,
+                  let boundarySalt = prefix.salt(forBoundary: boundary),
+                  boundarySalt != mediaSalt
+            else { return [mediaSalt] }
+            return [boundarySalt, mediaSalt]
+        }
         func ftrace(_ msg: String) {
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/fetch] \(msg) tokens=\(tokens.count) skipExactDisk=\(skipExactDiskBoundary) "
                         + "salt=\(mediaSalt.map { String($0.prefix(12)) } ?? "none")\n").utf8))
             }
@@ -860,22 +947,30 @@ public final class CacheCoordinator: @unchecked Sendable {
         // DSV4 via `LayerKind.deepseekV4` — would never get consulted.
         let skipPaged = isPagedIncompatible
 
-        // A rotating companion is an exact state boundary, not a trimmable
-        // token slice. Honor the caller's replay-seed policy in RAM as well as
-        // on disk: an exact N-token hit would rewind only full-attention layers
-        // to N-1 and leave wrapped sliding layers at N before replaying token N.
-        // Query at most N-1, but retain the original request below so every
-        // unprocessed token (including its final token) remains in the suffix.
+        // Tier 1: Paged cache (in-memory). The request salt is probed over
+        // the whole prompt; a media-independent prefix is then probed under
+        // its own salt over just that prefix (its rows carry the text salt).
+        var pagedProbes: [(tokens: [Int], salt: String?)] = [(tokens, mediaSalt)]
+        if let prefix = mediaIndependentPrefix, prefix.salt != mediaSalt,
+           prefix.tokenCount > 0, prefix.tokenCount <= tokens.count
+        {
+            pagedProbes.append((Array(tokens.prefix(prefix.tokenCount)), prefix.salt))
+        }
+        // Per-item segments, latest first: the longest prefix a previous turn's media covers.
+        for segment in mediaIndependentPrefix?.segments ?? []
+        where segment.salt != mediaSalt && segment.upper > 0 && segment.upper <= tokens.count {
+            pagedProbes.insert((Array(tokens.prefix(segment.upper)), segment.salt), at: 1)
+        }
+        for probe in pagedProbes {
         let pagedLookupTokens = skipExactDiskBoundary && requiresPagedBoundaryCompanion
-            ? Array(tokens.dropLast()) : tokens
-
-        // Tier 1: Paged cache (in-memory)
+            ? Array(probe.tokens.dropLast()) : probe.tokens
         if !skipPaged,
            let pagedCache,
            let result = pagedCache.fetchPrefix(
-                tokens: pagedLookupTokens, mediaSalt: mediaSalt,
+                tokens: pagedLookupTokens, mediaSalt: probe.salt,
                 requireBoundaryCompanion: requiresPagedBoundaryCompanion)
         {
+            let probeSalt = probe.salt
             var matchedBlocks = result.blocks
             var matchedTokens = result.matchedTokens
             var remainingTokens = Array(tokens.dropFirst(matchedTokens))
@@ -904,7 +999,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 ssmStates = fetchCompleteSSMStates(
                     tokens: tokens,
                     boundary: matchedTokens,
-                    mediaSalt: mediaSalt
+                    mediaSalt: probeSalt
                 )
                 if ssmStates?.isEmpty ?? true {
                     release(blocks: matchedBlocks)
@@ -923,6 +1018,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 )
             }
         }
+        }
 
         // Tier 2: Disk cache.
         //
@@ -938,14 +1034,25 @@ public final class CacheCoordinator: @unchecked Sendable {
             func diskHit(boundary: Int) -> CacheFetchResult? {
                 guard boundary > 0, boundary <= tokens.count else { return nil }
                 let prefix = boundary == tokens.count ? tokens : Array(tokens.prefix(boundary))
+                for probeSalt in saltsToProbe(boundary: boundary) {
+                    if let hit = diskHit(boundary: boundary, prefix: prefix, probeSalt: probeSalt) {
+                        return hit
+                    }
+                }
+                return nil
+            }
+            func diskHit(boundary: Int, prefix: [Int], probeSalt: String?) -> CacheFetchResult? {
+                let saltTag = probeSalt == mediaSalt ? "" : " salt=text-only"
                 // A deserializable KV payload is only a candidate until
                 // architecture-specific companion state is validated below.
                 // Do not make rejected hybrid candidates hot: no recency
                 // touch and no hit until one is accepted.
                 let arrays: [String: MLXArray]
-                switch diskCache.fetchCandidate(tokens: prefix, mediaSalt: mediaSalt) {
-                case .arrays(let found):
+                let source: DiskCache.FetchSource
+                switch diskCache.fetchCandidate(tokens: prefix, mediaSalt: probeSalt) {
+                case .arrays(let found, let from):
                     arrays = found
+                    source = from
                 case .miss:
                     // A miss here means the content-addressed key over this
                     // prefix found no row; a rejection below means the row
@@ -953,32 +1060,32 @@ public final class CacheCoordinator: @unchecked Sendable {
                     // aggregate "MISS all tiers" was ever traced, which cannot
                     // tell those apart — and a silent companion veto has
                     // already cost a whole family (LFM2.5) its cache once.
-                    ftrace("probe boundary=\(boundary) noRow")
+                    ftrace("probe boundary=\(boundary) noRow\(saltTag)")
                     return nil
                 case .restoreRejectedEarlier:
                     // See `reportDiskRestoreRejected`: serving it again would
                     // end in the same full prefill, with a shorter entry that
                     // does restore still waiting behind it.
-                    ftrace("probe boundary=\(boundary) skipped: restore was rejected earlier")
+                    ftrace("probe boundary=\(boundary) skipped: restore was rejected earlier\(saltTag)")
                     return nil
                 }
                 let ssmStates = resolveSSMStates(
                     forTokens: prefix,
                     boundary: boundary,
                     diskArrays: arrays,
-                    mediaSalt: mediaSalt,
+                    mediaSalt: probeSalt,
                     chainId: chainId)
                 if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
                     touchSuccessfulDiskRestore(
                         matchedTokens: prefix,
                         matchedBoundary: boundary,
-                        mediaSalt: mediaSalt,
+                        mediaSalt: probeSalt,
                         chainId: chainId)
-                    ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))")
+                    ftrace("HIT \(source.detail.rawValue) boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))\(saltTag)")
                     return .hit(
                         matchedTokens: boundary,
                         remainingTokens: Array(tokens.dropFirst(boundary)),
-                        detail: .disk,
+                        detail: source.detail,
                         blocks: [],
                         ssmStates: ssmStates,
                         diskArrays: arrays
@@ -986,7 +1093,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 }
                 ftrace(
                     "probe boundary=\(boundary) rowFound but companion REJECTED "
-                        + "ssm=\(ssmStates?.count ?? -1)")
+                        + "ssm=\(ssmStates?.count ?? -1)\(saltTag)")
                 return nil
             }
 
@@ -1121,14 +1228,26 @@ public final class CacheCoordinator: @unchecked Sendable {
         tokens: [Int],
         boundary: Int,
         mediaSalt: String?,
-        reason: String
+        reason: String,
+        mediaIndependentPrefix: MediaIndependentPrefix? = nil
     ) {
         guard let diskCache, boundary > 0, boundary <= tokens.count else { return }
         let prefix = boundary == tokens.count ? tokens : Array(tokens.prefix(boundary))
-        let marked = diskCache.markRestoreRejected(tokens: prefix, mediaSalt: mediaSalt)
+        // The served row sits under whichever salt `fetch` probed for this
+        // boundary; marking a key with no served payload changes nothing.
+        var salts: [String?] = [mediaSalt]
+        if let boundarySalt = mediaIndependentPrefix?.salt(forBoundary: boundary),
+           boundarySalt != mediaSalt
+        {
+            salts.insert(boundarySalt, at: 0)
+        }
+        var marked = false
+        for salt in salts where !marked {
+            marked = diskCache.markRestoreRejected(tokens: prefix, mediaSalt: salt)
+        }
         if marked || ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             // Said once per payload: it explains a full prefill after a hit.
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/restore] disk restore rejected boundary=\(boundary) "
                     + "tokens=\(tokens.count) marked=\(marked) reason=\(reason)\n").utf8))
         }
@@ -1295,7 +1414,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         matchedTokenCount: Int,
         preferredDiskBoundaries: [Int],
         skipExactDiskBoundary: Bool,
-        mediaSalt: String?
+        mediaSalt: String?,
+        mediaIndependentPrefix: MediaIndependentPrefix? = nil
     ) {
         guard let diskCache,
               matchedTokenCount > 0,
@@ -1306,7 +1426,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         defer { CombinedDiskCacheQuotaLock.shared.unlock() }
 
         let stableBoundaries = Set(preferredDiskBoundaries.compactMap { boundary in
-            let storedBoundary = skipExactDiskBoundary ? boundary - 1 : boundary
+            let storedBoundary = skipExactDiskBoundary && boundary > 1 ? boundary - 1 : boundary
             return storedBoundary > 0 && storedBoundary <= matchedTokenCount
                 ? storedBoundary
                 : nil
@@ -1315,15 +1435,16 @@ public final class CacheCoordinator: @unchecked Sendable {
             let tokens = boundary == requestTokens.count
                 ? requestTokens
                 : Array(requestTokens.prefix(boundary))
+            let boundarySalt = mediaIndependentPrefix?.salt(forBoundary: boundary) ?? mediaSalt
             let touchedKV = diskCache.touchRecency(
                 tokens: tokens,
-                mediaSalt: mediaSalt,
+                mediaSalt: boundarySalt,
                 at: recency)
             if touchedKV, isHybrid {
                 _ = ssmStateCache.diskStore?.touchRecency(
                     tokens: tokens,
                     boundary: boundary,
-                    mediaSalt: mediaSalt,
+                    mediaSalt: boundarySalt,
                     at: recency)
             }
         }
@@ -1369,6 +1490,26 @@ public final class CacheCoordinator: @unchecked Sendable {
         isResumeBoundary: Bool = false,
         isPostAnswer: Bool = false
     ) {
+        storeAfterGeneration(
+            promptTokens: promptTokens, perLayerData: perLayerData, ssmStates: ssmStates,
+            cache: cache, mediaSalt: mediaSalt, chainId: chainId,
+            isStableRoot: isStableRoot, isResumeBoundary: isResumeBoundary,
+            isPostAnswer: isPostAnswer, dflash2Context: nil)
+    }
+
+    /// Optional conditioning shares the target payload's lifetime and quota.
+    func storeAfterGeneration(
+        promptTokens: [Int],
+        perLayerData: [(keys: MLXArray, values: MLXArray)?],
+        ssmStates: [MLXArray]?,
+        cache: [any KVCache]? = nil,
+        mediaSalt: String? = nil,
+        chainId: String? = nil,
+        isStableRoot: Bool = false,
+        isResumeBoundary: Bool = false,
+        isPostAnswer: Bool = false,
+        dflash2Context: DFlash2PrefixContext?
+    ) {
         var trace = CacheFinalizationTrace("coordinator-store", tokens: promptTokens.count)
         defer { trace.mark("return") }
         let totalTokens = promptTokens.count
@@ -1395,10 +1536,10 @@ public final class CacheCoordinator: @unchecked Sendable {
         // Refuse the whole store instead: a skipped entry costs one prefill,
         // a poisoned entry costs correctness for every later turn.
         if let cache {
-            let offsets = Set(cache.map(\.offset))
-            if offsets.contains(where: { $0 != totalTokens }) {
+            let offsets = Set(cacheBoundaryLeafOffsets(cache))
+            if totalTokens <= 0 || offsets.isEmpty || offsets.contains(where: { $0 != totalTokens }) {
                 if traceCacheStore {
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         ("[vmlx][cache/store] REFUSED offset/key mismatch"
                             + " tokens=\(totalTokens) offsets=\(offsets.sorted())\n").utf8))
                 }
@@ -1454,7 +1595,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 + "blocks=\(blockLayerData.count) payload=\(hasPagedKVPayload) "
                 + "companion=\(pagedBoundaryCompanion != nil) "
                 + "rotatingOffsets=\(uniqueRotatingOffsets)\n"
-            FileHandle.standardError.write(Data(message.utf8))
+            RuntimeDiagnostics.write(Data(message.utf8))
         }
 
         trace.mark("geometry-and-paged-companion")
@@ -1532,6 +1673,23 @@ public final class CacheCoordinator: @unchecked Sendable {
             }
         }
 
+        if let context = dflash2Context, var arrays = diskArrays, let diskCache {
+            let baseBytes = IndexedBytes.total(arrays.values.map { Int64($0.nbytes) })
+            let companionBytes =
+                persistSeparateRecurrentPayload
+                ? IndexedBytes.total((ssmStates ?? []).map { Int64($0.nbytes) }) : 0
+            let cap = Int64(max(1, diskCache.maxSizeBytes))
+            let reserved = IndexedBytes.sum(IndexedBytes.sum(baseBytes, companionBytes), 131_072)
+            let available = cap - min(cap, reserved)
+            // Optional acceleration must never turn an otherwise valid KV store into a miss.
+            if let extra = context.diskArrays(at: promptTokens.count, byteBudget: available),
+                extra.keys.allSatisfy({ arrays[$0] == nil })
+            {
+                arrays.merge(extra) { existing, _ in existing }
+                diskArrays = arrays
+            }
+        }
+
         trace.mark("disk-serialization")
         storePersistentBoundary(
             tokens: promptTokens,
@@ -1565,6 +1723,10 @@ public final class CacheCoordinator: @unchecked Sendable {
         let usesCombinedQuota = config.enableDiskCache
             && diskCache != nil
             && ssmStateCache.diskStore != nil
+        // Back-pressure for write-behind happens HERE, before the combined quota lock: the writer
+        // takes that lock in `afterPublish`, so waiting for it to drain while holding the lock is a
+        // deadlock (see `DiskCache.store`).
+        diskCache?.waitForWriteBehindRoom()
         if usesCombinedQuota {
             CombinedDiskCacheQuotaLock.shared.lock()
         }
@@ -1591,7 +1753,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             let payload = IndexedBytes.sum(kvBytes, companionBytes)
             if payload > cap {
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         ("[vmlx][cache/disk-store] SKIP oversized count=\(tokens.count) "
                             + "bytes=\(payload) cap=\(cap) chain=\(chainId ?? "nil")\n").utf8))
                 }
@@ -1604,8 +1766,19 @@ public final class CacheCoordinator: @unchecked Sendable {
                 return
             }
         }
+        // Write-behind (see DiskCache) unless THIS call also stores a separate recurrent companion:
+        // that companion links onto the KV row inside this critical section ("KV first" below), so
+        // the row must exist before return. Hybrids whose recurrent state is native in the KV file
+        // (Qwen3.8 / Flash-Next / 27B GatedDeltaNet: `storesCompanion == false`) write one file and
+        // link nothing, so they write behind too: their single boundary save was the whole
+        // end-of-turn wait (Flash-Next 0.52 s, 27B 1.08 s per boundary at 10.8k tokens, 800 MB/s).
+        // When the write is deferred, what follows the row (early-companion adoption, the quota pass
+        // and the capacity-pressure record) runs on the writer once the row has landed, under the
+        // same lock.
+        var deferred = false
         if let diskArrays, !diskArrays.isEmpty {
-            diskCache?.store(
+            let isHybrid = isHybrid
+            deferred = diskCache?.store(
                 tokens: tokens,
                 arrays: diskArrays,
                 mediaSalt: mediaSalt,
@@ -1613,11 +1786,24 @@ public final class CacheCoordinator: @unchecked Sendable {
                 chainId: chainId,
                 isStableRoot: isStableRoot,
                 isResumeBoundary: isResumeBoundary,
-                isPostAnswer: isPostAnswer)
-            if !storesCompanion {
+                isPostAnswer: isPostAnswer,
+                allowWriteBehind: !storesCompanion,
+                afterPublish: { [self] finalizedChainId in
+                    if usesCombinedQuota { CombinedDiskCacheQuotaLock.shared.lock() }
+                    defer { if usesCombinedQuota { CombinedDiskCacheQuotaLock.shared.unlock() } }
+                    adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
+                    if usesCombinedQuota {
+                        enforceCombinedDiskQuotaLocked(activeChain: finalizedChainId)
+                    } else {
+                        enforceCombinedDiskQuota(activeChain: finalizedChainId)
+                    }
+                    diskCache?.reconcileCapacityPressure(chainId: finalizedChainId, requiresCompanion: isHybrid)
+                }) ?? false
+            if !deferred, !storesCompanion {
                 adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
             }
         }
+        if deferred { return }
 
         // KV first: the companion store reports what it wrote to the index
         // before it returns (still inside this critical section), and links
@@ -1842,6 +2028,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 isPostAnswer: kv.isPostAnswer,
                 isCanonicalCheckpoint: kv.isCanonicalCheckpoint,
                 chainId: kv.chainId,
+                modelKey: kv.modelKey,
                 isLegacyCompanion: false))
         }
         // A KV hash is hex, so the prefix keeps the two id spaces apart.
@@ -1877,7 +2064,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
 
         let selectStart = DispatchTime.now().uptimeNanoseconds
-        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: planCap, activeChain: activeChain)
+        let plan = DiskQuotaPlanner.plan(
+            rows: rows, capBytes: planCap, activeChain: activeChain, activeModelKey: diskCache.modelKey)
         let selectMs = msSince(selectStart)
         guard !plan.evict.isEmpty else { return }
 
@@ -1951,7 +2139,9 @@ public final class CacheCoordinator: @unchecked Sendable {
             evictedGroups: evictedGroups, evictedBytes: evictedBytes, milliseconds: totalMs,
             event: confirmedEvent,
             tipTokenCount: DiskQuotaPlanner.resumePoint(
-                of: rows.filter { $0.chainId == activeChain })?.tokenCount ?? 0)
+                of: rows.filter {
+                    $0.chainId == activeChain && ($0.modelKey ?? "") == (diskCache.modelKey ?? "")
+                })?.tokenCount ?? 0)
         _lastQuotaPassTiming = QuotaPassTiming(
             rowsMs: rowsMs, selectMs: selectMs, deleteMs: deleteMs, totalMs: totalMs,
             evictedGroups: evictedGroups)
@@ -1960,7 +2150,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             // Same leading keys as the directory-walk line; `ms` and `event`
             // are appended. An index pass never removes an orphan on sight, so
             // that count is always 0 here.
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.totalAfter)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(removedLegacy.count) orphanCompanionEvicted=0 deleteFailures=\(evictKV.count - removedKV.count + companionsStillOnDisk.count) source=index ms=\(String(format: "%.3f", totalMs)) rowsMs=\(String(format: "%.3f", rowsMs)) selectMs=\(String(format: "%.3f", selectMs)) deleteMs=\(String(format: "%.3f", deleteMs)) event=\(confirmedEvent?.kind.rawValue ?? "none") chain=\(activeChain ?? "none")\n".utf8))
         }
     }
@@ -2060,7 +2250,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
 
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.remaining)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(legacyCompanionEvicted) orphanCompanionEvicted=\(orphaned.count) deleteFailures=\(evictKV.count - removedKV.count + evictCompanion.count - removedCompanions.count) source=walk\n".utf8))
         }
     }
@@ -2118,6 +2308,16 @@ public final class CacheCoordinator: @unchecked Sendable {
     public func releaseVolatile() {
         pagedCache?.clear()
         ssmStateCache.clear()
+        // The disk tier's resident payloads are RAM copies of files that stay on the SSD.
+        diskCache?.releaseResidentEntries()
+    }
+
+    /// Wait for disk stores still being written in the background (``DiskCache`` write-behind) to
+    /// reach disk and the index. Unload, shutdown and app quit call this so an entry published as
+    /// stored is durable before the process lets go of it. A timeout only logs.
+    @discardableResult
+    public func waitForPendingDiskWrites(timeout: TimeInterval = 30) -> Bool {
+        diskCache?.waitForPendingWrites(timeout: timeout) ?? true
     }
 
     /// Clear all cache tiers, releasing all cached data.

@@ -1,6 +1,8 @@
-# Native MTP default Off checkpoint — PARTIAL
+# Historical native MTP default Off checkpoint
 
-## Superseded scope — September 14
+> Superseded October 7, 2026. Current policy is documented in [Speculative decoding defaults](SPECULATIVE_DECODING_DEFAULTS.md): Flash-Next with a usable MTP head defaults to Adaptive, and compatible bundled DFlash2 is discovered automatically. Explicit Off means AR. The policies and test results below are historical, not current defaults or new qualification evidence.
+
+## Historical scope — September 14
 
 The September 13 global-Off proposal below is superseded by Eric's request:
 **Flash Next only starts Off; 27B must not be affected.** Shared engine init

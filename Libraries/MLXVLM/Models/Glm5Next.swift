@@ -29,9 +29,15 @@
 
 import Foundation
 import MLX
-import AVFoundation
-import CoreImage
-import CoreMedia
+#if canImport(AVFoundation)
+    import AVFoundation
+#endif
+#if canImport(CoreImage)
+    import CoreImage
+#endif
+#if canImport(CoreMedia)
+    import CoreMedia
+#endif
 import MLXLLM
 import MLXLMCommon
 import MLXNN
@@ -66,14 +72,33 @@ enum Glm5NextPrefillMemoryProbe {
             }
         }
         let g = 1024.0 * 1024.0 * 1024.0
-        FileHandle.standardError.write(Data(String(
+        #if canImport(Metal)
+        RuntimeDiagnostics.write(Data(String(
             format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG slots=%d\n",
             tokens, Double(GPU.activeMemory) / g, Double(GPU.cacheMemory) / g,
             Double(GPU.peakMemory) / g, Double(cacheBytes) / g, slots).utf8))
+        #else
+        RuntimeDiagnostics.write(Data(String(
+            format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG slots=%d\n",
+            tokens, Double(Memory.activeMemory) / g, Double(Memory.cacheMemory) / g,
+            Double(Memory.peakMemory) / g, Double(cacheBytes) / g, slots).utf8))
+        #endif
     }
 }
 
 public enum Glm5NextIndexerRuntime {
+    static func layoutRangeCountIsRepresentable(_ count: Int) -> Bool {
+        count >= 0 && Int32(exactly: count) != nil
+    }
+
+    /// Build context-sized index layouts on device instead of copying a host integer range.
+    /// Explicit Int32 construction preserves selection and mask indices without Float rounding.
+    static func layoutRange(_ count: Int) -> MLXArray {
+        precondition(layoutRangeCountIsRepresentable(count), "GLM layout count exceeds Int32 range")
+        let stop = Int32(count)
+        return arange(Int(stop), dtype: .int32)
+    }
+
     nonisolated(unsafe) static var poolFP32: Bool = {
         ProcessInfo.processInfo.environment["VMLX_GLM5_INDEX_FP32"] == "1"
     }()
@@ -1225,18 +1250,26 @@ extension Glm5NextIndexer {
         // and producing one shared layout anyway would quietly mis-pool the padded rows.
         let anyValid = valid.any(axis: -1)
         let firstKey = MLX.where(anyValid, valid.asType(.int32).argMax(axis: -1), MLXArray(Int32(N)))
-        let firstValues = firstKey.asType(.int32).asArray(Int32.self)
-        guard let start = firstValues.first, firstValues.allSatisfy({ $0 == start }) else {
-            throw Glm5NextDecoderUnavailable(
-                detail:
-                    "the sequences in this batch begin at different offsets (padding); the indexer's "
-                    + "pool layout is shared across the batch and cannot express that")
+        let start: MLXArray
+        if B == 1 {
+            // A single sequence always has a shared layout. Keep its offset on the device:
+            // reading it on the host would evaluate the preceding model graph at every indexer.
+            start = firstKey[0].asType(.int32)
+        } else {
+            let firstValues = firstKey.asType(.int32).asArray(Int32.self)
+            guard let first = firstValues.first, firstValues.allSatisfy({ $0 == first }) else {
+                throw Glm5NextDecoderUnavailable(
+                    detail:
+                        "the sequences in this batch begin at different offsets (padding); the indexer's "
+                        + "pool layout is shared across the batch and cannot express that")
+            }
+            start = MLXArray(first)
         }
 
         let poolCount = (N + poolSize - 1) / poolSize
-        let offsets = MLXArray(Int32(0) ..< Int32(poolCount * poolSize))
+        let offsets = Glm5NextIndexerRuntime.layoutRange(poolCount * poolSize)
             .reshaped(poolCount, poolSize)
-        let poolIndices = offsets + MLXArray(start)
+        let poolIndices = offsets + start
         let safe = clip(poolIndices, min: MLXArray(Int32(0)), max: MLXArray(Int32(N - 1)))
         let flatSafe = safe.reshaped(-1)
 
@@ -1322,7 +1355,7 @@ extension Glm5NextIndexer {
 
         // A pool is a candidate only if its LAST token is visible to this query — which is what
         // makes the selection causal without materialising a per-token comparison.
-        let kvPositions = MLXArray(Int32(0) ..< Int32(N))
+        let kvPositions = Glm5NextIndexerRuntime.layoutRange(N)
         let queryPositions = MLXArray(Int32(queryOffset) ..< Int32(queryOffset + S))
         let causal = kvPositions[.newAxis, 0...] .<= queryPositions[0..., .newAxis]  // (S, N)
         let validKeys = packed[.ellipsis, 2 * headDim] .!= MLXArray(Float(0))  // (B, N)
@@ -1838,6 +1871,14 @@ public final class Glm5NextMoEGate: Module {
     public func callAsFunction(
         _ x: MLXArray, correctionBias: MLXArray
     ) -> (indices: MLXArray, weights: MLXArray) {
+        if numGroups <= 1, topkGroup <= 1,
+            let routed = SigmoidRouterKernels.route(
+                x, weight: weight, correctionBias: correctionBias, topK: topK,
+                normalize: topK > 1 && normTopkProb, scaling: routedScalingFactor)
+        {
+            // Same output contract as the graph below (weights rounded to the activation dtype).
+            return (routed.indices, routed.weights.asType(x.dtype))
+        }
         let logits = x.matmul(weight.T)
         let originalScores = sigmoid(logits.asType(.float32))
         let scoresForChoice = originalScores + correctionBias
@@ -1857,7 +1898,10 @@ public final class Glm5NextMoEGate: Module {
 }
 
 /// The sparse MLP: 288 routed experts fused into a `SwitchGLU`, plus one always-on shared expert.
+
 public final class Glm5NextMoE: Module {
+    /// Canonical checkpoint layer; standalone modules do not invent an owner.
+    public let routedAdviceLayerIndex: Int?
 
     /// Sibling of `gate`, NOT a child of it — `mlp.e_score_correction_bias`, where DeepSeek V3 puts
     /// the same tensor at `mlp.gate.e_score_correction_bias`. Copying V3's nesting produced a
@@ -1865,46 +1909,38 @@ public final class Glm5NextMoE: Module {
     @ParameterInfo(key: "e_score_correction_bias") public var eScoreCorrectionBias: MLXArray
 
     @ModuleInfo(key: "gate") public var gate: Glm5NextMoEGate
-    @ModuleInfo(key: "switch_mlp") public var switchMLP: SwitchGLU
+    @ModuleInfo(key: "switch_mlp") public var routedExperts: any WeightedRoutedExpertLayer
+
+    /// Ordinary affine/MX branch, absent when a custom bank owns the routed path.
+    public var switchMLP: SwitchGLU? { routedExperts as? SwitchGLU }
     @ModuleInfo(key: "shared_experts") public var sharedExperts: Glm5NextSharedExpert
 
-    public init(_ config: Glm5NextTextConfiguration) {
+    public init(
+        _ config: Glm5NextTextConfiguration,
+        routedExperts: (any WeightedRoutedExpertLayer)? = nil,
+        layerIndex: Int? = nil
+    ) {
+        routedAdviceLayerIndex = layerIndex
         _eScoreCorrectionBias.wrappedValue = MLXArray.zeros([config.nRoutedExperts])
         _gate.wrappedValue = Glm5NextMoEGate(config)
-        _switchMLP.wrappedValue = SwitchGLU(
+        // Select the custom bank before constructing any dense expert placeholders.
+        _routedExperts.wrappedValue = routedExperts ?? SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.nRoutedExperts,
-            // `swiglu_limit` is 10.0 in this bundle, so the activation is CLAMPED. Plain silu would
-            // be wrong on the tail, silently — nothing about the shapes would object.
-            activation: { clip(silu($0), min: -config.swigluLimit!, max: config.swigluLimit!) },
-            // The SAME value that builds the eager activation above, so the fused decode kernel and
-            // the generic path cannot disagree about the clamp.
-            swigluLimit: config.swigluLimit)
+            // One typed two-input contract drives both eager and fused clamps.
+            activation: .swiGLU(limit: config.swigluLimit))
         _sharedExperts.wrappedValue = Glm5NextSharedExpert(config)
         super.init()
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = gate(x, correctionBias: eScoreCorrectionBias)
-
-        // DECODE FAST PATH. `qwen4ExpReduced` walks gate and up in one pass and applies the router
-        // scores while reducing the down projections straight into the hidden vector, so it never
-        // materialises the [routes, hidden] routed tensor the generic path builds. It returns nil
-        // for anything it does not handle exactly — prefill batches, unqualified geometry, a
-        // quantization it has not been given — and the generic path below then runs unchanged.
-        //
-        // Asking for it is the half that was missing: the kernel and its shape gate can both be
-        // correct while nothing ever calls them, which is what made this a fast path GLM-5.3 could
-        // not reach no matter what the gate said.
-        let combined: MLXArray
-        if let fused = switchMLP.qwen4ExpReduced(x, indices: indices, scores: weights) {
-            combined = fused
-        } else {
-            let routed = switchMLP(x, indices)
-            // `switchMLP` returns [..., topK, hidden]; weight each expert's contribution and sum.
-            combined = (routed * expandedDimensions(weights, axis: -1)).sum(axis: -2)
+        if let layer = routedAdviceLayerIndex {
+            // Existing advisor policy is opt-in; disabled calls perform no readback.
         }
+
+        let combined = routedExperts.callRouted(x, indices: indices, scores: weights)
         // The shared expert is ALWAYS on — it is not one of the routed `topK`.
         return combined + sharedExperts(x)
     }
@@ -1987,7 +2023,9 @@ public final class Glm5NextDecoderLayer: Module {
 
     public init(
         _ config: Glm5NextTextConfiguration, kind: Glm5NextLayerKind, mlpKind: Glm5NextMLPKind,
-        isMultiTokenPrediction: Bool = false
+        isMultiTokenPrediction: Bool = false,
+        layerIndex: Int? = nil,
+        routedExperts: (any WeightedRoutedExpertLayer)? = nil
     ) {
         self.kind = kind
         self.mlpKind = mlpKind
@@ -2011,7 +2049,8 @@ public final class Glm5NextDecoderLayer: Module {
 
         switch mlpKind {
         case .dense: _feedForward.wrappedValue = Glm5NextDenseMLP(config)
-        case .sparse: _feedForward.wrappedValue = Glm5NextMoE(config)
+        case .sparse:
+            _feedForward.wrappedValue = Glm5NextMoE(config, routedExperts: routedExperts, layerIndex: layerIndex)
         }
 
         // NOT on the MTP layer. The shipped layer 45 carries no `attn_hc` / `ffn_hc` at all — it
@@ -2029,6 +2068,9 @@ public final class Glm5NextDecoderLayer: Module {
             _ffnHC.wrappedValue = DeepseekV4HyperConnection(
                 hcMult: config.hcMult, sinkhornIterations: config.hcSinkhornIters,
                 eps: config.hcEps, normEps: config.rmsNormEps, hiddenSize: config.hiddenSize)
+            // vMLX Python mHC v3 (glm5_mhc_decode): two dispatches for decode and verify slabs.
+            _attentionHC.wrappedValue?.fusedDecodeCollapse = true
+            _ffnHC.wrappedValue?.fusedDecodeCollapse = true
         }
 
         if isMultiTokenPrediction {
@@ -2118,7 +2160,75 @@ public final class Glm5NextSharedHead: Module {
 
 // MARK: - LanguageModel conformance
 
-extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
+extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel, CanonicalRequiredToolCacheModel {
+
+    public var canonicalRequiredToolCacheIdentity: String {
+        // The fused mHC prefill computes the projection in true fp32 (the graph runs TF32), so its cold prefill is a
+        // different canonical state.
+        "glm5-solo-cold-bf16-absorbed-tf32-default1-v1" + (MHCFusedPrefill.enabled ? "-mhcprefill1" : "")
+    }
+
+    public func canonicalRequiredToolChunkSize(parameters: GenerateParameters) -> Int? {
+        let chunk = Int(ProcessInfo.processInfo.environment["VMLX_GLM5_PREFILL_STEP"] ?? "") ?? parameters.prefillStepSize
+        // Quantized embeddings store packed integers; their effective output
+        // dtype follows the explicit override or the dequantization scales.
+        let embedding = languageModel.embedTokens
+        let embeddingDType = (embedding as? QuantizedEmbedding)
+            .map { $0.outputDType ?? $0.scales.dtype } ?? embedding.weight.dtype
+        guard preservesCheckpointParameterDTypes, embeddingDType == .bfloat16,
+              chunk == 512, parameters.kvBits == nil, parameters.maxKVSize == nil,
+              Glm5NextIndexerRuntime.absorbMLA, Glm5NextIndexerRuntime.gatherSelected,
+              !Glm5NextIndexerRuntime.poolFP32,
+              languageModel.layers.prefix(languageModel.numDecoderLayers).allSatisfy({
+                  $0.linearAttention?.fusedConv ?? true
+              }) else { return nil }
+        // MLX core defaults to TF32=1. Explicit0/unknown math policy cannot
+        // produce or consume this qualified namespace. No flag is overridden.
+        let tf32 = ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"]
+        guard tf32 == nil || Int(tf32!) == 1 else { return nil }
+        // Requested compiled decode is harmless here: IndexedKV is not a
+        // promotable cache, so the existing setupCompiledDecode guard leaves
+        // the entire configured GLM cache array and eager forward unchanged.
+        guard case .none = parameters.kvMode else { return nil }
+        return chunk
+    }
+
+    public func validateCanonicalRequiredToolCache(_ cache: [KVCache], boundary: Int) -> Bool {
+        guard boundary >= 0, cache.count == schedule.count, !cache.isEmpty else { return false }
+        for (kind, layer) in zip(schedule, cache) {
+            guard layer.offset == boundary else { return false }
+            switch kind {
+            case .linearAttention:
+                guard type(of: layer) == MambaCache.self, let mamba = layer as? MambaCache,
+                      mamba.persistentSlotCount == 2 else { return false }
+                if boundary == 0 {
+                    guard mamba.state.isEmpty else { return false }
+                } else {
+                    guard let convolution = mamba[0], let recurrent = mamba[1],
+                          convolution.dtype == .bfloat16, recurrent.dtype == .float32,
+                          convolution.shape == [1, config.textConfig.linearAttnConfig.shortConvKernelSize - 1,
+                              3 * config.textConfig.linearAttnConfig.numHeads * config.textConfig.linearAttnConfig.headDim],
+                          recurrent.shape == [1, config.textConfig.linearAttnConfig.numHeads,
+                              config.textConfig.linearAttnConfig.headDim, config.textConfig.linearAttnConfig.headDim]
+                    else { return false }
+                }
+            case .deepseekSparseAttention:
+                guard type(of: layer) == Glm5NextIndexedKVCache.self,
+                      let indexed = layer as? Glm5NextIndexedKVCache, indexed.absorbed else { return false }
+                if boundary == 0 {
+                    guard indexed.state.isEmpty else { return false }
+                } else {
+                    let arrays = indexed.state
+                    guard arrays.count == 3, arrays.allSatisfy({ $0.dtype == .bfloat16 }),
+                          arrays[0].shape == [1, 1, boundary, config.textConfig.kvLoraRank],
+                          arrays[1].shape == [1, 1, boundary, 1],
+                          arrays[2].shape == [1, boundary, 2 * config.textConfig.indexHeadDim + 1]
+                    else { return false }
+                }
+            }
+        }
+        return true
+    }
 
     public var vocabularySize: Int { config.textConfig.vocabSize }
 
@@ -2184,12 +2294,19 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
                         tokenIds: input.text.tokenIds))
             }
 
+            let beganCanonicalCold = CanonicalTextPrefillCheckpointReporter.isActive
+                && cache.allSatisfy({ $0.offset == 0 && $0.state.isEmpty })
             var offset = 0
             while offset + step < promptTokenCount {
                 try Task.checkCancellation()
                 let end = offset + step
                 _ = try languageModel(ids[0..., offset ..< end], mask: nil, caches: cache)
                 MLX.eval(cache)
+                if beganCanonicalCold {
+                    CanonicalTextPrefillCheckpointReporter.reportModelColdTextChunk(
+                        modelIdentity: canonicalRequiredToolCacheIdentity, input: input, cache: cache,
+                        chunkSize: step, completed: end, beganWithEmptyCache: true)
+                }
                 PrefillProgressReporter.reportCompletedUnits(end)
                 offset = end
                 Glm5NextPrefillMemoryProbe.report(tokens: end, caches: cache)
@@ -2278,7 +2395,7 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
         do {
             return try callAsFunction(inputs, mask: nil, caches: cache, inputEmbedding: nil)
         } catch {
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[glm5_next] forward failed: \(error)\n".utf8))
             return MLXArray.zeros([inputs.dim(0), inputs.dim(1), vocabularySize])
         }
@@ -2340,6 +2457,7 @@ public struct Glm5NextProcessorConfiguration: Codable, Sendable {
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public final class Glm5NextProcessor: UserInputProcessor {
 
     private let config: Glm5NextImageProcessorConfiguration
@@ -2366,8 +2484,8 @@ public final class Glm5NextProcessor: UserInputProcessor {
     /// "Unsupported processor type" — a table filled in on one side only.
     ///
     /// The media ids live in the MODEL config, which is not passed here, so they are resolved from
-    /// the vocabulary instead. `convertTokenToId` rather than `encode(...).last`, because encode
-    /// may prepend a BOS and would then hand back the wrong id with no sign anything was wrong.
+    /// the vocabulary instead. Resolve one token without an added BOS and require an exact
+    /// decode round trip, so an unknown-token alias cannot become an image/cache placeholder.
     public convenience init(
         config: Glm5NextProcessorConfiguration, tokenizer: any Tokenizer
     ) throws {
@@ -2382,7 +2500,9 @@ public final class Glm5NextProcessor: UserInputProcessor {
         videoConfig: Glm5NextImageProcessorConfiguration,
         videoFPS: Double, tokenizer: any Tokenizer
     ) throws {
-        guard let imageToken = tokenizer.convertTokenToId("<|image|>") else {
+        guard let imageToken = MediaTokenIds.resolve(
+            tokenizer: tokenizer, tokens: ["<|image|>"])?.first
+        else {
             throw Glm5NextDecoderUnavailable(
                 detail: "this tokenizer has no <|image|> token, so image placeholders cannot be "
                     + "written; the bundle's tokenizer.json is not GLM-5.3's")
@@ -2654,8 +2774,9 @@ public final class Glm5NextProcessor: UserInputProcessor {
         // tokens after it, which produced a prompt with no role framing at all — the model was doing
         // free continuation, and answered a picture of a red 1 with "The digit is 3, and it is red.
         // The digit is 3, and it is orange." Fluent, confident, and nothing to do with the image.
+        let messages = Glm5NextMessageGenerator().generate(from: input)
         var promptTokens = try tokenizer.applyChatTemplate(
-            messages: Glm5NextMessageGenerator().generate(from: input),
+            messages: messages,
             tools: input.tools,
             additionalContext: input.additionalContext)
 
@@ -2691,9 +2812,26 @@ public final class Glm5NextProcessor: UserInputProcessor {
         }
 
         guard !input.images.isEmpty else {
+            // The exact active template proves text-only resume boundaries.
+            // Media expansion needs its own companion-state proof before it
+            // can publish these counts. Unsupported tokenizers fail closed.
+            let boundaries = input.audios.isEmpty
+                ? canonicalChatCacheBoundaries(
+                    tokenizer: tokenizer,
+                    messages: messages,
+                    tools: input.tools,
+                    additionalContext: input.additionalContext,
+                    promptTokens: promptTokens,
+                    staticSystemPrefix: input.cacheStableSystemPrefix)
+                : CanonicalChatCacheBoundaries(all: [], stable: [])
             return LMInput(
-                text: .init(tokens: MLXArray(promptTokens.map { Int32($0) })),
-                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+                text: .init(tokens: MLXArray(promptTokens.map { Int32($0) }), tokenIds: promptTokens),
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+                cachePrefixTokenCounts: boundaries.all,
+                cacheStablePrefixTokenCounts: boundaries.stable,
+                toolSchemas: input.tools,
+                canonicalRequiredToolContext: CanonicalRequiredToolContext(
+                    additionalContext: input.additionalContext, tools: input.tools))
         }
 
         var patches = [MLXArray]()
@@ -2718,6 +2856,7 @@ public final class Glm5NextProcessor: UserInputProcessor {
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }
+#endif
 
 // MARK: - Image splicing
 
@@ -2787,6 +2926,11 @@ extension Glm5Next {
 /// separate head would mean rewriting keys for no gain. `num_nextn_predict_layers` decides whether
 /// it exists at all: the same model is published with and without MTP, and the version without must
 /// declare no parameter its checkpoint lacks.
+public enum Glm5NextRoutedBankError: Error {
+    case incompleteCoverageOrUnsupportedMTP
+    case invalidCustomTensorExclusions
+}
+
 public final class Glm5NextLanguageModel: Module {
 
     public let numDecoderLayers: Int
@@ -2798,8 +2942,21 @@ public final class Glm5NextLanguageModel: Module {
     @ModuleInfo(key: "layers") public var layers: [Glm5NextDecoderLayer]
     @ModuleInfo(key: "norm") public var norm: RMSNorm
 
-    public init(_ config: Glm5NextTextConfiguration) throws {
+    public init(
+        _ config: Glm5NextTextConfiguration,
+        routedExperts: [Int: any WeightedRoutedExpertLayer] = [:]
+    ) throws {
         let schedule = try config.validatedSchedule()
+        if !routedExperts.isEmpty {
+            let expected = Set((0 ..< config.numHiddenLayers).filter {
+                config.mlpLayerTypes[$0] == .sparse
+            })
+            guard Set(routedExperts.keys) == expected,
+                !glm5NextNativeMTPEnabled() || config.numNextnPredictLayers == 0
+            else {
+                throw Glm5NextRoutedBankError.incompleteCoverageOrUnsupportedMTP
+            }
+        }
         self.numDecoderLayers = config.numHiddenLayers
         // Gated, not config-driven: see `glm5NextNativeMTPEnabled()`. A bundle that declares an
         // MTP layer but ships no weights for it must not allocate one.
@@ -2813,7 +2970,8 @@ public final class Glm5NextLanguageModel: Module {
 
         var built = (0 ..< config.numHiddenLayers).map { index in
             Glm5NextDecoderLayer(
-                config, kind: schedule[index], mlpKind: config.mlpLayerTypes[index])
+                config, kind: schedule[index], mlpKind: config.mlpLayerTypes[index],
+                layerIndex: index, routedExperts: routedExperts[index])
         }
         // The MTP layer is NOT in `layer_types` — that list is exactly `num_hidden_layers` long, as
         // `validatedSchedule` enforces. Its kinds come from the weights instead: the shipped layer
@@ -2822,7 +2980,7 @@ public final class Glm5NextLanguageModel: Module {
             built.append(
                 Glm5NextDecoderLayer(
                     config, kind: .deepseekSparseAttention, mlpKind: .sparse,
-                    isMultiTokenPrediction: true))
+                    isMultiTokenPrediction: true, layerIndex: built.count))
         }
         _layers.wrappedValue = built
         _norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
@@ -2859,7 +3017,22 @@ public final class Glm5NextLanguageModel: Module {
         _ inputs: MLXArray, mask: MLXArray? = nil, caches: [KVCache]? = nil,
         inputEmbedding: MLXArray? = nil
     ) throws -> MLXArray {
+        try forwardCapturing(
+            inputs, mask: mask, caches: caches, captureLayerIDs: [], inputEmbedding: inputEmbedding
+        ).hidden
+    }
+
+    /// The backbone forward, additionally returning the COMPLETED output of each decoder layer in
+    /// `captureLayerIDs` (0-based), contracted over the hyper-connection streams by the same
+    /// unweighted mean GLM applies before its final norm — the DFlash 2 drafter's context taps
+    /// (SGLang `_prepare_aux_hidden_state`; vMLX Python `glm_dflash2._MeanStreamTap`). An empty set
+    /// is exactly the ordinary forward.
+    public func forwardCapturing(
+        _ inputs: MLXArray, mask: MLXArray? = nil, caches: [KVCache]? = nil,
+        captureLayerIDs: Set<Int>, inputEmbedding: MLXArray? = nil
+    ) throws -> (hidden: MLXArray, captured: [Int: MLXArray]) {
         var h = inputEmbedding ?? embedTokens(inputs)
+        var captured: [Int: MLXArray] = [:]
 
         // WITH hyper-connections the residual stream is WIDER than the hidden size: (B, L, H)
         // becomes (B, L, hcMult, H), tiled, and every `collapse`/`expand` pair works on that shape.
@@ -2871,12 +3044,15 @@ public final class Glm5NextLanguageModel: Module {
 
         for index in 0 ..< numDecoderLayers {
             h = try layers[index](h, mask: mask, cache: caches?[safe: index])
+            if captureLayerIDs.contains(index) {
+                captured[index] = usesHyperConnections ? Self.reduceHyperConnectionStream(h) : h
+            }
         }
 
         if usesHyperConnections {
             h = Self.reduceHyperConnectionStream(h)
         }
-        return norm(h)
+        return (norm(h), captured)
     }
 
     /// Collapses the hcMult copies back to one hidden state: an UNWEIGHTED MEAN.
@@ -2914,12 +3090,14 @@ public struct Glm5NextMessageGenerator: MessageGenerator {
     public init() {}
 
     public func generate(message: Chat.Message) -> MLXLMCommon.Message {
-        [
-            "role": message.role.rawValue,
-            "content": [["type": "text", "text": message.content]]
-                + message.images.map { _ in ["type": "image"] }
-                + message.videos.map { _ in ["type": "video"] },
-        ]
+        // Preserve reasoning, call/result IDs and emitted argument order for
+        // the native template to interpret. Only GLM's media content differs
+        // from the shared history mapping.
+        var result = defaultMessageDict(for: message)
+        result["content"] = [["type": "text", "text": message.content]]
+            + message.images.map { _ in ["type": "image"] }
+            + message.videos.map { _ in ["type": "video"] }
+        return result
     }
 }
 
@@ -3085,7 +3263,20 @@ public struct Glm5NextDecoderUnavailable: Error, CustomStringConvertible {
 /// caller actually reaches, which is the failure mode this repo has been removing (see the
 /// force-unwrap in `PromptTailDecodeTests` that took the whole test process down). An
 /// `unsupportedModelType` is a worse message but an honest one.
-public class Glm5Next: Module, ModalityBearing, ModelComponentMapping {
+public class Glm5Next: Module, ModalityBearing, ModelComponentMapping, SafetensorsLoadKeyExcluding {
+
+    private let customRoutedTensorNames: Set<String>
+
+    // Admitted custom bundles retain their native mixed checkpoint dtypes.
+    // Keep the existing ordinary GLM loading policy unchanged.
+    public var preservesCheckpointParameterDTypes: Bool { !customRoutedTensorNames.isEmpty }
+    // Mixed shards also contain custom banks mapped by their dedicated owner.
+    // Retain only ordinary tensor spans, not a second whole-shard Metal buffer.
+    public var requiresExactTensorMmapBuffers: Bool { !customRoutedTensorNames.isEmpty }
+
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        customRoutedTensorNames.contains(key)
+    }
 
     public let config: Glm5NextConfiguration
     public let plan: ResolvedConstructionPlan
@@ -3140,16 +3331,34 @@ public class Glm5Next: Module, ModalityBearing, ModelComponentMapping {
         try self.init(config, requesting: nil)
     }
 
-    /// - Parameter requesting: the caller's subset, or nil for everything the configuration offers.
-    public init(
+    /// Retains the factory's exact two-argument constructor identity.
+    public convenience init(
         _ config: Glm5NextConfiguration, requesting: Set<ModelRuntimeRequestModality>?
     ) throws {
+        try self.init(config, requesting: requesting, routedExperts: [:])
+    }
+
+    /// - Parameter requesting: the caller's subset, or nil for everything the configuration offers.
+    public init(
+        _ config: Glm5NextConfiguration, requesting: Set<ModelRuntimeRequestModality>?,
+        routedExperts: [Int: any WeightedRoutedExpertLayer],
+        customRoutedTensorNames: Set<String> = []
+    ) throws {
+        if !customRoutedTensorNames.isEmpty {
+            guard JANGHModelPreparation.isCanonicalRoutedExclusionSet(
+                customRoutedTensorNames, routedLayers: Set(routedExperts.keys))
+            else {
+                throw Glm5NextRoutedBankError.invalidCustomTensorExclusions
+            }
+        }
+        self.customRoutedTensorNames = customRoutedTensorNames
         let plan = try Self.resolveConstruction(config, requesting: requesting)
         self.config = config
         self.plan = plan
         self.schedule = try config.textConfig.validatedSchedule()
         self.modalities = plan.served
-        _languageModel.wrappedValue = try Glm5NextLanguageModel(config.textConfig)
+        _languageModel.wrappedValue = try Glm5NextLanguageModel(
+            config.textConfig, routedExperts: routedExperts)
         if !config.textConfig.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(
                 config.textConfig.hiddenSize, config.textConfig.vocabSize, bias: false)

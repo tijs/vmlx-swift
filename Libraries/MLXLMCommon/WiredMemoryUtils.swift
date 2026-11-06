@@ -6,8 +6,13 @@ import MLXNN
 
 /// Result of a wired memory measurement pass.
 public struct WiredMemoryMeasurement: Sendable {
-    /// Total bytes for model weights (`nbytes` sum).
+    /// Bytes in reflected parameter arrays; excludes reclaimable mapped banks.
+    /// This preserves the resident-weight reservation basis for ordinary models.
     public let weightBytes: Int
+    /// Logical packed weights omitted from parameter reflection. Not a footprint
+    /// measurement and deliberately excluded from the wired budget suggestion.
+    public let supplementalMappedWeightBytes: Int
+    public var logicalWeightBytes: Int { weightBytes + supplementalMappedWeightBytes }
     /// Total bytes for KV caches after prefill.
     public let kvBytes: Int
     /// Estimated transient workspace bytes (prefill peak minus weights + KV).
@@ -25,8 +30,21 @@ public struct WiredMemoryMeasurement: Sendable {
     }
 }
 
+public enum WiredMemoryMeasurementError: Error {
+    case mappedWeightsRequirePhysicalFootprintMeasurement
+}
+
 /// Helpers for deriving wired memory budgets from real runtime measurements.
 public enum WiredMemoryUtils {
+    static func validateAutomaticBudget(_ accounting: ModelWeightAccounting) throws {
+        // MLX allocator peaks do not establish which external mmap pages are
+        // resident. Subtracting or adding the full mapped span can both mis-size
+        // the workspace residual. Refuse an automatic wired recommendation.
+        guard accounting.supplementalMappedBytes == 0 else {
+            throw WiredMemoryMeasurementError.mappedWeightsRequirePhysicalFootprintMeasurement
+        }
+    }
+
     /// Produce a token ID array of exactly `count` tokens using the given tokenizer.
     ///
     /// This does not attempt to generate semantically meaningful text; it only ensures
@@ -141,7 +159,9 @@ public enum WiredMemoryUtils {
         seedText: String = " hello",
         resetPeakMemory: Bool = true
     ) async throws -> WiredMemoryMeasurement {
-        let weights = context.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+        let accounting = context.model.modelWeightAccounting()
+        try validateAutomaticBudget(accounting)
+        let weights = accounting.parameterArrayBytes
 
         let input = makeTokenInput(
             count: tokenCount,
@@ -166,6 +186,7 @@ public enum WiredMemoryUtils {
 
         return WiredMemoryMeasurement(
             weightBytes: weights,
+            supplementalMappedWeightBytes: accounting.supplementalMappedBytes,
             kvBytes: kvBytes,
             workspaceBytes: workspace,
             peakActiveBytes: peakActive,
@@ -191,7 +212,9 @@ public enum WiredMemoryUtils {
         parameters: GenerateParameters,
         resetPeakMemory: Bool = true
     ) async throws -> WiredMemoryMeasurement {
-        let weights = context.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+        let accounting = context.model.modelWeightAccounting()
+        try validateAutomaticBudget(accounting)
+        let weights = accounting.parameterArrayBytes
 
         let startActive = Memory.activeMemory
         if resetPeakMemory {
@@ -210,6 +233,7 @@ public enum WiredMemoryUtils {
 
         return WiredMemoryMeasurement(
             weightBytes: weights,
+            supplementalMappedWeightBytes: accounting.supplementalMappedBytes,
             kvBytes: kvBytes,
             workspaceBytes: workspace,
             peakActiveBytes: peakActive,

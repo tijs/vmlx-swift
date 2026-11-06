@@ -97,6 +97,10 @@ public enum KVQuantizationMode: Sendable, Equatable {
 }
 
 public struct GenerateParameters: Sendable {
+    /// JSON Schema enforced by token masking for this request. No prompt or sampler rewriting.
+    /// Constrained requests use autoregressive decoding until speculative matcher state is qualified.
+    public var jsonSchema: String? = nil
+
 
     /// Step size for processing the prompt
     public var prefillStepSize: Int
@@ -249,17 +253,15 @@ public struct GenerateParameters: Sendable {
     /// `generation_config.json`'s `suppress_tokens` field.
     public var suppressTokens: [Int]
 
-    /// Token ids masked only while the first ``initialSuppressCount`` sampled
-    /// tokens are produced; the ban lifts afterward. Engine-internal: armed by
-    /// `MinimumReasoningFloor` on the DSV4 enforced-low thinking rail so the
-    /// think block cannot close before a short visible reasoning floor lands.
-    /// Unlike ``suppressTokens`` this is a leading window, not a
-    /// whole-generation ban, and it can only ever DELAY a token — it never
-    /// forces or biases toward one.
+    /// Explicit caller-only token suppression during a leading sampling window.
+    /// The engine never enables this from a model family, prompt, or reasoning effort.
+    /// Retained for source compatibility; prefer the bundle's native generation controls.
+    @available(*, deprecated, message: "Explicit caller-only leading suppression; never enabled automatically")
     public var initialSuppressTokens: [Int] = []
 
-    /// Number of leading sampled tokens for which ``initialSuppressTokens``
-    /// stay masked. Zero disables the window.
+    /// Number of leading sampled tokens for the explicit suppression window.
+    /// Zero (the default) leaves logits untouched.
+    @available(*, deprecated, message: "Explicit caller-only leading suppression; never enabled automatically")
     public var initialSuppressCount: Int = 0
 
     /// Explicit ceiling on reasoning-block length, in sampled tokens. `nil`
@@ -302,9 +304,21 @@ public struct GenerateParameters: Sendable {
     /// `DDTREE-DESIGN.md` for the full spec.
     public var draftStrategy: DraftStrategy? = nil
 
-    /// Fixed native-MTP depth is a ceiling; adaptive exploration must be
-    /// requested explicitly. Either policy may descend to shallower work or AR.
-    public var nativeMTPDepthPolicy: NativeMTPDepthPolicy = .fixed
+    /// Native-MTP depth policy. ADAPTIVE BY DEFAULT: the requested depth (a bundle's
+    /// `recommended_num_drafts` / tuning sidecar / family default) is only where a request STARTS; the
+    /// request may climb to the runtime's top rung (`NativeMTPDepthPolicy.runtimeTopRung`: the model's
+    /// verifier capability) and steps down (or to AR) when a deeper depth loses. There is no request-level
+    /// ceiling by default (`defaultAdaptiveDepthCeiling`): a constant here capped every model at it, block
+    /// drafters (LiLiCorr, block - 1 = 7) included. `.fixed` turns the requested depth into a hard ceiling
+    /// and is an explicit choice only (the app's manual depth button, RunBench manual-depth runs). A `.fixed`
+    /// default here was the vmlx Python bug class of 2026-10-20 (Ornith's stamped D1 capped Adaptive at D1);
+    /// never make a resolved depth a ceiling implicitly. Either policy may descend to shallower work or AR.
+    public var nativeMTPDepthPolicy: NativeMTPDepthPolicy = .adaptiveToRuntimeCeiling
+
+    /// The adaptive request-level ceiling every request gets unless it sets its own: none (`Int.max`), so the
+    /// runtime's top rung governs. Matches the app's On (Adaptive). A finite `.adaptive(maximumDepth:)` is a
+    /// diagnostic / benchmark limit only (`BENCH_PERF_MTP_ADAPTIVE_MAX`).
+    public static let defaultAdaptiveDepthCeiling = Int.max
 
     /// Additional text-level stop sequences. When any of these strings
     /// appears in the user-visible assistant output, the library halts
@@ -565,10 +579,8 @@ public struct GenerateParameters: Sendable {
         (repetitionPenalty == nil || repetitionPenalty == 0 || repetitionPenalty == 1)
             && (presencePenalty == nil || presencePenalty == 0)
             && (frequencyPenalty == nil || frequencyPenalty == 0)
-            // The minimum reasoning floor masks logits per sampled token;
-            // drafted MTP tokens would bypass it, so fall back to AR. A
-            // reasoning budget is the same story: a drafted token could sail
-            // past the ceiling unchecked.
+            // Explicit leading suppression and reasoning budgets require
+            // per-token processing that drafted MTP tokens would bypass.
             && initialSuppressTokens.isEmpty
             && reasoningBudgetTokens == nil
             // The requested form resolves into `reasoningBudgetTokens` only
@@ -591,8 +603,14 @@ public struct GenerateParameters: Sendable {
     /// safety policy supplies a large finite window even for a 1K-token run;
     /// treating the mere presence of that cap as ineligible silently turned
     /// every such MTP request into plain AR.
-    public func nativeMTPEffectiveParameters(for input: LMInput) -> GenerateParameters? {
-        guard isNativeMTPPenaltyFree, !input.hasMediaContent else { return nil }
+    public func nativeMTPEffectiveParameters(for input: LMInput, model: Any? = nil)
+        -> GenerateParameters?
+    {
+        // Media is speculated only by models whose native forwards continue at the media-shifted
+        // (M-RoPE) positions after a VLM prefill (`NativeMTPMediaCapable`).
+        guard isNativeMTPPenaltyFree,
+            !input.hasMediaContent || NativeMTPMediaPolicy.allows(model: model)
+        else { return nil }
         // NativeMTPTokenIterator needs at least one draft/verify cycle. Treat
         // one-token probes as ordinary AR here so callers do not select the
         // exclusive MTP lane only for iterator construction to throw.
@@ -612,8 +630,8 @@ public struct GenerateParameters: Sendable {
         return resolved
     }
 
-    public func canUseNativeMTP(for input: LMInput) -> Bool {
-        nativeMTPEffectiveParameters(for: input) != nil
+    public func canUseNativeMTP(for input: LMInput, model: Any? = nil) -> Bool {
+        nativeMTPEffectiveParameters(for: input, model: model) != nil
     }
 }
 
@@ -660,27 +678,32 @@ public struct TopPSampler: LogitSampler {
     }
 
     public func sample(logits: MLXArray) -> MLXArray {
+        let logprobs = filteredLogprobs(logits)
+        return withRandomState(randomState) {
+            categorical(logprobs)
+        }
+    }
+
+    /// The distribution `sample` draws from: log-probabilities at the temperature with the filters
+    /// applied (rejected tokens -inf). dSpark's sampled speculation picks from the same values.
+    func filteredLogprobs(_ logits: MLXArray) -> MLXArray {
         var logits = logits
         if logits.dtype == .bfloat16 {
             logits = logits.asType(.float32)
         }
+        var logprobs = logSoftmax(logits * (1 / temp))
 
-        return withRandomState(randomState) {
-            var logprobs = logSoftmax(logits * (1 / temp))
-
-            // Apply filters in Python mlx-lm order after temperature scaling.
-            if let topP {
-                logprobs = applyTopP(logprobs, topP: topP)
-            }
-            if let minP {
-                logprobs = applyMinP(logprobs, minP: minP)
-            }
-            if let topK {
-                logprobs = applyTopK(logprobs, topK: topK)
-            }
-
-            return categorical(logprobs)
+        // Apply filters in Python mlx-lm order after temperature scaling.
+        if let topP {
+            logprobs = applyTopP(logprobs, topP: topP)
         }
+        if let minP {
+            logprobs = applyMinP(logprobs, minP: minP)
+        }
+        if let topK {
+            logprobs = applyTopK(logprobs, topK: topK)
+        }
+        return logprobs
     }
 
     /// Keep tokens whose cumulative probability exceeds `1 - topP` (nucleus sampling).
@@ -798,6 +821,13 @@ public struct SpeculativeSamplingController {
             logits = logits.asType(.float32)
         }
 
+        let vocabularySize = logits.dim(-1)
+        if topK > 0, topK <= 256, topK < vocabularySize, logits.dim(0) == 1,
+            Self.topKFastPathEnabled
+        {
+            return topKProbabilities(logits, vocabularySize: vocabularySize)
+        }
+
         var logprobs = logSoftmax(logits * (1 / MLXArray(temperature)))
         if topP > 0 && topP < 1 {
             logprobs = applyTopP(logprobs, topP: MLXArray(topP))
@@ -810,6 +840,37 @@ public struct SpeculativeSamplingController {
         }
 
         return softmax(logprobs, axis: -1, precise: true)
+    }
+
+    static let topKFastPathEnabled =
+        ProcessInfo.processInfo.environment["VMLX_SPEC_TOPK_PROBS"] != "0"
+
+    /// Same distribution as the full-vocabulary path above when a top-k filter is set — the kept
+    /// set is `topK ∩ nucleus ∩ minP`, and every member of the nucleus test can be decided from
+    /// the K largest log-probabilities (token i survives top-p iff the mass of strictly larger
+    /// tokens is < topP, and all of those are inside the top K) — but without the 248k-wide
+    /// argSort the top-p filter needs. Runs once per native-MTP draft step and fallback sample.
+    private func topKProbabilities(_ logits: MLXArray, vocabularySize: Int) -> MLXArray {
+        let x = logits.asType(.float32) * (1 / MLXArray(temperature))
+        let lse = logSumExp(x, axis: -1, keepDims: true)
+        let ids = argPartition(-x, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        let unsorted = takeAlong(x, ids, axis: -1) - lse
+        let order = argSort(-unsorted, axis: -1)
+        let sortedIDs = takeAlong(ids, order, axis: -1)
+        let logprobs = takeAlong(unsorted, order, axis: -1)
+        var keep = MLXArray.ones(logprobs.shape, type: Bool.self)
+        if topP > 0 && topP < 1 {
+            let p = exp(logprobs)
+            keep = keep .&& ((cumsum(p, axis: -1) - p) .< MLXArray(topP))
+        }
+        if minP > 0 {
+            let threshold = logprobs[.ellipsis, 0 ..< 1] + MLXArray(log(minP))
+            keep = logicalAnd(keep, greaterEqual(logprobs, threshold))
+        }
+        let kept = softmax(MLX.where(keep, logprobs, negInf), axis: -1, precise: true)
+        return putAlong(
+            MLXArray.zeros(logits.shape, type: Float.self), sortedIDs, values: kept,
+            axis: -1)
     }
 
     public func sample(logits: MLXArray) -> Sample {
@@ -828,6 +889,26 @@ public struct SpeculativeSamplingController {
         targetProbabilities: MLXArray,
         draftProbabilities: MLXArray
     ) -> AcceptanceDecision {
+        acceptOrCorrect(
+            draftToken: draftToken,
+            targetProbabilities: targetProbabilities,
+            draftProbabilities: draftProbabilities,
+            acceptanceRoll: {
+                withRandomState(acceptanceState) {
+                    MLXRandom.uniform(0.0 ..< 1.0).item(Float.self)
+                }
+            })
+    }
+
+    /// The production path supplies the original RNG draw; tests supply exact
+    /// representable endpoints. The draw stays AFTER the alpha>=1 fast path
+    /// and is consumed exactly once even when alpha is zero.
+    func acceptOrCorrect(
+        draftToken: MLXArray,
+        targetProbabilities: MLXArray,
+        draftProbabilities: MLXArray,
+        acceptanceRoll: () -> Float
+    ) -> AcceptanceDecision {
         let p = probability(targetProbabilities, token: draftToken)
         let q = probability(draftProbabilities, token: draftToken)
 
@@ -845,10 +926,10 @@ public struct SpeculativeSamplingController {
                 correction: nil)
         }
 
-        let roll = withRandomState(acceptanceState) {
-            MLXRandom.uniform(0.0 ..< 1.0).item(Float.self)
-        }
-        if roll <= acceptanceProbability {
+        let roll = acceptanceRoll()
+        // The draw's half-open interval includes zero. Equality must reject,
+        // otherwise alpha=0 can emit a token outside the target's support.
+        if roll < acceptanceProbability {
             return AcceptanceDecision(
                 accepted: true,
                 acceptanceProbability: acceptanceProbability,
@@ -890,7 +971,7 @@ public struct SpeculativeSamplingController {
         let row = normalizedRow(probabilities)
         let tokenID = token.item(Int.self)
         guard tokenID >= 0, tokenID < row.dim(-1) else { return 0 }
-        return row[0..., tokenID ..< (tokenID + 1)].item(Float.self)
+        return row[.ellipsis, tokenID ..< (tokenID + 1)].item(Float.self)
     }
 
     private func normalizedRow(_ array: MLXArray) -> MLXArray {
@@ -918,7 +999,8 @@ public struct SpeculativeSamplingController {
     private func applyTopK(_ logprobs: MLXArray, topK: Int) -> MLXArray {
         let vocabularySize = logprobs.dim(-1)
         guard topK < vocabularySize else { return logprobs }
-        let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[0..., topK...]
+        let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[
+            .ellipsis, topK ..< vocabularySize]
         return putAlong(logprobs, maskIndices, values: negInf, axis: -1)
     }
 }
@@ -1227,43 +1309,27 @@ public struct SuppressTokensProcessor: LogitProcessor {
         let vocabSize = logits.dim(-1)
         let valid = tokens.filter { $0 >= 0 && $0 < vocabSize }
         guard !valid.isEmpty else { return logits }
-        logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
-        return logits
+        // MLXArray is reference-typed: subscript assignment through a second
+        // binding would also rewrite the caller's logits and any aliases.
+        let indexShape = Array(repeating: 1, count: logits.ndim - 1) + [valid.count]
+        let indices = MLXArray(valid.map(Int32.init)).reshaped(indexShape)
+        return MLX.putAlong(
+            logits, indices, values: negInf.asType(logits.dtype), axis: -1)
     }
 
     mutating public func didSample(token: MLXArray) {}
 }
 
-/// Masks a fixed token set for only the first N sampled tokens, then
-/// releases the ban. Powers the DSV4 enforced-low minimum reasoning floor
-/// (see `MinimumReasoningFloor`): the enforced-low thinking rail must open
-/// with a short visible think block, so `</think>` is unavailable for the
-/// first few sampled tokens and the model closes naturally afterward.
-///
-/// This is the inverse of the removed hidden "reasoning close bias" (which
-/// capped thinking by forcing the close after a budget): a leading-window
-/// mask can only DELAY a token. It never forces, biases toward, or injects
-/// one — see `NoHiddenReasoningCloseBiasFocusedTests`.
-///
-/// Logit processors run before the sampler's `top_p`, so banning a token that
-/// holds nearly all the probability mass renormalizes a nearly flat residual
-/// and nucleus sampling then admits the whole vocabulary tail — live DSV4 runs
-/// turned into token soup from the first reasoning token. The window therefore
-/// also drops survivors that fall below ``survivorRelativeFloor`` of the best
-/// remaining token, which keeps the nucleus as narrow as it was before the ban.
+/// Explicit caller-requested suppression for the first N sampled tokens.
+/// Retained for source compatibility. No model family or prompt enables it
+/// automatically, and it applies no probability cutoff or other sampler change.
+@available(*, deprecated, message: "Explicit caller-only leading suppression; never enabled automatically")
 public struct InitialSuppressTokensProcessor: LogitProcessor {
-    /// Minimum probability a survivor may hold relative to the best remaining
-    /// token while the ban is active. Standard `min_p` territory.
-    static let survivorRelativeFloor: Float = 0.05
-
-    private let tokens: [Int]
+    private let suppression: SuppressTokensProcessor
     private var remaining: Int
-    private let negInf = MLXArray(-Float.infinity)
-    private let trace = ProcessInfo.processInfo.environment[
-        "VMLX_REASONING_FLOOR_TRACE"] == "1"
 
     public init(tokens: [Int], count: Int) {
-        self.tokens = Array(Set(tokens)).sorted()
+        self.suppression = SuppressTokensProcessor(tokens: tokens)
         self.remaining = max(0, count)
     }
 
@@ -1271,33 +1337,11 @@ public struct InitialSuppressTokensProcessor: LogitProcessor {
 
     public func process(logits: MLXArray) -> MLXArray {
         guard remaining > 0 else { return logits }
-        let vocabSize = logits.dim(-1)
-        let valid = tokens.filter { $0 >= 0 && $0 < vocabSize }
-        guard !valid.isEmpty else { return logits }
-        if trace {
-            let flat = logits.reshaped(-1)
-            let top = argMax(flat).item(Int.self)
-            let probs = softmax(flat.asType(.float32), axis: -1)
-            let bannedMass = valid.map { probs[$0].item(Float.self) }.reduce(0, +)
-            let line =
-                "[vmlx][reasoning-floor] step remaining=\(remaining) preMaskTop=\(top) "
-                + "bannedMass=\(bannedMass) topMass=\(probs[top].item(Float.self))\n"
-            FileHandle.standardError.write(Data(line.utf8))
-        }
-        logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
-        let bestSurvivor = MLX.max(logits, axis: -1, keepDims: true)
-        let cutoff = bestSurvivor + Float(log(Self.survivorRelativeFloor))
-        return MLX.where(logits .< cutoff, negInf, logits)
+        return suppression.process(logits: logits)
     }
 
     mutating public func didSample(token: MLXArray) {
-        guard remaining > 0 else { return }
-        if trace {
-            let line =
-                "[vmlx][reasoning-floor] sampled=\(token.reshaped(-1)[0].item(Int.self))\n"
-            FileHandle.standardError.write(Data(line.utf8))
-        }
-        remaining -= 1
+        remaining = max(0, remaining - 1)
     }
 }
 
@@ -1439,6 +1483,9 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var turboQuantCompressionCount: Int { get }
     var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { get }
     var nativeMTPStats: NativeMTPGenerationStats? { get }
+    var dflash2GenerationStats: DFlash2GenerationStats? { get }
+    var generationFailure: GenerationFailure? { get }
+    var structuredOutputComplete: Bool? { get }
     /// CPU-only end-of-generation bookkeeping needed to BUILD the completion
     /// info (e.g. the native-MTP stats snapshot). Split from
     /// `storeCacheAfterGeneration` so the generate loop can emit `.info` —
@@ -1458,6 +1505,9 @@ extension TokenIteratorProtocol {
     public var turboQuantCompressionCount: Int { 0 }
     public var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { nil }
     public var nativeMTPStats: NativeMTPGenerationStats? { nil }
+    public var dflash2GenerationStats: DFlash2GenerationStats? { nil }
+    public var generationFailure: GenerationFailure? { nil }
+    public var structuredOutputComplete: Bool? { nil }
 
     public mutating func finalizeGenerationStats(generatedTokenIds: [Int]) {}
 
@@ -1525,7 +1575,7 @@ private final class MLXPressGenerationProfileState: @unchecked Sendable {
                     name, row.count, totalMS, avgMS)
             }
             .joined(separator: " | ")
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 String(
                     format: "[MLXPressGenerationProfile] %@ total=%.1fms %@\n",
@@ -1576,7 +1626,7 @@ private enum MLXPressGenerationProfile {
 /// Port of `generate_step()` from https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/utils.py
 ///
 /// Note: this uses `asyncEval()` and there may be an async evaluation running after a call to `next()`.
-private final class SoloPrefillProgressAccumulator: @unchecked Sendable {
+final class SoloPrefillProgressAccumulator: @unchecked Sendable {
     private let handler: @Sendable (PrefillProgress) -> Void
     private let completedBeforePrefill: Int
     private let totalPromptUnits: Int
@@ -1678,7 +1728,65 @@ public struct TokenIterator: TokenIteratorProtocol {
     // `y` advances to the next prediction before next() returns. Retain the
     // token actually forwarded into KV using the existing return-value sync.
     private var lastForwardedTokenId: Int?
+    /// `VMLX_RUNTIME_RECEIPTS=1`: this request's receipt number (0 when receipts are off).
+    var receiptRequestID = 0
+    /// Prompt rows whose end-of-turn snapshot is taken as views of the finished cache (``AppendOnlyRowsCache``) instead
+    /// of a copy retained through decode. Nil: the ordinary retained copy (or none).
+    var deferredPromptSnapshotRows: Int?
+    /// `VMLX_PROMPT_SNAPSHOT_VIEWS=0`: the retained copy as before (A/B only; tests: the task-local override).
+    static let promptSnapshotViewsEnvironment =
+        ProcessInfo.processInfo.environment["VMLX_PROMPT_SNAPSHOT_VIEWS"] != "0"
+    @TaskLocal static var promptSnapshotViewsOverride: Bool?
+    static var promptSnapshotViewsEnabled: Bool { promptSnapshotViewsOverride ?? promptSnapshotViewsEnvironment }
+    /// `VMLX_ALIGNED_POST_ANSWER_STORE=1`: write the redundant post-answer entry of aligned-prefill caches (A/B only;
+    /// tests: the task-local override).
+    static let alignedPostAnswerStoreSkippedEnvironment =
+        ProcessInfo.processInfo.environment["VMLX_ALIGNED_POST_ANSWER_STORE"] != "1"
+    @TaskLocal static var alignedPostAnswerStoreSkippedOverride: Bool?
+    static var alignedPostAnswerStoreSkipped: Bool {
+        alignedPostAnswerStoreSkippedOverride ?? alignedPostAnswerStoreSkippedEnvironment
+    }
+    /// `VMLX_M3_ALIGNED_SINGLE_STORE=0`: aligned-prefill caches store every prompt boundary as before (N, N-1, the
+    /// generation-stripped boundary, each history boundary) instead of one entry per reusable row count (A/B only;
+    /// tests: the task-local override).
+    static let alignedSingleStoreEnvironment =
+        ProcessInfo.processInfo.environment["VMLX_M3_ALIGNED_SINGLE_STORE"] != "0"
+    @TaskLocal static var alignedSingleStoreOverride: Bool?
+    static var alignedSingleStoreEnabled: Bool { alignedSingleStoreOverride ?? alignedSingleStoreEnvironment }
+
+    /// One aligned-prefill store: the rows it holds (= its key length) and whether a stable (shared-root) boundary maps
+    /// to it.
+    struct AlignedStoreBoundary: Equatable {
+        let rows: Int
+        let stable: Bool
+    }
+
+    /// The entries an aligned-prefill request stores at the end of its turn: its store boundary `K` (every prompt
+    /// boundary at or past it serves exactly `K` rows: `AlignedPrefill.alignRestoredPrefix` never reuses rows past the
+    /// producer's `K`, and a request sharing a longer boundary shares `[0, K)`), and for each history boundary `b` below
+    /// `K` the last row a later request sharing only `[0, b)` can reuse: the largest multiple of the step or turn cut of
+    /// this plan at or before `b` (a v1 plan: multiples only). One entry per distinct row count, ascending; nil when the
+    /// plan has no store boundary.
+    static func alignedStoreBoundaries(
+        plan: AlignedPrefillPlan, promptTokenCount: Int, historyBoundaries: [Int], stableBoundaries: [Int]
+    ) -> [AlignedStoreBoundary]? {
+        guard let k = plan.boundary, k > 0, k <= promptTokenCount else { return nil }
+        // A boundary at or past K is served by the K entry (a request sharing it shares [0, K)).
+        var rows: [Int: Bool] = [k: false]
+        for b in Set(historyBoundaries) where b > 0 && b < k {
+            var reusable = (b / plan.step) * plan.step
+            for c in plan.turnCuts ?? [] where reusable < c && c <= b { reusable = c }
+            guard reusable > 0 else { continue }
+            rows[reusable] = (rows[reusable] ?? false) || stableBoundaries.contains(b)
+        }
+        return rows.keys.sorted().map { AlignedStoreBoundary(rows: $0, stable: rows[$0]!) }
+    }
     var cache: [KVCache]
+    public private(set) var generationFailure: GenerationFailure? = nil
+    public var structuredOutputComplete: Bool? {
+        (processor as? any ConstraintFailureReporting)?.constraintIsComplete
+    }
+
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
@@ -1703,6 +1811,29 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// values and downstream bookkeeping (strip boundaries, cache stores)
     /// reads stale positions. Compilable attention caches advance in-graph.
     private var compiledMambaOffsets: [(index: Int, base: Int)] = []
+    /// IFM Uno self-speculation (`DraftStrategy.uno`); nil when not requested or not servable.
+    private var uno: UnoDecoder?
+    /// Tokens an Uno cycle committed that `next()` has not returned yet (all already in the cache).
+    private var unoQueue: [Int] = []
+    /// Cache offset once prefill finished; the cache then holds this plus every returned token.
+    private var unoStartOffset = 0
+    /// Ordinary steps left in the current AR stretch, and when it started (`UnoWidthPlan.arStretch`).
+    private var unoARSteps = 0
+    private var unoARStretch: (start: Double, steps: Int)?
+    /// Length of the next AR stretch: doubles while the chooser keeps choosing AR (each stretch ends in
+    /// a host read of the pending token, which drains the pipelined AR loop), back to
+    /// `UnoWidthPlan.arStretch` after a speculative cycle.
+    private var unoARStretchLength = UnoWidthPlan.arStretch
+    /// Uno counters for the request (nil when the request did not run Uno).
+    public var unoGenerationStats: UnoGenerationStats? { uno?.stats }
+    /// DeepSeek-V4.1 dSpark speculation (`DraftStrategy.dspark`); nil when not requested or not servable.
+    private var dspark: DSparkDecoder?
+    /// Tokens a dSpark step committed that `next()` has not returned yet (all already in the cache).
+    private var dsparkQueue: [Int] = []
+    private var dsparkStartOffset = 0
+    private var dsparkFinished = false
+    /// dSpark counters for the request (nil when the request did not run dSpark).
+    public var dsparkGenerationStats: DSparkGenerationStats? { dspark?.stats }
     private var compiledStepCount = 0
 
     /// `VMLX_LOGITS_NAN_TRACE=1` diagnostic (see ``NaNLogitsTrace``). Created
@@ -1749,6 +1880,11 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// usable. Typed N-1-only topologies are not declines.
     private var exactPromptSnapshotWasDeclined = false
 
+    /// Aligned prefill (`AlignedPrefillPrefix.swift`): this request's absolute chunk cuts and store boundary, for a
+    /// model whose prompt prefill must be cut at absolute chunk boundaries (MiniMax-M3). nil for every other model, or
+    /// with `VMLX_M3_ALIGNED_PREFIX=0`.
+    var alignedPrefillPlan: AlignedPrefillPlan?
+
     /// Absolute index into ``promptTokenIds`` of the generation-suffix-stripped
     /// cross-turn reuse boundary — the last turn-start token, i.e. the end of
     /// the prompt with its trailing generation prompt stripped. `nil` when the
@@ -1765,6 +1901,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// as prefill passes through the boundary costs one cache copy instead of
     /// a second full prefill. Released once stored.
     var hybridStripSnapshot: [KVCache]?
+    var hybridStripBoundarySpilled = false
 
     /// Cache state at each processor-declared stable boundary, captured during
     /// prefill, keyed by the token count actually stored.
@@ -1781,6 +1918,12 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Prefill already passes through every one of these boundaries, so the
     /// state is free at that moment; keeping a copy costs one cache copy.
     var stableBoundarySnapshots: [Int: [KVCache]] = [:]
+    /// Pool-cache stable boundaries (store positions) this prefill deliberately did not cut at: too far from the end
+    /// of the span for a free cut (``poolCacheNearCutRows(windowSize:)``). Like every stable boundary a pool cache did
+    /// not capture in prefill, the store loop leaves them alone instead of replaying the prefix after the answer; a
+    /// later prompt that ends near them captures them.
+    var poolStableBoundariesLeftUncut: Set<Int> = []
+    private var canonicalStablePrefillCapture: CanonicalStablePrefillCapture?
 
     /// Absolute `promptTokenIds.count - 1` boundary for text-only
     /// standalone rotating/SWA cache topologies.
@@ -1801,6 +1944,12 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// colliding with other modes/media.
     let mediaSalt: String?
 
+    /// The salt each prompt boundary is keyed under (``CacheBoundarySaltPlan``).
+    /// Every boundary uses `mediaSalt` unless the model declares the state
+    /// before the first media token media-independent, in which case the
+    /// boundaries at or before that token use the text-only salt.
+    let cacheSaltPlan: CacheBoundarySaltPlan
+
     // Internal metrics
     public var promptPrefillTime: TimeInterval = 0.0
 
@@ -1817,6 +1966,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         prompt: MLXArray, model: any LanguageModel, cache: [KVCache]? = nil,
         parameters: GenerateParameters
     ) throws {
+        guard parameters.jsonSchema == nil else {
+            throw GenerationFailure(
+                stage: .preparation,
+                cause: "Structured output requires the context-based generation API")
+        }
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
         self.model = model
@@ -1840,6 +1994,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.originalInput = LMInput(text: y)
         self.cacheInitParameters = parameters
         self.mediaSalt = nil
+        self.cacheSaltPlan = CacheBoundarySaltPlan(requestSalt: nil)
 
         self.promptPrefillTime = try measure {
             let promptInput = LMInput(text: y)
@@ -1847,6 +2002,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 input: promptInput,
                 windowSize: parameters.prefillStepSize)
         }
+        // This initializer has no storage coordinator; retain only the live cache.
     }
 
     /// Initialize a `TokenIterator` with the given input.
@@ -1881,19 +2037,31 @@ public struct TokenIterator: TokenIteratorProtocol {
         disableDiskBackedRequiredToolRestore: Bool = false,
         skipDiskBackedToolPromptSeedBoundary: Bool = false,
         prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil,
-        additionalProcessor: LogitProcessor? = nil
+        additionalProcessor: LogitProcessor? = nil,
+        tokenizer: (any Tokenizer)? = nil,
+        stopTokenIDs: Set<Int> = []
     ) throws {
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
         self.model = model
         self.y = input.text
         self.cacheCoordinator = cacheCoordinator
+        // dSpark: attach the draft head BEFORE prefill, so the prefill runs with the head resident
+        // (its chunk size accounts for it) and records the draft-window tail into the cache.
+        Self.attachDSparkIfRequested(model: model, parameters: parameters)
         let requiresFreshToolSelection =
             input.cacheRestorePolicy == .freshRequiredToolSelection
         self.disableDiskBackedRequiredToolRestore =
             disableDiskBackedRequiredToolRestore || requiresFreshToolSelection
+        // A model whose exact-prefix restore is suffix-independent restores a
+        // forced tool selection like any other turn (see the fetch below), so
+        // its prompt-minus-one seed is as reusable as any other turn's: keep
+        // storing it, or the turn after every forced tool call re-prefills.
+        let requiredToolTurnKeepsReuse = (model as? PrefixCacheInvariantModel)?
+            .exactPrefixRestoreIsSuffixIndependent == true
         self.skipDiskBackedToolPromptSeedBoundary =
-            skipDiskBackedToolPromptSeedBoundary || requiresFreshToolSelection
+            (skipDiskBackedToolPromptSeedBoundary || requiresFreshToolSelection)
+            && !requiredToolTurnKeepsReuse
         let promptTokenCount = input.text.tokens.size
         var effectiveParameters = parameters
         if let coordinator = cacheCoordinator {
@@ -1918,20 +2086,24 @@ public struct TokenIterator: TokenIteratorProtocol {
             coordinator.setPagedIncompatible(true)
         }
 
-        let builtInProcessor = effectiveParameters.processor()
+        self.processor = effectiveParameters.processor()
+        if let schema = effectiveParameters.jsonSchema {
+            guard let tokenizer else {
+                throw GenerationFailure(
+                    stage: .preparation, cause: "Structured output requires tokenizer metadata")
+            }
+            self.processor = try JSONSchemaLogitProcessor(
+                schema: schema, tokenizer: tokenizer, stopTokenIDs: stopTokenIDs,
+                base: self.processor)
+        }
         if let additionalProcessor {
-            // Request-scoped constraint (structured/constrained decoding):
-            // composed so the built-in penalty stages run first and the
-            // constraint runs last. `nil` keeps the previous behavior
-            // byte-for-byte.
             self.processor = CompositeLogitProcessor(
-                base: builtInProcessor, additional: additionalProcessor)
-        } else {
-            self.processor = builtInProcessor
+                base: self.processor, additional: additionalProcessor)
         }
         self.sampler = effectiveParameters.sampler()
-        self.maxTokens = MetalLiveBufferGuard.clampedMaxTokens(
+        MetalLiveBufferGuard.reportProjectedBufferPressure(
             requested: effectiveParameters.maxTokens, cache: self.cache)
+        self.maxTokens = effectiveParameters.maxTokens
 
         self.kvBits = effectiveParameters.kvBits
         self.kvGroupSize = effectiveParameters.kvGroupSize
@@ -1951,7 +2123,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Compute a stable fingerprint of request-scope/media content plus
         // effective cache policy once at init, so both the pre-prepare fetch
         // below and the post-generation store see the same salt.
-        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
+        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters, model: model)
 
         // Multi-tier cache: attempt prefix fetch before prepare.
         // On cache hit, restore KV state and only prefill remaining tokens.
@@ -1970,6 +2142,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Gemma3n, Gemma4 SWA layers, Mistral4 with maxKVSize, MiMoV2Flash,
         // BaichuanM1, Qwen3.5-VL inherited) now get full L2 disk
         // persistence + paged restore on cache hit.
+        MemoryStageTrace.log("request-start", tokens: promptTokenIds.count)
         var cacheLookupTokenIds = promptTokenIds
         var cacheLookupUsesPostPrepareAlias = false
         if input.requiresPostPrepareCacheKey,
@@ -1984,6 +2157,24 @@ public struct TokenIterator: TokenIteratorProtocol {
             Self.logger.info(
                 "TokenIterator: resolved post-prepare cache-key alias for \(rawCount) raw tokens -> \(effectiveCount) effective tokens"
             )
+        }
+        // Per-boundary salts, computed in the token space the probe uses.
+        self.cacheSaltPlan = CacheBoundarySaltPlan.make(
+            requestSalt: mediaSalt, input: input, lookupTokenIds: cacheLookupTokenIds,
+            model: model, parameters: effectiveParameters)
+        // Aligned prefill: the same plan with or without a coordinator, so a cold prefill and a cached continuation
+        // cut the prompt at the same absolute positions.
+        self.alignedPrefillPlan = AlignedPrefill.plan(
+            model: model, cache: self.cache, promptTokenIds: cacheLookupTokenIds,
+            cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+            generationPromptSuffix: cacheCoordinator?.genPromptSuffixTokens ?? [],
+            prefillStepSize: effectiveParameters.prefillStepSize)
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1",
+           let prefix = cacheSaltPlan.mediaIndependentPrefix
+        {
+            RuntimeDiagnostics.write(Data(
+                ("[vmlx][cache/salt] media-independent prefix tokens=\(prefix.tokenCount)"
+                    + " salt=\(prefix.salt.map { String($0.prefix(12)) } ?? "nil")\n").utf8))
         }
 
         if let coordinator = cacheCoordinator,
@@ -2031,10 +2222,41 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
-            if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore {
-                Self.logger.info(
-                    "TokenIterator: skipped disk-backed required-tool cache restore; warm restore is not proven safe for this topology"
-                )
+            // A model that declares its exact-prefix restore suffix-independent
+            // keeps the ordinary longest-prefix fetch under a forced tool
+            // selection; the skip below was the whole-prompt re-prefill of
+            // every tool_choice=required turn on Nemotron 3.5 (19,373 tokens,
+            // 33.9 s, with the previous turn's boundary on disk).
+            let suffixIndependentRestore = (model as? PrefixCacheInvariantModel)?
+                .exactPrefixRestoreIsSuffixIndependent == true
+            if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore
+                && !cacheRestoreIsExactPrefix(self.cache) && !suffixIndependentRestore
+            {
+                let structuralBoundary = input.cachePrefixTokenCounts
+                    .filter { $0 > 0 && $0 < cacheLookupTokenIds.count }.max()
+                if let model = self.model as? any CanonicalRequiredToolCacheModel,
+                   let structuralBoundary,
+                   let canonical = coordinator.restoreCanonicalRequiredToolPrefix(
+                    input: input, model: model, cache: self.cache, parameters: effectiveParameters,
+                    ordinarySalt: self.mediaSalt, structuralBoundary: structuralBoundary) {
+                    let suffix = Array(cacheLookupTokenIds.dropFirst(canonical.boundary))
+                    self.cache = canonical.cache
+                    inputForPrepare = LMInput(
+                        text: .init(tokens: MLXArray(suffix.map(Int32.init)).expandedDimensions(axis: 0),
+                            mask: input.text.mask.map { $0.reshaped(-1)[canonical.boundary...].expandedDimensions(axis: 0) },
+                            tokenIds: suffix),
+                        cacheScopeSalt: input.cacheScopeSalt,
+                        cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+                        cacheStablePrefixTokenCounts: input.cacheStablePrefixTokenCounts,
+                        cachePromptIntent: input.cachePromptIntent,
+                        cacheRestorePolicy: input.cacheRestorePolicy, toolSchemas: input.toolSchemas,
+                        canonicalRequiredToolContext: input.canonicalRequiredToolContext)
+                    acceptedCacheRestoreDetail = .disk
+                } else {
+                    Self.logger.info(
+                        "TokenIterator: skipped disk-backed required-tool cache restore; warm restore is not proven safe for this topology"
+                    )
+                }
             } else {
                 let result = coordinator.fetch(
                     tokens: cacheLookupTokenIds,
@@ -2042,11 +2264,15 @@ public struct TokenIterator: TokenIteratorProtocol {
                     skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: originalInput
                         .cacheStablePrefixTokenCounts,
-                    chainId: parameters.cacheChainId)
+                    chainId: parameters.cacheChainId,
+                    mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                 switch result {
                 case .hit(
-                    let matchedTokens, let remainingTokens, let detail, let blocks,
+                    let fetchedMatchedTokens, let fetchedRemainingTokens, let detail, let blocks,
                     let ssmStates, let diskArrays):
+                // An aligned-prefill restore may keep fewer rows than the entry held (below).
+                var matchedTokens = fetchedMatchedTokens
+                var remainingTokens = fetchedRemainingTokens
                 // INVARIANT. The prefill capture stores the N-1 recurrent seed
                 // for a stable boundary, not the boundary itself — the inner
                 // capture maps stable boundaries through `$0 - 1`. So a restore
@@ -2136,7 +2362,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 let counts = Dictionary(grouping: types, by: { $0 }).mapValues { $0.count }
                                 let ssmN = ssmStates?.count ?? -1
                                 let fmtV = TQDiskSerializer.formatVersion(of: diskArrays)
-                                FileHandle.standardError.write(
+                                RuntimeDiagnostics.write(
                                     "[vmlx][ssm-restore] types=\(counts) hasArrays=\(cacheHasArraysState) ssmN=\(ssmN) fmtV=\(fmtV) willRestore=\(ssmStates != nil && (fmtV < 2 || cacheHasArraysState))\n"
                                         .data(using: .utf8)!)
                             }
@@ -2161,11 +2387,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                         Self.logger.info(
                             "Cache \(detail.rawValue) hit: restored \(diskRestored) tokens from disk, prefilling \(remainingTokens.count) remaining"
                         )
-                    } else if detail == .disk {
+                    } else if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
-                            reason: "payload does not fit the runtime cache")
+                            reason: "payload does not fit the runtime cache",
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                 }
 
@@ -2177,23 +2404,50 @@ public struct TokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: detail.rawValue)
                 {
-                    if detail == .disk {
+                    if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
-                            reason: "restored offsets do not match the boundary")
+                            reason: "restored offsets do not match the boundary",
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                     restored = false
                     retainedDiskRestore = false
                     self.cache = self.model.newCache(parameters: effectiveParameters)
                     inputForPrepare = input
                 }
+                // Aligned prefill: keep only the rows a cold prefill of this request also ends a chunk at (the last
+                // chunk boundary, or all of its own store boundary when the rows were produced with it). None: the
+                // whole prompt prefills, exactly as a miss.
+                if restored, let plan = self.alignedPrefillPlan {
+                    let reuse = AlignedPrefill.alignRestoredPrefix(
+                        self.cache, matchedTokens: matchedTokens, plan: plan, detail: detail.rawValue)
+                    if reuse > 0 {
+                        matchedTokens = reuse
+                        remainingTokens = Array(cacheLookupTokenIds.dropFirst(reuse))
+                    } else {
+                        restored = false
+                        self.cache = self.model.newCache(parameters: effectiveParameters)
+                        inputForPrepare = input
+                    }
+                }
                 if restored {
                     if cacheLookupUsesPostPrepareAlias {
                         self.promptTokenIds = cacheLookupTokenIds
                     }
-                    let unsafePartial =
+                    // A hit at or before the first media token of a model that
+                    // declares its pre-media state media-independent resumes
+                    // with the media carried into the suffix; every other hit
+                    // whose suffix still holds a placeholder rolls back. Live
+                    // on Nemotron 3.5 Bolt the roll-back followed EVERY image
+                    // turn's restore (the 4,315-token seed was restored, then
+                    // all 17,829 tokens were prefilled, 31.5 s), so the salt
+                    // fix alone would not have reused anything.
+                    let suffixHoldsMedia =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
+                    let unsafePartial = cacheHitSuffixRequiresMediaRollback(
+                        input: input, remainingTokens: remainingTokens,
+                        matchedTokens: matchedTokens, plan: cacheSaltPlan)
                     // Only standalone rotating / sliding-window caches (Gemma,
                     // Mistral SWA) are PROVEN to restore exactly and take the
                     // standard trim-last-token + re-feed fast path on a full hit
@@ -2220,7 +2474,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                            let seedSSM = coordinator.ssmStateCache.fetchEntry(
                                 tokens: cacheLookupTokenIds,
                                 boundary: seedBoundary,
-                                mediaSalt: mediaSalt,
+                                mediaSalt: cacheSaltPlan.salt(forBoundary: seedBoundary),
                                 requireComplete: true)?.states
                         {
                             let cacheOffset = self.cache.first?.offset ?? promptLen
@@ -2278,6 +2532,10 @@ public struct TokenIterator: TokenIteratorProtocol {
                             inputForPrepare = LMInput(
                                 text: LMInput.Text(tokens: lastToken),
                                 image: nil, video: nil)
+                        } else if suffixHoldsMedia {
+                            inputForPrepare = mediaCarryingSuffixInput(
+                                from: input, remainingTokens: remainingTokens,
+                                matchedTokens: matchedTokens, itemSpans: cacheSaltPlan.itemSpans)
                         } else {
                             let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
                                 .expandedDimensions(axis: 0)
@@ -2295,7 +2553,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                             preferredDiskBoundaries: originalInput
                                 .cacheStablePrefixTokenCounts,
                             skipExactDiskBoundary: requiresDiskBackedRestore,
-                            mediaSalt: mediaSalt)
+                            mediaSalt: mediaSalt,
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                 }
                 case .miss:
@@ -2334,6 +2593,22 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         let remainingPromptUnits = Swift.max(0, inputForPrepare.text.tokens.size)
         let completedBeforePrefill = Swift.max(0, promptTokenCount - remainingPromptUnits)
+        if RuntimeReceipts.isEnabled {
+            let rid = RuntimeReceipts.currentRequestID ?? 0
+            self.receiptRequestID = rid
+            RuntimeReceipts.emit(
+                "request id=\(rid) prompt=\(promptTokenCount) "
+                    + "thinking_mode=\(RuntimeReceipts.thinkingMode(fromScopeSalt: originalInput.cacheScopeSalt)) "
+                    + "prompt_tail=\(self.promptTokenIds.last.map(String.init) ?? "none") "
+                    + "draft=\(RuntimeReceipts.draftName(effectiveParameters.draftStrategy)) "
+                    + "prefill_step=\(effectiveParameters.prefillStepSize) "
+                    + "memory_limit_gib=\(RuntimeReceipts.gib(MLX.Memory.memoryLimit)) "
+                    + "cache_limit_gib=\(RuntimeReceipts.gib(MLX.Memory.cacheLimit))")
+            RuntimeReceipts.emit(
+                "cache id=\(rid) prompt=\(promptTokenCount) restored=\(completedBeforePrefill) "
+                    + "tier=\(completedBeforePrefill > 0 ? (acceptedCacheRestoreDetail?.rawValue ?? "live") : "none") "
+                    + "prefilled=\(remainingPromptUnits) coordinator=\(cacheCoordinator == nil ? "off" : "on")")
+        }
         if let acceptedCacheRestoreDetail, completedBeforePrefill > 0 {
             prefillProgressHandler?(PrefillProgress(
                 stage: .cacheRestore,
@@ -2369,33 +2644,99 @@ public struct TokenIterator: TokenIteratorProtocol {
             promptTokenIds: self.promptTokenIds,
             input: input,
             cache: self.cache,
-            skipBoundary: self.skipDiskBackedToolPromptSeedBoundary)
+            skipBoundary: self.skipDiskBackedToolPromptSeedBoundary && !cacheRestoreIsExactPrefix(self.cache))
+        // Only the already-existing cold head prepare may report a canonical
+        // seed. Warm/media requests retain their original fallback behavior.
+        let canonicalModel = self.model as? any CanonicalRequiredToolCacheModel
+        let canonicalRequiredSalt = canonicalModel.flatMap {
+            canonicalRequiredToolSalt(input: input, model: $0, parameters: effectiveParameters,
+                cache: self.cache, ordinarySalt: self.mediaSalt)
+        }
+        // Scope the new producer to an eligible explicit selection request.
+        // Ordinary/unqualified requests keep the original legacy capture flow.
+        let requiredCanonicalModel = canonicalRequiredSalt == nil ? nil : canonicalModel
+        let canonicalTargets: [Int]
+        if let coordinator = self.cacheCoordinator, coordinator.canPersistBoundaries,
+           let canonicalModel, canonicalRequiredSalt != nil,
+           canonicalModel.validateCanonicalRequiredToolCache(self.cache, boundary: 0),
+           let strip = self.hybridStripBoundary,
+           let history = input.cachePrefixTokenCounts.filter({
+               $0 >= effectiveParameters.prefillStepSize && $0 < strip
+                   && !input.cacheStablePrefixTokenCounts.contains($0)
+           }).max() {
+            canonicalTargets = [history]
+        } else if requiredCanonicalModel != nil {
+            canonicalTargets = []
+        } else if let coordinator = self.cacheCoordinator, coordinator.canPersistBoundaries,
+           // These are fresh in-request checkpoints, not restored disk state.
+           // Required-tool restore and whole-prompt N-1 exclusions stay below.
+           inputForPrepare.text.tokens.size == self.promptTokenIds.count,
+           cacheRequiresDiskBackedCoordinatorRestore(self.cache),
+           let strip = self.hybridStripBoundary {
+            canonicalTargets = input.cacheStablePrefixTokenCounts
+                .filter { $0 > 1 && $0 < strip }
+                .map { $0 - 1 }
+                .filter { !coordinator.hasDurableDiskEntry(
+                    tokens: Array(self.promptTokenIds.prefix($0)),
+                    mediaSalt: self.cacheSaltPlan.salt(forBoundary: $0)) }
+        } else { canonicalTargets = [] }
+        let canonicalCapture = CanonicalStablePrefillCapture(
+            input: input, promptTokens: self.promptTokenIds, cache: self.cache,
+            chunkSize: effectiveParameters.prefillStepSize,
+            targets: canonicalTargets, salt: requiredCanonicalModel == nil ? self.mediaSalt : canonicalRequiredSalt,
+            canonicalModel: requiredCanonicalModel)
+        if let positioned = self.model as? any RestoredPrefixPositionModel {
+            positioned.prepareRestoredPrefixPositions(
+                fullInput: input,
+                restoredTokenCount: Swift.max(
+                    0, input.text.tokens.size - inputForPrepare.text.tokens.size))
+        }
+        AlignedPrefill.install(self.alignedPrefillPlan, into: self.cache)
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
-                try PrefillProgressReporter.withHandler(modelPrepareProgressHandler) {
-                    try prepare(
-                        input: inputForPrepare,
-                        windowSize: effectiveParameters.prefillStepSize)
+                try CanonicalTextPrefillCheckpointReporter.withCapture(canonicalCapture) {
+                    try PrefillProgressReporter.withHandler(modelPrepareProgressHandler) {
+                        try prepare(
+                            input: inputForPrepare,
+                            windowSize: effectiveParameters.prefillStepSize)
+                    }
                 }
             }
+        }
+        if canonicalCapture?.snapshot != nil {
+            try Task.checkCancellation()
+            self.canonicalStablePrefillCapture = canonicalCapture
         }
         prefillProgressHandler?(PrefillProgress(
             stage: .complete,
             completedUnitCount: promptTokenCount,
             totalUnitCount: promptTokenCount,
             detail: "decode_ready"))
+        MemoryStageTrace.log("prefill-complete", tokens: promptTokenCount)
         // The prefill-captured N-1 state is the only prompt checkpoint an
         // exact DSV4 replay can consume safely. Keep one retained snapshot,
         // not both N-1 and the deliberately skipped exact prompt boundary.
-        if let cacheCoordinator, cacheCoordinator.canPersistBoundaries,
-            !self.promptTokenIds.isEmpty,
-            input.cachePromptIntent != .auxiliary,
-            !cacheRequiresPrefillCapturedDiskSeed(self.cache)
-        {
-            self.retainedPromptSnapshot = cacheCoordinator.retainExactPromptSnapshot(
-                from: self.cache)
-            self.exactPromptSnapshotWasDeclined = self.retainedPromptSnapshot == nil
+        if retainsPromptSnapshotForStores {
+            // Append-only caches under aligned prefill (MiniMax-M3): the prompt rows never change after this point (decode
+            // and DSpark verify append past them, rollbacks trim back to them), so the end-of-turn stores take views of the
+            // finished cache instead of a copy held through the whole decode (4.5 GiB at 35k tokens on M3.1, and a
+            // second copy per boundary store).
+            if alignedPrefillPlan != nil, Self.promptSnapshotViewsEnabled,
+                cacheBoundaryLeafOffsets(self.cache).allSatisfy({ $0 == promptTokenIds.count }),
+                cacheSupportsPrefixViews(self.cache, rows: promptTokenIds.count)
+            {
+                self.deferredPromptSnapshotRows = promptTokenIds.count
+            } else {
+                if let cacheCoordinator {
+                    self.retainedPromptSnapshot = cacheCoordinator.retainExactPromptSnapshot(from: self.cache)
+                }
+                self.exactPromptSnapshotWasDeclined = self.retainedPromptSnapshot == nil
+            }
         }
+        spillHybridStripBoundaryAfterPrefill()
+        MemoryStageTrace.log(
+            "prompt-snapshot", tokens: promptTokenCount,
+            detail: promptCacheSnapshot == nil ? "none" : "retained")
 
         if effectiveParameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model) {
             // The Compilable caches are FIXED-size buffers with no overflow
@@ -2422,6 +2763,280 @@ public struct TokenIterator: TokenIteratorProtocol {
             try setupCompiledDecode(
                 maxCacheLength: effectiveParameters.compiledMaxCacheLength
                     ?? Swift.max(4096, neededLength ?? 4096))
+        }
+        if case .uno(let adapterPath, let blockSize) = effectiveParameters.draftStrategy {
+            setupUno(
+                adapterPath: adapterPath, blockSize: blockSize, input: input,
+                parameters: effectiveParameters, stopTokenIDs: stopTokenIDs)
+        }
+        if effectiveParameters.draftStrategy?.usesDSpark == true {
+            // The PREFILLED input decides: a media request whose every media item is inside the
+            // restored prefix prefills a text-only tail (`inputForPrepare` carries no media) and
+            // dSpark serves it; a request that prefilled media decodes autoregressively. For a
+            // text-only request the two inputs carry the same (absent) media.
+            setupDSpark(
+                input: inputForPrepare, parameters: effectiveParameters, stopTokenIDs: stopTokenIDs)
+        }
+    }
+
+    /// Load the dSpark head for a `.dspark` request (once per model; with sampled dSpark off, a
+    /// sampled request never pays for the head). Failures are logged and the request decodes AR.
+    static func attachDSparkIfRequested(model: any LanguageModel, parameters: GenerateParameters) {
+        guard let directory = parameters.draftStrategy?.dsparkDrafterPath,
+            parameters.temperature <= 0 || !DSparkEnvironment.sampledDisabled(),
+            !DSparkEnvironment.disabled(),
+            let target = model as? any DSparkSpeculativeModel,
+            target.dsparkBlockSize == nil
+        else { return }
+        do {
+            if try !target.attachDSparkDraft(directory: directory) {
+                logger.info("dSpark head not attached: this model does not use one")
+            }
+        } catch {
+            logger.error(
+                "dSpark head failed to load from \(directory.path, privacy: .public) (decoding autoregressively): \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    /// Enable dSpark for this request when it can be served exactly; otherwise log why and decode AR.
+    private mutating func setupDSpark(
+        input: LMInput, parameters: GenerateParameters, stopTokenIDs: Set<Int>
+    ) {
+        let reason: String? = {
+            if DSparkEnvironment.disabled() { return "VMLX_DSV41_DSPARK disables it" }
+            guard let target = model as? any DSparkSpeculativeModel else {
+                return "model \(type(of: model)) has no dSpark pathway"
+            }
+            guard let blockSize = target.dsparkBlockSize, let session = target.makeDSparkDraftSession()
+            else { return "no dSpark head is attached" }
+            if uno != nil { return "Uno is active" }
+            if parameters.temperature > 0, DSparkEnvironment.sampledDisabled() {
+                return "sampled decoding with VMLX_DSV41_DSPARK_SAMPLED=0"
+            }
+            if processor != nil {
+                return "logit processors (penalties / reasoning budget / JSON schema) need per-token sampling"
+            }
+            if compiledForward != nil { return "compiled decode is active" }
+            if needsCacheQuantization { return "KV quantization is active" }
+            if state != nil || input.image != nil || input.video != nil { return "media inputs" }
+            if let why = target.dsparkCacheUnsupportedReason(cache) { return why }
+            dspark = DSparkDecoder(
+                session: session, blockSize: blockSize, stopTokenIDs: stopTokenIDs,
+                sampling: DSparkSampling(parameters: parameters),
+                ladderTop: target.dsparkLadderTop, pinnedWidth: target.dsparkPinnedWidth,
+                widthCostPerRow: target.dsparkWidthCostPerRow)
+            dsparkStartOffset = cache.map(\.offset).max() ?? 0
+            return nil
+        }()
+        if let reason {
+            Self.logger.info(
+                "dSpark requested but not used for this request (decoding autoregressively): \(reason, privacy: .public)")
+            if DSparkEnvironment.statsEnabled {
+                NSLog("[dSpark] off for this request: \(reason)")
+            }
+        }
+    }
+
+    /// One dSpark step: return a queued token, or run a step from the pending token `y`. Nil hands
+    /// this step to ordinary decoding (the governor chose AR, or a block cannot fit).
+    private mutating func dsparkNext() -> Int? {
+        if !dsparkQueue.isEmpty {
+            let token = dsparkQueue.removeFirst()
+            tokenCount += 1
+            lastForwardedTokenId = token
+            return token
+        }
+        guard var decoder = dspark else { return nil }
+        defer { dspark = decoder }
+        let remaining = maxTokens.map { $0 - tokenCount } ?? Int.max
+        // The governor chooses before the pending token is read: an AR step returns to the ordinary decode step,
+        // which submits the next forward before it waits for this token.
+        guard decoder.begin(remaining: remaining) else { return nil }
+        // Waits for the previous step's last forward.
+        let seed = y.tokens.reshaped(-1)[0].item(Int.self)
+        let model = self.model
+        let cache = self.cache
+        let step = decoder.speculate(seed: seed, cache: cache, remaining: remaining) { ids in
+            let tokens = MLXArray(ids.map { Int32($0) }).reshaped(1, ids.count)
+            return model(LMInput.Text(tokens: tokens), cache: cache, state: nil).logits
+        }
+        guard case .committed(let committed, let next) = step else { return nil }
+        dsparkQueue = Array(committed.dropFirst())
+        y = .init(tokens: next)
+        tokenCount += 1
+        lastForwardedTokenId = seed
+        // Same cadence as ordinary decoding: once per 256 tokens, when this step crosses a boundary.
+        if (tokenCount + dsparkQueue.count) / 256 > (tokenCount - 1) / 256 {
+            Memory.clearCache()
+        }
+        return seed
+    }
+
+    /// A dSpark step commits whole blocks (cut at stop tokens and the budget), so the cache can only
+    /// run ahead of the returned tokens when the consumer stops early (a stop string, a tool
+    /// dispatch, a cancel). Trim that back where the trim is exact. A DSV4 pool cache cannot trim
+    /// exactly, and loses nothing by it: the generate loop stores the post-answer boundary only for
+    /// a stop-token `.stop` (stop strings, tool dispatch and cancels skip that store on every decode
+    /// path, AR included), and a block is cut at the stop token, so on that path the cache ends
+    /// exactly where AR's does. Anything else that leaves the cache ahead (the loop's
+    /// unknown-token stop, which is not in `stopTokenIDs`) gives a key the store's offset guard
+    /// refuses: one re-prefill, never a mislabelled entry. The prompt boundaries are snapshots taken
+    /// during prefill and are not affected.
+    private mutating func finishDSpark() {
+        guard dspark != nil, !dsparkFinished else { return }
+        dsparkFinished = true
+        dspark?.finish()
+        if DSparkEnvironment.statsEnabled, let stats = dspark?.stats {
+            NSLog("[dSpark] \(stats.summary)")
+        }
+        let expected = dsparkStartOffset + tokenCount
+        if cache.contains(where: { $0.offset > expected }),
+            cache.allSatisfy({ $0.isTrimmable && !($0 is any HybridPoolCache) })
+        {
+            for layer in cache where layer.offset > expected {
+                _ = layer.trim(layer.offset - expected)
+            }
+        }
+        dsparkQueue.removeAll()
+    }
+
+    /// Enable Uno for this request when it can be served exactly; otherwise log why and decode AR.
+    /// `blockSize` pins the rows per cycle; nil chooses them per cycle (`UnoWidthPlan`).
+    private mutating func setupUno(
+        adapterPath: URL, blockSize pinned: Int?, input: LMInput, parameters: GenerateParameters,
+        stopTokenIDs: Set<Int>
+    ) {
+        let blockSize = pinned ?? UnoWidthPlan.candidates.max()!
+        let reason: String? = {
+            guard let target = model as? any UnoSelfSpeculativeModel else {
+                return "model \(type(of: model)) has no Uno pathway"
+            }
+            if processor != nil { return "logit processors (penalties / JSON schema) need per-token sampling" }
+            if parameters.minP > 0 { return "min-p sampling is not supported by the Uno acceptance test" }
+            if compiledForward != nil { return "compiled decode is active" }
+            if input.image != nil || input.video != nil { return "media inputs" }
+            if !cache.allSatisfy(\.isTrimmable) { return "the cache cannot drop rejected rows" }
+            if blockSize < 2 { return "block size \(blockSize) < 2" }
+            // A greedy response on such a target must equal ordinary decoding token for token
+            // (the bundle's own runtime contract; DFlash2 verifies it one row at a time). Uno's draft
+            // and verify are multi-row forwards, whose matmul and attention kernels round differently
+            // from 1-row decoding, so a near-tie can flip (Diplodocus preview 3, 2.2k-token prompt:
+            // first difference after ~200 greedy tokens). Sampled requests keep Uno, as DFlash2 keeps
+            // batched verification for them.
+            if parameters.temperature <= 0,
+                (target as? any DFlash2Target)?.requiresSequentialDFlash2Verification == true
+            {
+                return "greedy decoding on this model must match ordinary decoding exactly"
+            }
+            do {
+                let adapter = try UnoAdapterResolver.shared.adapter(at: adapterPath)
+                let mask = try target.installUnoAdapter(adapter)
+                // Draft and verify are multi-row forwards; the target's lane policy keeps 1-row AR
+                // on its ordinary kernels.
+                LaneQMM.installForDFlash2Target(target)
+                // `VMLX_UNO_PREWARM=1`: compile every speculative shape before the first request
+                // decodes. Off by default: measured, it only MOVES the one-time ~1.8 s compile from
+                // mid-stream into the first request's TTFT (0.75 → 4.2 s at a ~450 MHz clock). Its
+                // right home is the host: `UnoWarmup.prepare` right after the model loads.
+                if ProcessInfo.processInfo.environment["VMLX_UNO_PREWARM"] == "1",
+                    let ms = try UnoWarmup.prepare(
+                        model: target, adapterDirectory: adapterPath, temperature: parameters.temperature)
+                {
+                    Self.logger.info("Uno prewarm \(ms) ms")
+                }
+                uno = UnoDecoder(
+                    model: target, mask: mask, blockSize: blockSize,
+                    maskTokenBound: target.unoNoiseTokenBound,
+                    temperature: parameters.temperature, topP: parameters.topP,
+                    topK: parameters.topK, stopTokenIDs: stopTokenIDs)
+                if let seed = parameters.randomSeed {
+                    uno?.randomState = MLXRandom.RandomState(seed: seed &+ 0x5851_F42D_4C95_7F2D)
+                }
+                if pinned == nil {
+                    uno?.chooser = DFlash2WidthChooser(
+                        widths: UnoWidthPlan.candidates,
+                        costs: .shared(
+                            for: target, widths: UnoWidthPlan.candidates, namespace: "uno",
+                            // `VMLX_UNO_CLOCK_TRACK=0`: per-width EMA costs (A/B control).
+                            tracksClock: UnoWarmup.tracksClock),
+                        bonusTokens: 1,
+                        initial: UnoWidthPlan.declaredWidth(adapterDirectory: adapterPath) ?? 8,
+                        sharesAcceptance: true,
+                        // `VMLX_UNO_PROBE_REWARD=0`: plain probe backoff (A/B control).
+                        rewardsWinningProbes: ProcessInfo.processInfo.environment["VMLX_UNO_PROBE_REWARD"] != "0",
+                        // `VMLX_UNO_DECAY=<x>`: acceptance-evidence decay (A/B tool; 0.85 = DFlash2's).
+                        decay: ProcessInfo.processInfo.environment["VMLX_UNO_DECAY"].flatMap(Double.init) ?? 0.95,
+                        // `VMLX_UNO_LAZY=0`: time every width in every bucket (A/B control).
+                        lazyExploration: ProcessInfo.processInfo.environment["VMLX_UNO_LAZY"] != "0")
+                }
+                unoStartOffset = cache.map(\.offset).max() ?? 0
+                return nil
+            } catch {
+                return "adapter \(adapterPath.path): \(error.localizedDescription)"
+            }
+        }()
+        if let reason {
+            Self.logger.warning(
+                "Uno requested but not used for this request (decoding autoregressively): \(reason, privacy: .public)")
+        }
+    }
+
+    /// One Uno step: return a queued token, or run a cycle from the pending token `y`. Nil hands this
+    /// step to ordinary decoding (stop-token seed, or too little budget left for a cycle).
+    private mutating func unoNext() -> Int? {
+        if !unoQueue.isEmpty {
+            let token = unoQueue.removeFirst()
+            tokenCount += 1
+            lastForwardedTokenId = token
+            return token
+        }
+        if unoARSteps > 0 {
+            unoARSteps -= 1
+            return nil
+        }
+        guard var decoder = uno else { return nil }
+        // After an AR stretch this read waits for the stretch's last forward, closing its timing.
+        let seed = y.tokens.reshaped(-1)[0].item(Int.self)
+        if let stretch = unoARStretch {
+            decoder.observeAR(
+                steps: stretch.steps, seconds: Date.timeIntervalSinceReferenceDate - stretch.start)
+            unoARStretch = nil
+        }
+        defer { uno = decoder }
+        let remaining = maxTokens.map { $0 - tokenCount } ?? Int.max
+        guard remaining >= 4, !decoder.stopTokenIDs.contains(seed) else { return nil }
+        decoder.prepare(keys: cache.first?.offset ?? 0)
+        if decoder.wantsAR {
+            // This call's ordinary step is the stretch's first. Never past the budget's end: the
+            // stretch must close (and be timed) inside this request.
+            let steps = Swift.max(1, Swift.min(unoARStretchLength, remaining - 1))
+            unoARSteps = steps - 1
+            unoARStretch = (Date.timeIntervalSinceReferenceDate, steps)
+            unoARStretchLength = Swift.min(unoARStretchLength * 2, UnoWidthPlan.maxARStretch)
+            return nil
+        }
+        unoARStretchLength = UnoWidthPlan.arStretch
+        let committed = decoder.cycle(
+            seed: seed, cache: cache, maxCommit: Swift.min(remaining - 1, 1 << 20))
+        unoQueue = Array(committed.dropLast())
+        y = .init(tokens: MLXArray([Int32(committed.last!)]))
+        tokenCount += 1
+        lastForwardedTokenId = seed
+        // Same cadence as ordinary decoding: once per 256 tokens, when this cycle crosses a boundary.
+        if (tokenCount + unoQueue.count) / 256 > (tokenCount - 1) / 256 {
+            Memory.clearCache()
+        }
+        return seed
+    }
+
+    /// Uno cycles can commit past a stop token or the budget; the caller stops there. Bring the cache
+    /// back to exactly what ordinary decoding would hold: prompt + every returned token.
+    private func reconcileUnoCache() {
+        guard uno != nil else { return }
+        let expected = unoStartOffset + tokenCount
+        for layer in cache where layer.offset > expected {
+            _ = layer.trim(layer.offset - expected)
         }
     }
 
@@ -2462,6 +3077,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.originalInput = input
         self.cacheInitParameters = nil
         self.mediaSalt = nil
+        self.cacheSaltPlan = CacheBoundarySaltPlan(requestSalt: nil)
 
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
@@ -2470,6 +3086,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     windowSize: prefillStepSize)
             }
         }
+        // This initializer has no storage coordinator; retain only the live cache.
     }
 
     /// The cross-turn reuse boundary for path-dependent hybrid and standalone
@@ -2522,7 +3139,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                         trace += "heuristic=\(heuristicBoundary.map(String.init) ?? "nil") "
                         trace += "isHybrid=\(coordinator?.isHybrid ?? false) "
                         trace += "companion=\(coordinator?.requiresPagedBoundaryCompanion ?? false)\n"
-            FileHandle.standardError.write(Data(trace.utf8))
+            RuntimeDiagnostics.write(Data(trace.utf8))
         }
         guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
             let coordinator,
@@ -2582,6 +3199,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     private func boundarySplit(
         of input: LMInput,
         at boundary: Int,
+        inputStart: Int? = nil,
         allowHybridPool: Bool = false
     ) -> (head: LMInput?, tail: LMInput)? {
         guard !input.requiresPostPrepareCacheKey,
@@ -2593,7 +3211,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         else { return nil }
 
         let size = input.text.tokens.size
-        let split = boundary - (promptTokenIds.count - size)
+        // A structural head ends before the full prompt. Its caller must
+        // supply the absolute start; the suffix-only inference is otherwise
+        // wrong when splitting stable seeds inside that head.
+        let split = boundary - (inputStart ?? (promptTokenIds.count - size))
         guard split >= 0, split < size else { return nil }
 
         // Keep a media payload with the complete placeholder span it belongs
@@ -2640,7 +3261,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                 mediaTokenIds: input.mediaTokenIds,
                 cacheScopeSalt: input.cacheScopeSalt,
                 cachePromptIntent: input.cachePromptIntent,
-                toolSchemas: input.toolSchemas)
+                toolSchemas: input.toolSchemas,
+                canonicalRequiredToolContext: input.canonicalRequiredToolContext)
             : nil
         let tail = LMInput(
             text: LMInput.Text(
@@ -2653,13 +3275,16 @@ public struct TokenIterator: TokenIteratorProtocol {
             mediaTokenIds: input.mediaTokenIds,
             cacheScopeSalt: input.cacheScopeSalt,
             cachePromptIntent: input.cachePromptIntent,
-            toolSchemas: input.toolSchemas)
+            toolSchemas: input.toolSchemas,
+            canonicalRequiredToolContext: input.canonicalRequiredToolContext)
         return (head, tail)
     }
 
     private func prefillBoundaryCapture(
         of input: LMInput
     ) -> (kind: PrefillBoundaryCapture, head: LMInput?, tail: LMInput)? {
+        guard cacheCoordinator?.canPersistBoundaries == true,
+              originalInput.cachePromptIntent != .auxiliary else { return nil }
         if let boundary = hybridStripBoundary,
            hybridStripSnapshot == nil,
            let split = boundarySplit(of: input, at: boundary)
@@ -2680,6 +3305,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        // Aligned prefill: the model cuts the prompt at absolute chunk boundaries and the store boundary only. Any
+        // other split (stable-boundary captures) would be a cut a cold prefill of a different request does not make;
+        // the store loop takes those boundaries from the prompt snapshot (these caches trim) instead.
+        if alignedPrefillPlan != nil {
+            try prepareRemainder(
+                input: input, windowSize: windowSize, promptTokensForProcessor: input.text.tokens)
+            return
+        }
         // A warm input contains only the suffix after the restored prefix.
         // Snapshot keys and processor boundaries refer to the whole prompt.
         let inputStart = promptTokenIds.count - input.text.tokens.size
@@ -2698,104 +3331,20 @@ public struct TokenIterator: TokenIteratorProtocol {
         // generation and does not alter sampler or template behavior.
         if let capture = prefillBoundaryCapture(of: input) {
             if let head = capture.head {
-                // Capture any stable boundaries that sit INSIDE this head on the
-                // way through it, ascending, before prefilling the rest.
-                //
-                // The pass below this one only looks at stable boundaries AFTER
-                // the head, because it filters on `alreadyConsumed`. For a
-                // cross-conversation anchor that filter can never match: the
-                // anchor marks the shared system+tools prefix and is therefore
-                // always EARLIER in the prompt than the generation-stripped
-                // boundary this head ends at. Measured on Ornith 1.5 35B-A3B,
-                // the head ended at 20,388 while the anchor sat at 20,375, so
-                // `wanted` came back empty on every request and the anchor was
-                // never captured.
-                //
-                // With no capture the post-answer store fell back to
-                // cacheSnapshotForBoundary, which cannot trim a cache holding
-                // MambaCache layers (BaseKVCache defaults isTrimmable to false
-                // and neither ArraysCache nor MambaCache overrides it) and so
-                // REDERIVED the state with a fresh newCache at a different
-                // prefill step. Restoring that rederived state changed greedy
-                // output: on a 20,406-token prompt at temperature 0 the first
-                // assistant turn differed from cold, while a self-restore to
-                // the captured boundary 27 tokens later was byte-identical.
-                let headCount = head.text.tokenIds?.count ?? head.text.tokens.size
-                // EXPERIMENT: capture ONLY the N-1 seed, not N as well.
-                // Capturing both forces a 1-token prefill chunk between them,
-                // and a 1-token chunk plausibly takes the recurrent kernels'
-                // single-step path rather than the chunked scan.
-                // `cacheStablePrefixTokenCounts` are ABSOLUTE positions in the
-                // whole prompt; `headCount` is the length of the slice this
-                // prefill will process. They coincide only when the cache
-                // started empty. After a restore prefill begins partway in —
-                // measured live: promptTokenIds=4102 inputSize=1031
-                // headCount=1026 stable=[4087] — so the strip boundary fails
-                // `$0 < headCount` and `inner` comes back EMPTY. Nothing is
-                // captured, and the post-answer store replays the whole prefix
-                // through the model after the answer has already streamed,
-                // making a restoring turn slower (12.9 s) than a cold one
-                // (10.5 s).
-                let alreadyInCache = promptTokenIds.count - input.text.tokens.size
-                let headEnd = alreadyInCache + headCount
-                let inner = Set(
-                    originalInput.cacheStablePrefixTokenCounts
-                        .filter { $0 > 1 && $0 < headEnd }
-                        .map { $0 - 1 }
-                ).filter { $0 > alreadyInCache && $0 < headEnd }.sorted()
-
-                var consumed = alreadyInCache
-                var remainingHead = head
-                for boundary in inner {
-                    // `boundarySplit` rebases the boundary itself, assuming the
-                    // input it is handed is the LAST `size` tokens of the prompt
-                    // (`split = boundary - (promptTokenIds.count - size)`). That
-                    // holds for a tail but not for the head pieces walked here,
-                    // so undo that rebase instead of subtracting `consumed` on
-                    // top of it. Applying both corrections cut the first piece
-                    // short by `promptCount - headCount` — 5 tokens on Ornith
-                    // 1.5, this template's generation-prompt suffix — and the
-                    // store was then correctly refused, `offsets=[20369]` under
-                    // a claimed `tokens=20374`.
-                    let rebase = promptTokenIds.count - remainingHead.text.tokens.size
-                    guard boundary > consumed,
-                        let split = boundarySplit(
-                            of: remainingHead, at: boundary - consumed + rebase),
-                        let piece = split.head
-                    else { continue }
-                    let preparedPiece = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-                        try model.prepare(piece, cache: cache, windowSize: windowSize)
-                    }
-                    switch preparedPiece {
-                    case .tokens(let leftover):
-                        _ = model(
-                            leftover[text: .newAxis],
-                            cache: cache.isEmpty ? nil : cache,
-                            state: nil)
-                    case .logits:
-                        break
-                    }
-                    MLX.eval(cache)
-                    stableBoundarySnapshots[boundary] =
-                        makePromptBoundaryCacheSnapshot(from: cache)
-                    remainingHead = split.tail
-                    consumed = boundary
-                }
-
-                let preparedHead = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-                    try model.prepare(remainingHead, cache: cache, windowSize: windowSize)
-                }
-                switch preparedHead {
-                case .tokens(let remaining):
-                    _ = model(
-                        remaining[text: .newAxis],
-                        cache: cache.isEmpty ? nil : cache,
-                        state: nil)
-                case .logits:
-                    break
-                }
+                // The stable seeds can precede this later structural boundary.
+                // Capture them while forwarding the head, rather than replaying
+                // each prefix after output. Qualified canonical required-tool
+                // requests own their cold chunk schedule; preserve that route.
+                let ownsCanonicalSchedule = model is any CanonicalRequiredToolCacheModel
+                    && originalInput.cacheRestorePolicy == .freshRequiredToolSelection
+                    && originalInput.canonicalRequiredToolContext != nil
+                let remainingHead = ownsCanonicalSchedule ? nil : try prepareStableBoundarySegments(
+                    input: head, windowSize: windowSize, alreadyConsumed: inputStart,
+                    captureStoreSeedsOnly: true)
+                try prepareBoundaryHead(remainingHead ?? head, windowSize: windowSize)
+            } else {
+                try withError { MLX.eval(cache) }
             }
-            MLX.eval(cache)
             let snapshot = makePromptBoundaryCacheSnapshot(from: cache)
             switch capture.kind {
             case .hybridStrip:
@@ -2848,6 +3397,63 @@ public struct TokenIterator: TokenIteratorProtocol {
             promptTokensForProcessor: input.text.tokens)
     }
 
+    /// Preserve the originating MLX failure before snapshotting a prefix or
+    /// continuing into its tail. Cache-boundary prefill is preparation too.
+    private mutating func prepareBoundaryHead(_ input: LMInput, windowSize: Int?) throws {
+        try withError { error in
+            let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
+                try model.prepare(input, cache: cache, windowSize: windowSize)
+            }
+            try error.check()
+            if case .tokens(let remaining) = prepared {
+                _ = model(remaining[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: nil)
+                try error.check()
+            }
+            MLX.eval(cache)
+            try error.check()
+        }
+    }
+
+    /// A hybrid-pool cache with no recurrent state (DeepSeek-V4 / V4.1): its
+    /// stable system / tool boundaries are captured while prefill crosses them,
+    /// the same split its prompt-minus-one seed already takes, instead of being
+    /// rebuilt by a second prefill of the whole prefix after the answer (11.5 s
+    /// with the stream held open, DSV4.1 at 3.4k tokens on an M5 Max).
+    /// `VMLX_POOL_BOUNDARY_CAPTURE=0` keeps the store-time rebuild for comparisons.
+    private var poolCacheCapturesBoundariesInPrefill: Bool {
+        ProcessInfo.processInfo.environment["VMLX_POOL_BOUNDARY_CAPTURE"] != "0"
+            && cacheRequiresPrefillCapturedDiskSeed(cache)
+    }
+
+    /// How close to the end of the span being prefilled a pool cache's stable boundary must sit to be cut there
+    /// during prefill, or nil for every distance.
+    ///
+    /// A cut prefills the head as its own prompt. On a model whose prefill prunes its upper layers to the rows the
+    /// prompt end depends on (``PrunedPromptPrefillModel``, DeepSeek-V4.1), the head then runs those layers over the
+    /// rows ITS end depends on too: a cut far from the end costs a second pruned region, ~24k layer rows, which made
+    /// a 4.2k-token cold DSV4.1 prefill with its system and system+tools cuts 18-19 % slower than an uncut one. A
+    /// cut within the model's unpruned tail of the end costs at most that tail, which the uncut prefill runs through
+    /// every layer anyway. Boundaries further out are left to a later prompt that ends near them: a new chat or the
+    /// next turn on the same system + tools prefix, whose own cold prefill takes the near cut (the prompt-minus-one
+    /// seed of every request is stored as before). The answer stream never waits on a rebuild of them.
+    ///
+    /// `VMLX_POOL_BOUNDARY_CAPTURE=all` cuts at every stable boundary (the previous behaviour, for comparisons).
+    private func poolCacheNearCutRows(windowSize: Int?) -> Int? {
+        guard ProcessInfo.processInfo.environment["VMLX_POOL_BOUNDARY_CAPTURE"] != "all" else { return nil }
+        return (model as? any PrunedPromptPrefillModel)?.unprunedPromptTailRows(windowSize: windowSize)
+    }
+
+    /// `VMLX_POOL_BOUNDARY_CAPTURE=history`: the published history boundaries
+    /// too (the newest message boundary and the ladder rungs). Opt-in: a split
+    /// far from the prompt end runs the pruned upper layers over the rows before
+    /// it as well, measured +1 to +4 s per split on a cold DSV4.1 prefill (M5 Max),
+    /// and the newest boundary sits one rail short of the prompt-minus-one seed
+    /// every request stores anyway.
+    private var poolCacheCapturesHistoryBoundaries: Bool {
+        ProcessInfo.processInfo.environment["VMLX_POOL_BOUNDARY_CAPTURE"] == "history"
+            && cacheRequiresPrefillCapturedDiskSeed(cache)
+    }
+
     /// Prefill in segments that end on each processor-declared stable boundary,
     /// keeping the cache state at every one.
     ///
@@ -2871,59 +3477,104 @@ public struct TokenIterator: TokenIteratorProtocol {
         input: LMInput, windowSize: Int?, alreadyConsumed: Int,
         promptTokensForProcessor: MLXArray
     ) throws -> Bool {
-        // Boundaries are absolute positions in the whole prompt, while `input`
-        // may already start partway through it when an earlier capture split
-        // it. Everything below works in absolute terms and subtracts
-        // `alreadyConsumed` only when slicing.
-        let promptCount =
-            alreadyConsumed + (input.text.tokenIds?.count ?? input.text.tokens.size)
-        // Store shifts stable boundaries one token short for disk-backed
-        // restores, so capture N-1 as well and let the loop find either.
-        let wanted = Set(
-            originalInput.cacheStablePrefixTokenCounts
-                .filter { $0 > alreadyConsumed && $0 < promptCount }
-                .flatMap { [$0, $0 - 1] }
-        ).filter { $0 > alreadyConsumed }.sorted()
-        if CacheFidelityTrace.isEnabled {
-            FileHandle.standardError.write(Data(
-                ("[vmlx][fidelity] capture-loop stable=\(originalInput.cacheStablePrefixTokenCounts) "
-                    + "alreadyConsumed=\(alreadyConsumed) promptCount=\(promptCount) "
-                    + "wanted=\(wanted)\n").utf8))
-        }
-        guard !wanted.isEmpty else { return false }
-
-        var consumed = alreadyConsumed
-        var remaining = input
-        for boundary in wanted {
-            guard boundary > consumed,
-                let split = boundarySplit(of: remaining, at: boundary),
-                let head = split.head
-            else { continue }
-            let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-                try model.prepare(head, cache: cache, windowSize: windowSize)
-            }
-            switch prepared {
-            case .tokens(let leftover):
-                _ = model(
-                    leftover[text: .newAxis],
-                    cache: cache.isEmpty ? nil : cache,
-                    state: nil)
-            case .logits:
-                break
-            }
-            MLX.eval(cache)
-            stableBoundarySnapshots[boundary] = makePromptBoundaryCacheSnapshot(from: cache)
-            CacheFidelityTrace.dumpCache(
-                stableBoundarySnapshots[boundary]!,
-                label: "STORE stable boundary=\(boundary)")
-            remaining = split.tail
-            consumed = boundary
-        }
-        guard consumed > alreadyConsumed else { return false }
+        guard let remaining = try prepareStableBoundarySegments(
+            input: input, windowSize: windowSize, alreadyConsumed: alreadyConsumed)
+        else { return false }
         try prepareRemainder(
             input: remaining, windowSize: windowSize,
             promptTokensForProcessor: promptTokensForProcessor)
         return true
+    }
+
+    /// Forward interior stable segments without priming the processor or
+    /// sampling. A structural head uses the returned remainder before its own
+    /// snapshot; the final suffix uses it before the one sampling/priming step.
+    private mutating func prepareStableBoundarySegments(
+        input: LMInput, windowSize: Int?, alreadyConsumed: Int,
+        captureStoreSeedsOnly: Bool = false
+    ) throws -> LMInput? {
+        let segmentEnd = alreadyConsumed + (input.text.tokenIds?.count ?? input.text.tokens.size)
+        var wanted: [Int]
+        if captureStoreSeedsOnly {
+            // The terminal store consumes only N-1 for disk-backed hybrid
+            // topologies. Retaining N as well would duplicate a KV payload
+            // through decode even though no store uses it.
+            let requiresDiskRestore = cacheRequiresDiskBackedCoordinatorRestore(cache)
+            let stable = Set(originalInput.cacheStablePrefixTokenCounts)
+            // History boundaries (the newest message boundary and the ladder
+            // rungs below it) too, when asked for, for pool caches: their state at a boundary
+            // exists only while prefill crosses it. After the prompt the
+            // sliding windows have moved past it and pool rows cannot be
+            // un-appended, so the store loop's trim / replay fallback has
+            // nothing to cut back and every rung but the prompt-minus-one
+            // seed went unstored: an edited or regenerated message, or a
+            // second chat diverging inside the history, re-prefilled all of
+            // it. The split runs the head as its own prompt (`model.prepare`
+            // ends its pruned chunks at the head's end), so the snapshot is
+            // the state a cold prefill of exactly those tokens produces.
+            let history = poolCacheCapturesHistoryBoundaries
+                ? originalInput.cachePrefixTokenCounts.filter { !stable.contains($0) }
+                : []
+            wanted = Set(stable
+                .filter { $0 > 0 && $0 <= segmentEnd && $0 < promptTokenIds.count }
+                .map { requiresDiskRestore && $0 > 1 ? $0 - 1 : $0 }
+                + history.filter { $0 > 0 && $0 <= segmentEnd && $0 < promptTokenIds.count })
+                .filter { boundary in
+                    boundary > alreadyConsumed && boundary < segmentEnd
+                        && !(cacheCoordinator?.hasDurableDiskEntry(
+                            tokens: Array(promptTokenIds.prefix(boundary)),
+                            mediaSalt: cacheSaltPlan.salt(forBoundary: boundary)) ?? false)
+                }.sorted()
+            if poolCacheCapturesBoundariesInPrefill, let nearRows = poolCacheNearCutRows(windowSize: windowSize) {
+                let stableStores = Set(stable.map { requiresDiskRestore && $0 > 1 ? $0 - 1 : $0 })
+                let far = wanted.filter { stableStores.contains($0) && segmentEnd - $0 > nearRows }
+                if !far.isEmpty {
+                    poolStableBoundariesLeftUncut.formUnion(far)
+                    wanted.removeAll { far.contains($0) }
+                    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                        RuntimeDiagnostics.write(Data(
+                            ("[vmlx][cache/stable-head-capture] far=\(far) segmentEnd=\(segmentEnd)"
+                                + " nearRows=\(nearRows) left to a later prompt\n").utf8))
+                    }
+                }
+            }
+        } else {
+            // Preserve the pre-existing final-suffix partition exactly.
+            wanted = Set(originalInput.cacheStablePrefixTokenCounts
+                .filter { $0 > alreadyConsumed && $0 < segmentEnd }
+                .flatMap { [$0, $0 - 1] })
+                .filter { $0 > alreadyConsumed }.sorted()
+        }
+        guard !wanted.isEmpty else { return nil }
+        var consumed = alreadyConsumed
+        var remaining = input
+        for boundary in wanted {
+            guard boundary > consumed,
+                let split = boundarySplit(
+                    of: remaining, at: boundary, inputStart: consumed,
+                    allowHybridPool: captureStoreSeedsOnly && poolCacheCapturesBoundariesInPrefill),
+                let head = split.head
+            else { continue }
+            try prepareBoundaryHead(head, windowSize: windowSize)
+            let snapshot = makePromptBoundaryCacheSnapshot(from: cache)
+            stableBoundarySnapshots[boundary] = snapshot
+            if captureStoreSeedsOnly,
+               ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                // Logical payload only, not allocator/physical footprint. These
+                // evaluated owned copies live until terminal publication; the
+                // optimization exchanges replay work for retained seed bytes.
+                let bytes = snapshot.reduce(0) { total, layer in
+                    total + layer.state.reduce(0) { $0 + $1.nbytes }
+                }
+                RuntimeDiagnostics.write(Data(
+                    ("[vmlx][cache/stable-head-capture] boundary=\(boundary)"
+                        + " inputStart=\(consumed) snapshot_state_bytes=\(bytes)\n").utf8))
+            }
+            CacheFidelityTrace.dumpCache(snapshot, label: "STORE stable boundary=\(boundary)")
+            remaining = split.tail
+            consumed = boundary
+        }
+        return consumed > alreadyConsumed ? remaining : nil
     }
 
     /// Prefill `input` and prime `y` with the first sampled token.
@@ -2937,8 +3588,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         windowSize: Int?,
         promptTokensForProcessor: MLXArray
     ) throws {
-        let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-            try model.prepare(input, cache: cache, windowSize: windowSize)
+        // Keep the scope around the originating prepare operation, not merely
+        // the later shape read. Failed C operations can leave an invalid array;
+        // preserve their first synchronous error before inspecting that array.
+        let prepared = try withError { error in
+            let result = try MLXPressGenerationProfile.time("prompt.model_prepare") {
+                try model.prepare(input, cache: cache, windowSize: windowSize)
+            }
+            try error.check()
+            if case .logits(let output) = result {
+                try validatePreparedLogitsForSampling(output.logits)
+            }
+            return result
         }
         switch prepared {
         case .tokens(let tokens):
@@ -2946,7 +3607,15 @@ public struct TokenIterator: TokenIteratorProtocol {
             y = tokens
 
             // evaluate the remainder of the prompt -- this primes the pump
-            let token = step(previous: y)
+            let result = try withError { error in
+                let result = forwardUncompiled(previous: y)
+                // The remainder projection is part of preparation too. Check
+                // its originating MLX error before indexing its output array.
+                try error.check()
+                try validatePreparedLogitsForSampling(result.logits)
+                return result
+            }
+            let token = sampleUncompiledResult(result)
             y = .init(tokens: token)
             MLXPressGenerationProfile.time("prompt.async_eval_submit") {
                 asyncEval(y.tokens)
@@ -2985,14 +3654,34 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         if var processor {
             logits = processor.process(logits: logits)
+            if let failure = (processor as? any ConstraintFailureReporting)?.constraintFailure {
+                self.generationFailure = GenerationFailure(
+                    stage: .decoding, cause: failure.localizedDescription)
+                self.processor = processor
+                // Internal sentinel only: next() checks the failure before emitting or advancing it.
+                return MLXArray(Int32(0))
+            }
             let y = sampler.sample(logits: logits)
             processor.didSample(token: y)
             self.processor = processor
+            if let failure = (processor as? any ConstraintFailureReporting)?.constraintFailure {
+                self.generationFailure = GenerationFailure(
+                    stage: .decoding, cause: failure.localizedDescription)
+            }
             if let rawRow { probeNonFiniteLogits(rawRow, sampled: y) }
             return y
         }
 
-        let y = sampler.sample(logits: logits)
+        let y: MLXArray
+        if let sampling = dspark?.sampling, !dsparkFinished {
+            // Sampled dSpark: an AR step draws with the same position-keyed noise a verify row of
+            // this position would, so a fixed seed gives the same tokens however the wall-clock
+            // governor split the run into speculative and AR steps. The token sampled here takes
+            // the position the cache offset now names (the forwarded token sits just before it).
+            y = sampling.sample(logits, position: cache.map(\.offset).max() ?? 0)
+        } else {
+            y = sampler.sample(logits: logits)
+        }
         if let rawRow { probeNonFiniteLogits(rawRow, sampled: y) }
         return y
     }
@@ -3012,6 +3701,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     public mutating func finalizeGenerationStats(generatedTokenIds: [Int]) {
         nanTrace?.finish(totalSteps: tokenCount)
+        finishDSpark()
     }
 
     // Whether cache quantization is needed (skip the function call entirely when not)
@@ -3033,20 +3723,20 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func maybeQuantizeCacheForStep() {
-        let hadTQ = ModelCacheTopologySnapshot(cache: cache).turboQuantKVLayerCount > 0
-        let before = hadTQ ? nil : ModelCacheTopologySnapshot(cache: cache)
+        let hadTQ = ModelCacheTopologySnapshot(cache: cache, cacheComputationIdentity: model.cacheComputationIdentity).turboQuantKVLayerCount > 0
+        let before = hadTQ ? nil : ModelCacheTopologySnapshot(cache: cache, cacheComputationIdentity: model.cacheComputationIdentity)
         maybeQuantizeKVCache(
             cache: &cache,
             kvBits: kvBits,
             kvGroupSize: kvGroupSize,
             quantizedKVStart: quantizedKVStart,
             kvMode: kvMode)
-        let hasTQ = ModelCacheTopologySnapshot(cache: cache).turboQuantKVLayerCount > 0
+        let hasTQ = ModelCacheTopologySnapshot(cache: cache, cacheComputationIdentity: model.cacheComputationIdentity).turboQuantKVLayerCount > 0
         if !hadTQ, hasTQ, let before {
             turboQuantCompressionCount += 1
             lastTurboQuantCacheTransition = TurboQuantCacheTransitionSnapshot(
                 before: before,
-                after: ModelCacheTopologySnapshot(cache: cache)
+                after: ModelCacheTopologySnapshot(cache: cache, cacheComputationIdentity: model.cacheComputationIdentity)
             )
         }
     }
@@ -3185,15 +3875,22 @@ public struct TokenIterator: TokenIteratorProtocol {
             self.compiledExternalInputModel = nil
         }
 
+        return sampleUncompiledResult(forwardUncompiled(previous: previous))
+    }
+
+    private func forwardUncompiled(previous: LMInput.Text) -> LMOutput {
         // Models expect [B, L] input. If the caller passed 1D tokens [L], add a batch
         // axis. If they passed 2D [B, L] already (some VLM bench/test paths), use as-is —
         // adding another newAxis would produce 3D and break QuantizedLinear matmul on
         // pure-LLM model paths (Llama, Mistral, Phi, etc).
         let stepInput: LMInput.Text =
             previous.tokens.ndim == 1 ? previous[text: .newAxis] : previous
-        let result = MLXPressGenerationProfile.time("decode.model_forward") {
+        return MLXPressGenerationProfile.time("decode.model_forward") {
             model(stepInput, cache: cache.isEmpty ? nil : cache, state: state)
         }
+    }
+
+    private mutating func sampleUncompiledResult(_ result: LMOutput) -> MLXArray {
         self.state = result.state
 
         if shouldQuantizeAfterStep {
@@ -3208,19 +3905,34 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating public func next() -> Int? {
+        guard generationFailure == nil else { return nil }
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
+        if uno != nil, let token = unoNext() {
+            return token
+        }
+        if dspark != nil, let token = dsparkNext() {
+            return token
+        }
 
         let previousY = y
+        if (processor as? JSONSchemaLogitProcessor)?.isTerminated == true {
+            // EOS has already been sampled. Do not run the usual one-token lookahead
+            // against a terminated grammar; return EOS to the standard stop handler.
+            tokenCount += 1
+            return previousY.tokens.item(Int.self)
+        }
 
         let token = MLXPressGenerationProfile.time("decode.step_build") {
             step(previous: previousY)
         }
         y = .init(tokens: token)
 
-        MLXPressGenerationProfile.time("decode.async_eval_submit") {
-            asyncEval(token)
+        if generationFailure == nil {
+            MLXPressGenerationProfile.time("decode.async_eval_submit") {
+                asyncEval(token)
+            }
         }
 
         tokenCount += 1
@@ -3236,18 +3948,88 @@ public struct TokenIterator: TokenIteratorProtocol {
         return forwardedToken
     }
 
+    // Canonical hybrid prompts are never stored exactly, and their recurrent state
+    // cannot be trimmed to a previous boundary. Keep only the captured boundary.
+    var retainsPromptSnapshotForStores: Bool {
+        guard cacheCoordinator?.canPersistBoundaries == true,
+              originalInput.cachePromptIntent != .auxiliary,
+              !cacheRequiresPrefillCapturedDiskSeed(cache) else {
+            return false
+        }
+        return !(cacheCoordinator?.isHybrid == true && hybridStripBoundary != nil
+            && !canTrimPromptCache(cache))
+    }
+
+    mutating func spillHybridStripBoundaryAfterPrefill() {
+        guard !retainsPromptSnapshotForStores,
+              originalInput.cachePromptIntent != .auxiliary,
+              !originalInput.requiresPostPrepareCacheKey,
+              let coordinator = cacheCoordinator,
+              let stripAt = hybridStripBoundary,
+              let snapshot = hybridStripSnapshot,
+              storeCapturedHybridBoundary(
+                snapshot, tokens: Array(promptTokenIds.prefix(stripAt)),
+                coordinator: coordinator,
+                mediaSalt: cacheSaltPlan.salt(forBoundary: stripAt),
+                chainId: cacheInitParameters?.cacheChainId,
+                kvMode: selectivePromptBoundaryDiskKVMode(cache: snapshot, requested: kvMode),
+                kvGroupSize: kvGroupSize,
+                quantizedKVStart: quantizedKVStart)
+        else { return }
+        hybridStripBoundarySpilled = true
+        hybridStripSnapshot = nil
+        stableBoundarySnapshots.removeValue(forKey: stripAt)
+        MemoryStageTrace.log("strip-spilled", tokens: stripAt, detail: "solo accepted")
+    }
+
     public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        reconcileUnoCache()
+        finishDSpark()
+        MemoryStageTrace.log("decode-end", tokens: promptTokenIds.count + generatedTokenIds.count)
+        // Decode is over: the prompt rows of the finished cache are what prefill wrote (append-only lanes), so the stores
+        // below take views of them. No copy held through decode, none made here.
+        if let rows = deferredPromptSnapshotRows {
+            deferredPromptSnapshotRows = nil
+            if let views = prefixViews(of: cache, rows: rows) {
+                retainedPromptSnapshot = cacheCoordinator?.retainExactPromptSnapshot(from: views, copy: false)
+            }
+            exactPromptSnapshotWasDeclined = retainedPromptSnapshot == nil
+        }
+        defer {
+            MemoryStageTrace.log("stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count)
+        }
+        defer {
+            if !Task.isCancelled,
+               let coordinator = cacheCoordinator,
+               let model = self.model as? any CanonicalRequiredToolCacheModel,
+               let parameters = cacheInitParameters,
+               let capture = canonicalStablePrefillCapture, capture.modelIdentity == model.canonicalRequiredToolCacheIdentity,
+               let snapshot = capture.snapshot,
+               let salt = canonicalRequiredToolSalt(input: originalInput, model: model,
+                    parameters: parameters, cache: snapshot, ordinarySalt: mediaSalt) {
+                coordinator.storeCanonicalCheckpoint(
+                    tokens: Array(promptTokenIds.prefix(capture.seedCount)), cache: snapshot,
+                    chunkSize: capture.chunkSize, requestSalt: salt, chainId: parameters.cacheChainId,
+                    canonicalModel: model,
+                    requiredResumeTokens: hybridStripBoundary.map { Array(promptTokenIds.prefix($0)) },
+                    ordinaryRequestSalt: mediaSalt)
+            }
+            canonicalStablePrefillCapture = nil
+        }
         defer { retainedPromptSnapshot = nil }
-        guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
+        guard let coordinator = cacheCoordinator, coordinator.canPersistBoundaries, !promptTokenIds.isEmpty else {
             return
         }
         // Auxiliary (title/suggestion/summary) prompts embed per-turn content
         // and never prefix a future request — persisting their boundaries is
         // pure write cost. They may restore; they never store.
         guard originalInput.cachePromptIntent != .auxiliary else { return }
+        if includeGeneratedBoundary {
+            synchronizeCompiledRotatingCacheMetadataForStorage(cache)
+        }
 
         var sharedPromptRederivedStates: [Int: [MLXArray]]?
         let anchorBoundaries = cacheInitParameters?.ssmAnchorBoundaries ?? []
@@ -3255,10 +4037,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             cachePrefixTokenCounts + [hybridStripBoundary].compactMap { $0 } + anchorBoundaries
         ))
         // When a hybrid prompt exposes a generation-suffix-stripped boundary,
-        // that is the canonical cross-turn checkpoint.  Full-prompt and
-        // post-answer snapshots are both larger and not the boundary the next
-        // templated turn is guaranteed to contain.  Prompts without this
-        // processor-proven boundary keep the existing storage policy.
+        // that is the canonical fallback checkpoint. Avoid redundant exact
+        // prompt snapshots; separately retain a completed-answer snapshot when
+        // its offsets are valid, because some templates preserve generated
+        // history verbatim. Fetch validates the concrete token prefix before
+        // reusing either checkpoint. Prompts without this processor-proven
+        // boundary keep the existing prompt storage policy.
         // Standalone rotating/SWA caches deliberately keep the exact/N-1
         // disk-seed and post-answer policy (see `diskSeedBoundaryIndex`); they
         // only gain the stripped-boundary store itself.
@@ -3278,16 +4062,18 @@ public struct TokenIterator: TokenIteratorProtocol {
             kvMode diskKVMode: KVQuantizationMode,
             isStableBoundary: Bool = false,
             isResumeBoundary: Bool = false,
-            isPostAnswer: Bool = false
+            isPostAnswer: Bool = false,
+            ownsSnapshot: Bool = false
         ) {
             var trace = CacheFinalizationTrace("solo-entry", tokens: tokens.count)
             defer { trace.mark("return") }
             guard !tokens.isEmpty else { return }
-            // The writer may materialize a compact copy of the logical KV;
-            // snapshots and raw disk-store views otherwise share buffers (see
-            // CacheStoreBudget.materializationFactor). This optional speed-up
-            // must respect host pressure and the byte budget before that copy.
-            guard CacheStoreBudget.canStore(cacheToStore) else {
+            // Saving the cache duplicates it several times over (snapshot, host
+            // `Data` for the disk write, disk-store cache) at the point where
+            // memory is already at its peak. A prefix-cache entry is only ever a
+            // speed-up for some later request — it must never be able to take the
+            // host down. If the copies won't fit, don't make them.
+            guard CacheStoreBudget.canStore(cacheToStore, ownsSnapshot: ownsSnapshot) else {
                 let gib = Double(CacheStoreBudget.cacheBytes(cacheToStore)) / 1_073_741_824
                 Self.logger.info(
                     """
@@ -3296,9 +4082,17 @@ public struct TokenIterator: TokenIteratorProtocol {
                     The request completed normally; only the cache entry was dropped.
                     """
                 )
+                RuntimeReceipts.emit(
+                    "store id=\(receiptRequestID) tokens=\(tokens.count) result=skipped "
+                        + "reason=store_budget kv_gib=\(String(format: "%.2f", gib))")
                 return
             }
-            let snapshot = cacheToStore.map { $0.copy() }
+            RuntimeReceipts.emit(
+                "store id=\(receiptRequestID) tokens=\(tokens.count) result=written "
+                    + "kv_gib=\(RuntimeReceipts.gib(CacheStoreBudget.cacheBytes(cacheToStore))) owned=\(ownsSnapshot)")
+            // Prefill/boundary snapshots are already owned and evaluated. Only
+            // a live post-answer cache needs sealing before the async writer.
+            let snapshot = ownsSnapshot ? cacheToStore : cacheToStore.map { $0.copy() }
             let requiresDiskBackedRestore =
                 cacheRequiresDiskBackedCoordinatorRestore(snapshot)
             if !requiresDiskBackedRestore {
@@ -3332,7 +4126,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 promptTokenIds: promptTokenIds,
                                 mediaSalt: mediaSalt,
                                 additionalBoundaries: sharedPromptAdditionalBoundaries,
-                                persistCapturedStatesToDisk: false)
+                                persistCapturedStatesToDisk: false,
+                                prefillStepSize: cacheInitParameters?.prefillStepSize ?? 512)
                     }
                     if let shared = sharedPromptRederivedStates?[tokens.count] {
                         return shared
@@ -3343,7 +4138,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                     model: model,
                     promptTokenIds: tokens,
                     mediaSalt: mediaSalt,
-                    persistCapturedStatesToDisk: false)
+                    persistCapturedStatesToDisk: false,
+                    prefillStepSize: cacheInitParameters?.prefillStepSize ?? 512)
             }()
             let diskStoreCache = makeDiskStoreCache(
                 fromPromptBoundary: snapshot,
@@ -3356,7 +4152,10 @@ public struct TokenIterator: TokenIteratorProtocol {
                 perLayerData: perLayerData,
                 ssmStates: ssmCapture,
                 cache: diskStoreCache,
-                mediaSalt: mediaSalt,
+                // A boundary at or before the first media token is keyed under
+                // the text-only salt so later text turns and other-image turns
+                // of this chat reuse it; later boundaries keep the media salt.
+                mediaSalt: cacheSaltPlan.salt(forBoundary: tokens.count),
                 chainId: cacheInitParameters?.cacheChainId,
                 isStableRoot: isStableBoundary,
                 isResumeBoundary: isResumeBoundary,
@@ -3369,11 +4168,70 @@ public struct TokenIterator: TokenIteratorProtocol {
         // exact-prompt duplicate. Stores are synchronous, so release it as soon
         // as this method returns.
         let capturedDiskSeed = diskSeedSnapshot
+        // Live state substitutes only for topology inspection on non-trimmable hybrids.
         let storageTopologySnapshot = promptCacheSnapshot ?? capturedDiskSeed
+            ?? (retainsPromptSnapshotForStores ? nil : cache)
         let storageSnapshotTokenCount = promptCacheSnapshot == nil
             ? diskSeedBoundary ?? promptTokenIds.count
             : promptTokenIds.count
         defer { diskSeedSnapshot = nil }
+
+        // Aligned prefill (MiniMax-M3): a restore never reuses rows past the producing request's store boundary K, and
+        // below K only rows ending at a chunk boundary or a turn cut (`AlignedPrefill.alignRestoredPrefix`). The exact
+        // prompt (N), the N-1 seed and the generation-stripped boundary (N - gpl) therefore all serve the same K rows,
+        // and a history boundary serves only the last reusable row at or before it. Store ONE entry per reusable row
+        // count, keyed at exactly those rows, as views of the finished cache (zero-copy). Before 2026-10-29 a 35k-token
+        // M3.1 turn wrote three to four ~4.6 GiB entries (N, N-1, N-3 and earlier history boundaries) for what one
+        // entry serves. `VMLX_M3_ALIGNED_SINGLE_STORE=0` = the previous stores (A/B).
+        if let plan = alignedPrefillPlan, Self.alignedSingleStoreEnabled, !isReusablePrefixWarmup,
+            !originalInput.requiresPostPrepareCacheKey,
+            let boundaries = Self.alignedStoreBoundaries(
+                plan: plan, promptTokenCount: promptTokenIds.count,
+                historyBoundaries: cachePrefixTokenCounts,
+                stableBoundaries: originalInput.cacheStablePrefixTokenCounts),
+            boundaries.allSatisfy({ cacheSupportsPrefixViews(cache, rows: $0.rows) })
+        {
+            for boundary in boundaries {
+                let tokens = Array(promptTokenIds.prefix(boundary.rows))
+                if coordinator.hasDurableDiskEntry(
+                    tokens: tokens, mediaSalt: cacheSaltPlan.salt(forBoundary: boundary.rows))
+                {
+                    RuntimeReceipts.emit(
+                        "store id=\(receiptRequestID) tokens=\(boundary.rows) result=skipped reason=already_durable")
+                    continue
+                }
+                guard let views = prefixViews(of: cache, rows: boundary.rows) else { continue }
+                store(
+                    tokens: tokens, cache: views, kvBits: nil,
+                    kvMode: selectivePromptBoundaryDiskKVMode(cache: views, requested: kvMode),
+                    isStableBoundary: boundary.stable, isResumeBoundary: !boundary.stable, ownsSnapshot: true)
+            }
+            RuntimeReceipts.emit(
+                "store id=\(receiptRequestID) tokens=\(promptTokenIds.count + generatedTokenIds.count) result=skipped "
+                    + "reason=aligned_single_store boundaries=\(boundaries.map(\.rows))")
+            return
+        }
+
+        // A plain text KV prompt and its processor-declared history boundary
+        // differ only by the template's actual generation rail. Persist that
+        // common prefix once; an exact retry replays the rail instead of
+        // writing another full-context payload. Publication remains best
+        // effort and uses the existing writer/clear/failure contract.
+        let shorterPlainPrompt = Self.shorterPlainKVPromptCheckpoint(
+            coordinator: coordinator, promptTokenIds: promptTokenIds,
+            input: originalInput, parameters: cacheInitParameters,
+            hasAuxiliaryState: state != nil, hasCompiledForward: compiledForward != nil,
+            snapshot: promptCacheSnapshot)
+        if let selected = shorterPlainPrompt {
+            let tokens = Array(promptTokenIds.prefix(selected.boundary))
+            if !coordinator.hasDurableDiskEntry(
+                tokens: tokens, mediaSalt: cacheSaltPlan.salt(forBoundary: selected.boundary))
+            {
+                store(
+                    tokens: tokens, cache: selected.cache, kvBits: nil, kvMode: .none,
+                    isResumeBoundary: true, ownsSnapshot: true)
+            }
+        }
 
         if let promptCacheSnapshot {
             // Prompt-boundary disk entries must remain raw KV even when the
@@ -3388,12 +4246,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             let promptDiskKVMode = selectivePromptBoundaryDiskKVMode(
                 cache: promptCacheSnapshot,
                 requested: kvMode)
-            if !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
+            if shorterPlainPrompt == nil, !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
                 store(
                     tokens: promptTokenIds,
                     cache: promptCacheSnapshot,
                     kvBits: nil,
-                    kvMode: promptDiskKVMode)
+                    kvMode: promptDiskKVMode, ownsSnapshot: true)
             } else if isReusablePrefixWarmup, !shouldPersistExactWarmupPrompt {
                 Self.logger.info(
                     "TokenIterator: skipped exact recurrent warmup boundary; retaining processor-proven safe prefix seeds only"
@@ -3406,7 +4264,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     cacheRequiresDiskBackedCoordinatorRestore(storageTopologySnapshot ?? cache)
                 if !usesCanonicalHybridBoundary,
                    requiresDiskBackedRestore,
-                   !skipDiskBackedToolPromptSeedBoundary,
+                   !skipDiskBackedToolPromptSeedBoundary || cacheRestoreIsExactPrefix(storageTopologySnapshot ?? cache),
                    promptTokenIds.count > 1
                 {
                     // Reusable-prefix warmups publish this N-1 seed too —
@@ -3438,7 +4296,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: seedSnapshot,
-                                requested: kvMode))
+                                requested: kvMode), ownsSnapshot: true)
                     }
                 }
                 // Cross-turn reuse boundary for hybrid-SSM models (qwen3.5 /
@@ -3466,7 +4324,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // which means a boundary at least that long is already stored, and
                 // it is the one the next turn will match — or on cache topologies
                 // (DSV4's pool cache) that cannot hold this boundary at all.
-                if let stripAt = hybridStripBoundary {
+                if let stripAt = hybridStripBoundary, !hybridStripBoundarySpilled {
                     // NOTE: intentionally NOT gated on
                     // `!cachePrefixTokenCounts.contains(stripAt)`. For hybrid caches
                     // the history-boundary loop below calls `cacheSnapshotForBoundary`
@@ -3485,7 +4343,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: strippedSnapshot,
                                 requested: kvMode),
-                            isResumeBoundary: true)
+                            isResumeBoundary: true, ownsSnapshot: true)
                     } else {
                         Self.logger.debug(
                             "TokenIterator: no stripped-boundary snapshot to store at \(stripAt, privacy: .public); prefill did not cross the boundary"
@@ -3496,6 +4354,10 @@ public struct TokenIterator: TokenIteratorProtocol {
 
                 for boundary in Set(cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokenIds.count {
+                    // Already attempted above, including an in-flight or
+                    // refused publication. Do not turn failure into a second
+                    // write or claim a durable hit; later lookup may miss.
+                    if boundary == shorterPlainPrompt?.boundary { continue }
                     let isStableBoundary = originalInput
                         .cacheStablePrefixTokenCounts.contains(boundary)
                     if usesCanonicalHybridBoundary, !isStableBoundary {
@@ -3529,11 +4391,28 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // `rederive-failed ... CancellationError()`.
                     if coordinator.hasDurableDiskEntry(
                         tokens: boundaryTokens,
-                        mediaSalt: mediaSalt)
+                        mediaSalt: cacheSaltPlan.salt(forBoundary: boundaryTokens.count))
                     {
                         Self.logger.debug(
                             "TokenIterator: skipped already-durable cache boundary at \(boundary, privacy: .public) tokens (stable=\(isStableBoundary, privacy: .public))"
                         )
+                        continue
+                    }
+                    // A pool cache that captures its stable boundaries in prefill gets them there or not at all:
+                    // cut near the end of this prompt, or left to a later prompt that ends near them (far from
+                    // this end, or inside the prefix this request restored). A replay here would hold the answer
+                    // stream open for a whole prefix prefill, and on every later turn of the chat as well, since a
+                    // boundary nobody cut never becomes durable.
+                    if isStableBoundary, poolCacheCapturesBoundariesInPrefill,
+                       stableBoundarySnapshots[storeBoundary] == nil
+                    {
+                        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                            RuntimeDiagnostics.write(Data(
+                                ("[vmlx][cache/store-boundary] boundary=\(boundary) store=\(storeBoundary)"
+                                    + " stable=true not captured in prefill, left to a later prompt"
+                                    + " (cut far from the end: \(poolStableBoundariesLeftUncut.contains(storeBoundary)))\n")
+                                    .utf8))
+                        }
                         continue
                     }
                     let allowRederive = shouldForceStableBoundaryRederive(
@@ -3581,7 +4460,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                             + " allowRederive=\(allowRederive)"
                             + " snapshotTokens=\(storageSnapshotTokenCount)"
                             + " snapshot=\(snapshotState) captured=\(capturedSnapshot)\n"
-                        FileHandle.standardError.write(Data(boundaryMessage.utf8))
+                        RuntimeDiagnostics.write(Data(boundaryMessage.utf8))
                     }
                     if let boundarySnapshot = boundarySnapshotOrNil {
                         CacheFidelityTrace.dumpCache(
@@ -3601,13 +4480,23 @@ public struct TokenIterator: TokenIteratorProtocol {
                             // A message boundary that is not the shared root
                             // is what the next prompt of this chat (or an
                             // edited one) starts with.
-                            isResumeBoundary: !isStableBoundary)
+                            isResumeBoundary: !isStableBoundary, ownsSnapshot: true)
                     }
                 }
         }
 
-        guard !usesCanonicalHybridBoundary,
-            !isReusablePrefixWarmup,
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            RuntimeDiagnostics.write(Data(
+                ("[vmlx][cache/post-answer] gate include=\(includeGeneratedBoundary) "
+                    + "canonicalHybrid=\(usesCanonicalHybridBoundary) warmup=\(isReusablePrefixWarmup) "
+                    + "generated=\(generatedTokenIds.count) quantize=\(needsCacheQuantization)\n").utf8))
+        }
+        // The stripped checkpoint is a fallback for templates that rewrite
+        // assistant history. It must not prevent saving a completed answer:
+        // templates that preserve it can resume after a long generated reply.
+        // Fetch still requires an exact token prefix; incompatible renderings
+        // use the stripped checkpoint. Keep offset, stop and tool-call guards.
+        guard !isReusablePrefixWarmup,
             includeGeneratedBoundary, !generatedTokenIds.isEmpty
         else { return }
         // The original blanket refusal was written for affine
@@ -3622,6 +4511,16 @@ public struct TokenIterator: TokenIteratorProtocol {
             guard !hasSimpleKV else { return }
         }
         guard !containsUnprovenZayaTurboQuantDiskState(cache) else { return }
+        // Aligned prefill (MiniMax-M3): a restore never reuses rows past the producing request's store boundary
+        // (`AlignedPrefill.alignRestoredPrefix`: decoded rows and the final piece are not what a cold prefill makes), so
+        // a post-answer entry can serve at most the rows the prompt-boundary entry above already serves. Writing it cost
+        // a full copy of the live cache plus its disk write every turn (4.6 GiB at 35k tokens on M3.1).
+        if alignedPrefillPlan != nil, Self.alignedPostAnswerStoreSkipped {
+            RuntimeReceipts.emit(
+                "store id=\(receiptRequestID) tokens=\(promptTokenIds.count + generatedTokenIds.count) result=skipped "
+                    + "reason=aligned_post_answer_redundant")
+            return
+        }
         // The async decode pipeline forwards the consumed stop token while
         // computing the never-consumed next step, so at store time every
         // cache layer can legitimately sit ONE token past
@@ -3636,14 +4535,66 @@ public struct TokenIterator: TokenIteratorProtocol {
         let generatedBoundaryTokens = Self.generatedBoundaryTokensAligned(
             promptTokenIds: promptTokenIds,
             generatedTokenIds: generatedTokenIds,
-            cacheOffsets: cache.map(\.offset),
+            cacheOffsets: cacheBoundaryLeafOffsets(cache),
             pendingDrainedTokenId: lastForwardedTokenId)
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            RuntimeDiagnostics.write(Data(
+                ("[vmlx][cache/post-answer] prompt=\(promptTokenIds.count) generated=\(generatedTokenIds.count) "
+                    + "offsets=\(Array(Set(cacheBoundaryLeafOffsets(cache))).sorted()) "
+                    + "key=\(generatedBoundaryTokens.map { String($0.count) } ?? "nil")\n").utf8))
+        }
         guard let generatedBoundaryTokens else { return }
         // Whether the next prompt starts from this row depends on the
         // template; the cache learns that from the first hit on one.
         store(
             tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode,
             isPostAnswer: true)
+    }
+
+    /// Select only a real template rail backed by a matching, trim-safe plain
+    /// KV snapshot. No guessed suffix length or model-name eligibility.
+    static func shorterPlainKVPromptCheckpoint(
+        coordinator: CacheCoordinator,
+        promptTokenIds: [Int],
+        input: LMInput,
+        parameters: GenerateParameters?,
+        hasAuxiliaryState: Bool,
+        hasCompiledForward: Bool = false,
+        snapshot: [KVCache]?
+    ) -> (boundary: Int, cache: [KVCache])? {
+        guard coordinator.config.enableDiskCache, !coordinator.config.usePagedCache,
+            coordinator.canPersistBoundaries, !coordinator.isHybrid,
+            !coordinator.requiresRecurrentSSMCompanion, !coordinator.requiresPagedBoundaryCompanion,
+            !coordinator.isPagedIncompatible, !hasAuxiliaryState, !hasCompiledForward,
+            input.cachePromptIntent == .generation, input.cacheRestorePolicy == .standard,
+            input.canonicalRequiredToolContext == nil,
+            !input.hasMediaContent, !input.requiresPostPrepareCacheKey, input.text.mask == nil,
+            let parameters, parameters.draftStrategy == nil,
+            parameters.kvMode == .none, parameters.kvBits == nil,
+            let snapshot, !snapshot.isEmpty
+        else { return nil }
+        let suffix = coordinator.genPromptSuffixTokens
+        let boundary = promptTokenIds.count - suffix.count
+        guard !suffix.isEmpty, boundary > 0,
+            suffix.elementsEqual(promptTokenIds.suffix(suffix.count)),
+            input.cachePrefixTokenCounts.contains(boundary),
+            !input.cacheStablePrefixTokenCounts.contains(boundary),
+            snapshot.allSatisfy({ layer in
+                guard Swift.type(of: layer) == KVCacheSimple.self,
+                    layer.offset == promptTokenIds.count
+                else { return false }
+                let arrays = layer.state
+                return arrays.count == 2 && arrays.allSatisfy {
+                    $0.ndim == 4 && $0.dim(0) == 1 && $0.dim(2) == promptTokenIds.count
+                        && ($0.dtype == .float16 || $0.dtype == .bfloat16 || $0.dtype == .float32)
+                }
+            })
+        else { return nil }
+        let selected = snapshot.map { $0.copy() }
+        guard trimPromptCache(selected, numTokens: suffix.count) == suffix.count,
+            selected.allSatisfy({ $0.offset == boundary && $0.state.allSatisfy { $0.dim(2) == boundary } })
+        else { return nil }
+        return (boundary, selected)
     }
 
     /// Align the post-answer boundary key with what the cache actually
@@ -3679,16 +4630,25 @@ public struct TokenIterator: TokenIteratorProtocol {
         else {
             return nil
         }
+        // A snapshot of views (deferred prompt snapshot): its boundaries are views too, nothing is copied.
+        let snapshotIsViews = cacheIsPrefixViews(storageSnapshot)
         if tokens.count == storageSnapshotTokenCount {
+            if snapshotIsViews, let views = prefixViews(of: storageSnapshot, rows: tokens.count) { return views }
             return storageSnapshot.map { $0.copy() }
         }
+        guard let boundaryInput = originalInput.inputForCacheBoundary(
+            tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
+        let keepsMedia = !originalInput.hasMediaContent || boundaryInput.hasMediaContent
+        if keepsMedia, snapshotIsViews, let views = prefixViews(of: storageSnapshot, rows: tokens.count) {
+            return views
+        }
         let trimCount = storageSnapshotTokenCount - tokens.count
-        let trimmed = storageSnapshot.map { $0.copy() }
-        if canTrimPromptCache(trimmed),
-           trimPromptCache(trimmed, numTokens: trimCount) == trimCount
-        {
-            MLX.eval(trimmed)
-            return trimmed
+        if keepsMedia, canTrimPromptCache(storageSnapshot) {
+            let trimmed = storageSnapshot.map { $0.copy() }
+            if trimPromptCache(trimmed, numTokens: trimCount) == trimCount {
+                MLX.eval(trimmed)
+                return trimmed
+            }
         }
 
         if !allowDiskBackedRederive,
@@ -3706,20 +4666,49 @@ public struct TokenIterator: TokenIteratorProtocol {
             return nil
         }
 
+        let reconstructionStarted = canonicalStablePrefillCapture == nil
+            ? 0 : Date.timeIntervalSinceReferenceDate
+        var canonicalSeedUsed: Int?
+        var reconstructionSucceeded = false
+        defer {
+            if let seed = canonicalSeedUsed,
+               ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                let elapsed = Date.timeIntervalSinceReferenceDate - reconstructionStarted
+                RuntimeDiagnostics.write(Data(
+                    ("[vmlx][cache/canonical-residual] seed=\(seed) target=\(tokens.count)"
+                        + " residual_tokens=\(tokens.count - seed)"
+                        + " copy_and_forward_seconds=\(elapsed) success=\(reconstructionSucceeded)\n").utf8))
+            }
+        }
         do {
-            let boundaryTokens = MLXArray(tokens.map { Int32($0) })
-                .reshaped(1, tokens.count)
-            let boundaryInput = LMInput(
-                text: LMInput.Text(tokens: boundaryTokens),
-                image: originalInput.image,
-                video: originalInput.video,
-                audio: originalInput.audio,
-                mediaTokenIds: originalInput.mediaTokenIds,
-                cacheScopeSalt: originalInput.cacheScopeSalt)
-            let cache = model.newCache(parameters: cacheInitParameters)
+            if canonicalStablePrefillCapture != nil { try Task.checkCancellation() }
             let rederiveWindow = cacheInitParameters?.prefillStepSize ?? 512
+            let cache: [KVCache]
+            let replayInput: LMInput
+            if let capture = canonicalStablePrefillCapture,
+               let seed = capture.copySeed(for: tokens, salt: mediaSalt, chunkSize: rederiveWindow) {
+                cache = seed
+                canonicalSeedUsed = capture.seedCount
+                let remaining = Array(tokens.dropFirst(capture.seedCount))
+                if remaining.isEmpty {
+                    try Task.checkCancellation()
+                    reconstructionSucceeded = true
+                    return cache
+                }
+                // Preserve processor mask values; Qwen4Exp's current text
+                // prepare ignores this mask. This does not add padding support.
+                let residualMask = boundaryInput.text.mask.map {
+                    $0.reshaped(-1)[capture.seedCount...].reshaped(1, remaining.count)
+                }
+                replayInput = LMInput(
+                    tokens: MLXArray(remaining.map(Int32.init)).reshaped(1, remaining.count),
+                    mask: residualMask, tokenIds: remaining)
+            } else {
+                cache = model.newCache(parameters: cacheInitParameters)
+                replayInput = boundaryInput
+            }
             switch try model.prepare(
-                boundaryInput,
+                replayInput,
                 cache: cache,
                 windowSize: rederiveWindow)
             {
@@ -3736,6 +4725,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                 break
             }
             MLX.eval(cache)
+            if canonicalSeedUsed != nil { try Task.checkCancellation() }
+            reconstructionSucceeded = true
             return cache
         } catch {
             Self.logger.debug(
@@ -3745,7 +4736,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // This catch silently costs hybrid-SSM models every
                 // cross-conversation prefix hit (vmlx#219). At debug level the
                 // reason is unobservable on a real run, so surface it.
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/rederive-failed] tokens=\(tokens.count) "
                         + "error=\(String(describing: error))\n").utf8))
             }
@@ -3825,6 +4816,13 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters,
         numDraftTokens: Int
     ) throws {
+        guard parameters.jsonSchema == nil else {
+            throw GenerationFailure(
+                stage: .preparation,
+                cause:
+                    "Schema-constrained speculative decoding is not supported; use context-based autoregressive generation"
+            )
+        }
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
         self.y = input.text
@@ -4123,7 +5121,7 @@ private struct SynchronousGenerationLoopResult {
     let stopReason: GenerateStopReason
 }
 
-private func buildStopTokenIds(
+func buildStopTokenIds(
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer
 ) -> Set<Int> {
@@ -4253,6 +5251,13 @@ public func generate(
     input: LMInput, parameters: GenerateParameters, context: ModelContext,
     didGenerate: ([Int]) -> GenerateDisposition
 ) throws -> GenerateResult {
+    guard parameters.jsonSchema == nil else {
+        throw GenerationFailure(
+            stage: .preparation,
+            cause:
+                "Structured output requires the asynchronous generation API with terminal failure metadata"
+        )
+    }
     let iterator = try TokenIterator(
         input: input, model: context.model, parameters: parameters)
     return generate(
@@ -4315,6 +5320,13 @@ public func generate(
     input: LMInput, parameters: GenerateParameters, context: ModelContext,
     didGenerate: (Int) -> GenerateDisposition
 ) throws -> GenerateCompletionInfo {
+    guard parameters.jsonSchema == nil else {
+        throw GenerationFailure(
+            stage: .preparation,
+            cause:
+                "Structured output requires the asynchronous generation API with terminal failure metadata"
+        )
+    }
     let iterator = try TokenIterator(
         input: input, model: context.model, parameters: parameters)
     return generate(
@@ -4413,10 +5425,11 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> AsyncStream<Generation> {
+    try validateStructuredOutputRequest(input: input, parameters: parameters, context: context)
+    var parameters = parameters
+    if parameters.jsonSchema != nil { parameters.draftStrategy = nil }
     _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
-    context.jangPressRuntime.recordPromptTokenActivity(
-        input.text.tokens.reshaped(-1).asArray(Int.self))
 
     let promptTail = _decodePromptTail(
         input: input, tokenizer: context.tokenizer, tokens: 64)
@@ -4426,7 +5439,7 @@ public func generate(
     // model's own MTP head does not also run. Ordering here is the
     // backstop; hosts are expected to send only one strategy.
     if let strategy = parameters.draftStrategy, let drafterPath = strategy.dflash2DrafterPath,
-        DFlash2TokenIterator.unservableReason(parameters) == nil
+        DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
     {
         guard let dflashTarget = context.model as? any DFlash2Target else {
             throw DFlash2RuntimeError.drafterTargetMismatch(
@@ -4436,7 +5449,14 @@ public func generate(
         // Vocabulary agreement is checked inside the iterator against the
         // first real logits row rather than here: `vocabularySize` lives on
         // the per-family model protocols, which this module cannot see.
-        let drafter = try DFlash2DrafterResolver.shared.drafter(at: drafterPath)
+        guard let drafter = try DFlash2DrafterResolver.shared.optionalDrafter(at: drafterPath)
+        else {
+            var arParameters = parameters
+            arParameters.draftStrategy = nil
+            return try generate(
+                input: input, cache: cache, parameters: arParameters, context: context,
+                wiredMemoryTicket: wiredMemoryTicket, cacheCoordinator: cacheCoordinator)
+        }
         let iterator = try DFlash2TokenIterator(
             input: input,
             target: dflashTarget,
@@ -4458,7 +5478,7 @@ public func generate(
     }
     if let strategy = parameters.draftStrategy,
         case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
-        parameters.canUseNativeMTP(for: input)
+        parameters.canUseNativeMTP(for: input, model: context.model)
     {
         guard let nativeModel = context.model as? any NativeMTPModel else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
@@ -4531,7 +5551,9 @@ public func generate(
     }
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
-        cacheCoordinator: cacheCoordinator)
+        cacheCoordinator: cacheCoordinator, tokenizer: context.tokenizer,
+        stopTokenIDs: buildStopTokenIds(
+            modelConfiguration: context.configuration, tokenizer: context.tokenizer))
     let (stream, _) = generateTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -4599,8 +5621,6 @@ public func generate(
     numDraftTokens: Int = 2,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
-    context.jangPressRuntime.recordPromptTokenActivity(
-        input.text.tokens.reshaped(-1).asArray(Int.self))
 
     let iterator = try SpeculativeTokenIterator(
         input: input,
@@ -4682,15 +5702,20 @@ public func generateTask(
     toolSchemas: [ToolSpec]? = nil,
     parseChatMarkup: Bool = true
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
+    let structuredOutput = iterator.structuredOutputComplete != nil
     let effectivePromptTail =
         promptTail
         ?? _decodePromptTail(
             tokenIds: iterator.promptTokenIds, tokenizer: tokenizer, tokens: 64)
-    let effectiveStopStrings = mergeStopStrings(
-        extraStopStrings,
-        resolveStopSequences(
-            modelConfiguration: modelConfiguration,
-            tokenizer: tokenizer).textStopStrings)
+    let effectiveStopStrings =
+        structuredOutput
+        ? []
+        : mergeStopStrings(
+            extraStopStrings,
+            resolveStopSequences(
+                modelConfiguration: modelConfiguration,
+                tokenizer: tokenizer
+            ).textStopStrings)
 
     // Existing callers pass an already-constructed iterator (prefill ran at
     // construction time). Wrap it in a one-shot factory so it crosses into the
@@ -4710,7 +5735,8 @@ public func generateTask(
                 stampName: modelConfiguration.reasoningParserName,
                 promptTail: effectivePromptTail),
             stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings),
-            parseChatMarkup: parseChatMarkup
+            parseChatMarkup: parseChatMarkup,
+            structuredOutput: structuredOutput
         )
     )
 }
@@ -4732,17 +5758,22 @@ public func generateTaskDeferred(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     extraStopStrings: [String] = [],
     promptTail: String? = nil,
-    toolSchemas: [ToolSpec]? = nil
+    toolSchemas: [ToolSpec]? = nil,
+    structuredOutput: Bool = false
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     let effectivePromptTail =
         promptTail
         ?? _decodePromptTail(
             tokenIds: promptTokenIds, tokenizer: tokenizer, tokens: 64)
-    let effectiveStopStrings = mergeStopStrings(
-        extraStopStrings,
-        resolveStopSequences(
-            modelConfiguration: modelConfiguration,
-            tokenizer: tokenizer).textStopStrings)
+    let effectiveStopStrings =
+        structuredOutput
+        ? []
+        : mergeStopStrings(
+            extraStopStrings,
+            resolveStopSequences(
+                modelConfiguration: modelConfiguration,
+                tokenizer: tokenizer
+            ).textStopStrings)
 
     return generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -4757,7 +5788,8 @@ public func generateTaskDeferred(
             reasoningParser: ReasoningParser.forPrompt(
                 stampName: modelConfiguration.reasoningParserName,
                 promptTail: effectivePromptTail),
-            stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings)
+            stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings),
+            structuredOutput: structuredOutput
         )
     )
 }
@@ -4787,12 +5819,13 @@ public func generateTokens(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> AsyncStream<TokenGeneration> {
-    context.jangPressRuntime.recordPromptTokenActivity(
-        input.text.tokens.reshaped(-1).asArray(Int.self))
+    try validateStructuredOutputRequest(input: input, parameters: parameters, context: context)
 
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
-        cacheCoordinator: cacheCoordinator)
+        cacheCoordinator: cacheCoordinator, tokenizer: context.tokenizer,
+        stopTokenIDs: buildStopTokenIds(
+            modelConfiguration: context.configuration, tokenizer: context.tokenizer))
     let (stream, _) = generateTokenTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -4832,8 +5865,6 @@ public func generateTokens(
     numDraftTokens: Int = 2,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
-    context.jangPressRuntime.recordPromptTokenActivity(
-        input.text.tokens.reshaped(-1).asArray(Int.self))
 
     let iterator = try SpeculativeTokenIterator(
         input: input,
@@ -4882,20 +5913,29 @@ public func generateTokensTask(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
-    context.jangPressRuntime.recordPromptTokenActivity(
-        input.text.tokens.reshaped(-1).asArray(Int.self))
+    try validateStructuredOutputRequest(input: input, parameters: parameters, context: context)
+    var parameters = parameters
+    if parameters.jsonSchema != nil { parameters.draftStrategy = nil }
 
     // Same ordering rule as `generate`: a selected DFlash 2 drafter
     // replaces native MTP rather than stacking with it.
     if let strategy = parameters.draftStrategy, let drafterPath = strategy.dflash2DrafterPath,
-        DFlash2TokenIterator.unservableReason(parameters) == nil
+        DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
     {
         guard let dflashTarget = context.model as? any DFlash2Target else {
             throw DFlash2RuntimeError.drafterTargetMismatch(
                 "\(type(of: context.model)) does not expose per-layer hidden states and a shared LM head"
             )
         }
-        let drafter = try DFlash2DrafterResolver.shared.drafter(at: drafterPath)
+        guard let drafter = try DFlash2DrafterResolver.shared.optionalDrafter(at: drafterPath)
+        else {
+            var arParameters = parameters
+            arParameters.draftStrategy = nil
+            return try generateTokensTask(
+                input: input, cache: cache, parameters: arParameters, context: context,
+                includeStopToken: includeStopToken, wiredMemoryTicket: wiredMemoryTicket,
+                cacheCoordinator: cacheCoordinator)
+        }
         let iterator = try DFlash2TokenIterator(
             input: input,
             target: dflashTarget,
@@ -4914,7 +5954,7 @@ public func generateTokensTask(
     }
     if let strategy = parameters.draftStrategy,
         case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
-        parameters.canUseNativeMTP(for: input)
+        parameters.canUseNativeMTP(for: input, model: context.model)
     {
         guard let nativeModel = context.model as? any NativeMTPModel else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
@@ -4937,7 +5977,9 @@ public func generateTokensTask(
 
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
-        cacheCoordinator: cacheCoordinator)
+        cacheCoordinator: cacheCoordinator, tokenizer: context.tokenizer,
+        stopTokenIDs: buildStopTokenIds(
+            modelConfiguration: context.configuration, tokenizer: context.tokenizer))
     return generateTokenTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -5017,8 +6059,15 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             // returned (which happens when the iterator — and therefore the
             // whole prompt prefill — is built eagerly before the loop task).
             var iterator: any TokenIteratorProtocol
+            let receiptID = RuntimeReceipts.isEnabled ? RuntimeReceipts.nextRequestID() : 0
+            // Collect only errors escaping this operation's scoped handlers.
+            // A process-wide counter also sees unrelated requests and probes
+            // whose owners caught their errors and selected a valid fallback.
             do {
-                iterator = try makeIterator.consume()()
+                let make = makeIterator.consume()
+                iterator = try RuntimeReceipts.$currentRequestID.withValue(receiptID) {
+                    try MLX.withError { try make() }
+                }
             } catch is CancellationError {
                 // Client disconnected while the prompt was still prefilling —
                 // the chunked prepare loops bail between chunks. Not an error;
@@ -5054,14 +6103,18 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 // closing the stream (see the CancellationError branch above).
                 StreamOrDevice.default.stream.synchronize()
                 handler.onGenerationEnd(emit: continuation.yield)
-                _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
-                    promptTokenCount: promptTokenCount,
-                    generationTokenCount: 0,
-                    promptTime: 0,
-                    generationTime: 0,
-                    stopReason: .cancelled,
-                    toolCallProtocolFailure: handler.toolCallProtocolFailure
-                )))
+                _ = continuation.yield(
+                    handler.infoEvent(
+                        GenerateCompletionInfo(
+                            promptTokenCount: promptTokenCount,
+                            generationTokenCount: 0,
+                            promptTime: 0,
+                            generationTime: 0,
+                            stopReason: .cancelled,
+                            toolCallProtocolFailure: handler.toolCallProtocolFailure,
+                            generationFailure: GenerationFailure(
+                                stage: .preparation, cause: error.localizedDescription)
+                        )))
                 continuation.finish()
                 return
             }
@@ -5071,13 +6124,29 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             var tokenCount = 0
             var generatedTokenIds: [Int] = []
             var stopReason: GenerateStopReason?
+            var decodeFailure: GenerationFailure?
 
             let stopTokenIds = buildStopTokenIds(
                 modelConfiguration: modelConfiguration,
                 tokenizer: tokenizer
             )
 
-            while let token = iterator.next() {
+            // The prompt is resident now; keep MLX's scheduling limit above it (SchedulingMemoryFloor).
+            SchedulingMemoryFloor.observe()
+            while true {
+                let nextToken: Int?
+                SchedulingMemoryFloor.observe()
+                do {
+                    nextToken = try MLX.withError { iterator.next() }
+                } catch {
+                    decodeFailure = GenerationFailure(
+                        stage: .decoding, cause: "MLX error during decode: \(error.localizedDescription)")
+                    stopReason = .cancelled
+                    streamTiming?.recordTermination("mlx_error")
+                    break
+                }
+                guard let token = nextToken else { break }
+
                 // Check for cancellation on every loop iteration. A consumer
                 // that stops after the handler surfaced a parsed tool call is
                 // not abandoning the turn — the dispatched tool defines its
@@ -5119,7 +6188,6 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 if !handler.onToken(token, emit: continuation.yield) {
                     streamTiming?.recordTermination(
                         handler.stopSequenceHit ? "stop_sequence"
-                        : handler.haltedOnRepetition ? "repetition_detector"
                         : handler.emittedToolCall ? "tool_call" : "consumer_terminated")
                     // Distinguish "downstream consumer terminated the
                     // stream" from "library-internal stop-sequence
@@ -5128,13 +6196,14 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     // after an emitted tool call is likewise a natural
                     // `.stop`: the dispatched tool ends the turn.
                     stopReason =
-                        (handler.stopSequenceHit || handler.haltedOnRepetition
-                            || handler.emittedToolCall)
+                        (handler.stopSequenceHit || handler.emittedToolCall)
                         ? .stop : .cancelled
                     break
                 }
                 generatedTokenIds.append(token)
             }
+
+
 
             if stopReason == nil {
                 if Task.isCancelled {
@@ -5188,9 +6257,32 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 turboQuantCacheTransition: iterator.lastTurboQuantCacheTransition,
                 unclosedReasoning: unclosedReasoning,
                 nativeMTPStats: iterator.nativeMTPStats,
-                toolCallProtocolFailure: handler.toolCallProtocolFailure
+                dflash2Stats: iterator.dflash2GenerationStats,
+                toolCallProtocolFailure: handler.toolCallProtocolFailure,
+                generationFailure: iterator.generationFailure
+                    ?? decodeFailure
+                    ?? (iterator.structuredOutputComplete != nil
+                        && (stopReason != .stop || iterator.structuredOutputComplete != true)
+                        ? GenerationFailure(
+                            stage: .decoding,
+                            cause: "Structured output stopped before its schema was complete")
+                        : nil)
             )
             _ = continuation.yield(handler.infoEvent(info))
+            if RuntimeReceipts.isEnabled {
+                let prefillSeconds = info.promptTime
+                RuntimeReceipts.emit(
+                    "done id=\(receiptID) prompt=\(promptTokenCount) "
+                        + "prefill_s=\(String(format: "%.2f", prefillSeconds)) "
+                        + "pp_s=\(String(format: "%.1f", prefillSeconds > 0 ? Double(promptTokenCount) / prefillSeconds : 0)) "
+                        + "generated=\(tokenCount) "
+                        + "decode_tok_s=\(String(format: "%.2f", generateTime > 0 ? Double(max(0, tokenCount - 1)) / generateTime : 0)) "
+                        + "stop=\(String(describing: info.stopReason)) "
+                        + "mlx_active_gib=\(RuntimeReceipts.gib(MLX.Memory.activeMemory)) "
+                        + "mlx_peak_gib=\(RuntimeReceipts.gib(MLX.Memory.peakMemory)) "
+                        + "memory_limit_gib=\(RuntimeReceipts.gib(MLX.Memory.memoryLimit)) "
+                        + "floor_raises=\(SchedulingMemoryFloor.raises)")
+            }
 
             // Post-completion cleanup, still on the request path so the
             // stream does not FINISH until it is done. Timed to split
@@ -5205,25 +6297,19 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             iterator.storeCacheAfterGeneration(
                 generatedTokenIds: generatedTokenIds,
                 includeGeneratedBoundary: stopReason == .stop
+                    && info.generationFailure == nil
                     && !handler.stopSequenceHit
                     && !handler.emittedToolCall)
             let tailT2 = Date()
             StreamOrDevice.default.stream.synchronize()
             let tailT3 = Date()
 
-            // Router-advice readback runs on its own Dispatch queue. Drain it
-            // after MLX synchronization so short-lived CLI runs and app unload
-            // paths do not tear down runtime state while the advisor is still
-            // applying mmap page advice.
-            MLXPressCanonicalExpertAdvisor.shared.waitUntilIdle()
             if genTailTrace {
-                let tailT4 = Date()
                 print(
                     "[vmlx][gen/tail] infoEmitted=early"
                         + " drain1=\(tailT1.timeIntervalSince(tailT0))s"
                         + " store=\(tailT2.timeIntervalSince(tailT1))s"
-                        + " drain2=\(tailT3.timeIntervalSince(tailT2))s"
-                        + " advisor=\(tailT4.timeIntervalSince(tailT3))s")
+                        + " drain2=\(tailT3.timeIntervalSince(tailT2))s")
             }
 
             // Finalize the stream — the serialization point for the next
@@ -5337,6 +6423,16 @@ public struct GenerateCompletionInfo: Sendable {
     /// native-MTP iterator.
     public let nativeMTPStats: NativeMTPGenerationStats?
 
+    /// DFlash 2 / DSpark lane counters (acceptance length, cycles per verify width). `nil` for any generation that did
+    /// not run that lane.
+    public let dflash2Stats: DFlash2GenerationStats?
+
+    /// An originating runtime failure, distinct from explicit cancellation.
+    /// Consumers must surface this error rather than treating the terminal
+    /// metadata as a successful or user-cancelled completion. The legacy stop
+    /// reason remains cancelled for source compatibility with older consumers.
+    public let generationFailure: GenerationFailure?
+
     /// The number of tokens processed per second during the prompt phase.
     ///
     /// Zero when the phase did not measurably run. `promptTime` is legitimately
@@ -5368,7 +6464,9 @@ public struct GenerateCompletionInfo: Sendable {
         turboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? = nil,
         unclosedReasoning: Bool = false,
         nativeMTPStats: NativeMTPGenerationStats? = nil,
-        toolCallProtocolFailure: ToolCallProtocolFailure? = nil
+        dflash2Stats: DFlash2GenerationStats? = nil,
+        toolCallProtocolFailure: ToolCallProtocolFailure? = nil,
+        generationFailure: GenerationFailure? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
@@ -5380,6 +6478,8 @@ public struct GenerateCompletionInfo: Sendable {
         self.unclosedReasoning = unclosedReasoning
         self.toolCallProtocolFailure = toolCallProtocolFailure
         self.nativeMTPStats = nativeMTPStats
+        self.dflash2Stats = dflash2Stats
+        self.generationFailure = generationFailure
     }
 
     public func summary() -> String {
@@ -5646,15 +6746,6 @@ private protocol TokenLoopHandler: Sendable {
     /// text (e.g., the raw-token handler).
     var stopSequenceHit: Bool { get }
 
-    /// True when the last `onToken` returned false because the degenerate-
-    /// repetition guard fired. Reported like a stop sequence — `.stop`, not
-    /// `.cancelled` — because it is a deliberate library-internal halt, not a
-    /// consumer abort. Without this the collapse the guard exists to bound
-    /// still ends the turn, but arrives indistinguishable from the user
-    /// pressing stop, which is precisely the "no usable stop reason" symptom
-    /// that motivated the guard.
-    var haltedOnRepetition: Bool { get }
-
     /// True when the handler is still inside a reasoning envelope before
     /// terminal flush. Must be snapshotted before `onGenerationEnd`, because
     /// flushing drains and closes parser state.
@@ -5673,7 +6764,6 @@ private protocol TokenLoopHandler: Sendable {
 
 extension TokenLoopHandler {
     var stopSequenceHit: Bool { false }
-    var haltedOnRepetition: Bool { false }
     var unclosedReasoning: Bool { false }
     var emittedToolCall: Bool { false }
     var toolCallProtocolFailure: ToolCallProtocolFailure? { nil }
@@ -5713,17 +6803,9 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     /// `onToken` returns false to halt the loop; the `.info` event
     /// reports `stopReason = .stop`.
     var stopStringMatcher: StopStringMatcher
-    /// Degenerate-repetition guard. Sees the same visible text as the stop
-    /// matcher and halts the loop when the tail collapses into a verbatim
-    /// cycle, so a model stuck repeating itself cannot spend the whole token
-    /// budget and finish with no stop reason at all.
-    var repetitionDetector: RepetitionCycleDetector = .fromEnvironment()
     /// Flipped by `dispatch` when the stop matcher fires, so the loop
     /// task can signal `.stop` in its terminal `.info` event.
     private(set) var stopSequenceHit: Bool = false
-    /// The cycle that halted generation, when the repetition guard fired.
-    private(set) var repetitionCycle: RepetitionCycleDetector.Cycle?
-    var haltedOnRepetition: Bool { repetitionCycle != nil }
     private(set) var emittedToolCall: Bool = false
 
     init(
@@ -5732,7 +6814,8 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         tools: [[String: any Sendable]]? = nil,
         reasoningParser: ReasoningParser? = nil,
         stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: []),
-        parseChatMarkup: Bool = true
+        parseChatMarkup: Bool = true,
+        structuredOutput: Bool = false
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         let activeTools = tools?.isEmpty == false ? tools : nil
@@ -5742,15 +6825,19 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         // whose tool schema rides in the system prompt sends an empty `tools`
         // field — and without a processor the raw `<|tool_call>…<tool_call|>`
         // envelope leaks verbatim into visible text. Mirrors BatchEngine.
-        if parseChatMarkup, let activeTools {
+        if structuredOutput || !parseChatMarkup {
+            toolCallProcessor = nil
+        } else if let activeTools {
             toolCallProcessor = ToolCallProcessor(format: format, tools: activeTools)
         } else if parseChatMarkup, format.hasTaggedToolMarkers {
             toolCallProcessor = ToolCallProcessor(format: format, tools: nil, stripOnly: true)
         } else {
             toolCallProcessor = nil
         }
-        self.reasoningParser = parseChatMarkup ? reasoningParser : nil
-        self.stopStringMatcher = stopStringMatcher
+        self.reasoningParser = parseChatMarkup && !structuredOutput ? reasoningParser : nil
+        // Grammar-approved EOS, not a substring inside JSON, ends structured output.
+        self.stopStringMatcher =
+            structuredOutput ? StopStringMatcher(stopStrings: []) : stopStringMatcher
     }
 
     /// Feed a raw decoded chunk through the reasoning parser (if any) and
@@ -5966,33 +7053,18 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> AsyncStream<Generation>.Continuation.YieldResult {
         guard stopStringMatcher.isEnabled else {
-            let result = emit(.chunk(text))
-            return haltingOnRepetition(text, otherwise: result)
+            return emit(.chunk(text))
         }
         switch stopStringMatcher.feed(text) {
         case .streaming(let out):
             if out.isEmpty { return .enqueued(remaining: 0) }
-            let result = emit(.chunk(out))
-            return haltingOnRepetition(out, otherwise: result)
+            return emit(.chunk(out))
         case .stopped(let out):
             stopSequenceHit = true
             if out.isEmpty { return .terminated }
             _ = emit(.chunk(out))
             return .terminated
         }
-    }
-
-    /// Feed already-emitted visible text to the repetition guard and convert a
-    /// detected cycle into loop termination. Text is emitted first and never
-    /// withheld: the guard bounds how much more arrives, it does not edit what
-    /// already did.
-    private mutating func haltingOnRepetition(
-        _ emitted: String,
-        otherwise result: AsyncStream<Generation>.Continuation.YieldResult
-    ) -> AsyncStream<Generation>.Continuation.YieldResult {
-        guard let cycle = repetitionDetector.feed(emitted) else { return result }
-        repetitionCycle = cycle
-        return .terminated
     }
 
     func infoEvent(_ info: GenerateCompletionInfo) -> Generation {
@@ -6068,4 +7140,16 @@ internal func _decodePromptTail(
     guard !tokenIds.isEmpty else { return nil }
     let tail = Array(tokenIds.suffix(max(1, tokens)))
     return tokenizer.decode(tokenIds: tail, skipSpecialTokens: false)
+}
+
+/// A native-MTP model whose prefill runs the VLM path and whose native forwards (bridge, AR,
+/// verify, draft seed) continue at the media-shifted M-RoPE positions — so a request carrying
+/// images/video can speculate after its media prefill instead of decoding plain AR.
+public protocol NativeMTPMediaCapable {}
+
+public enum NativeMTPMediaPolicy {
+    public static func allows(model: Any?) -> Bool {
+        model is NativeMTPMediaCapable
+            && ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_MEDIA"] != "0"
+    }
 }

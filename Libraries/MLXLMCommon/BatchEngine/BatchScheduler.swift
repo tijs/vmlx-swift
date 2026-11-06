@@ -79,10 +79,20 @@ struct BatchSlot {
     /// not the live decode cache, because coordinator keys are prompt-only.
     var promptCacheSnapshot: [KVCache]?
 
+    /// Aligned prefill (`AlignedPrefillPrefix.swift`): this request's absolute chunk cuts and store boundary (MiniMax-M3);
+    /// nil for every other model.
+    var alignedPrefillPlan: AlignedPrefillPlan?
+    var appendOnlyPromptCheckpoint: AppendOnlyPromptCheckpoint?
+    var appendOnlyDiskSeed: AppendOnlyPromptCheckpoint?
+
     /// Exact prompt-minus-one cache state captured during prefill for typed
     /// disk-only topologies (currently DSV4 SWA + compressor/indexer pools)
     /// that cannot be losslessly trimmed after their rotating window wraps.
     var diskSeedSnapshot: [KVCache]?
+
+    /// The exact N-1 boundary was accepted by the disk coordinator during
+    /// prefill. Keep only this receipt, not a second full cache through decode.
+    var prefillStoredDiskSeed = false
 
     /// Sealed, already-computed chunk boundary for this request's rotating
     /// finalization replay. Bounded to one snapshot and cleared at completion.
@@ -158,6 +168,16 @@ struct BatchSlot {
     /// traffic can cache-hit without colliding with other modes/media.
     let mediaSalt: String?
 
+    /// Per-boundary salts (``CacheBoundarySaltPlan``), set once the prefill
+    /// lookup token space is known. Nil until then: every boundary uses
+    /// `mediaSalt`.
+    var cacheSaltPlan: CacheBoundarySaltPlan? = nil
+
+    /// The salt a prompt boundary of `tokenCount` tokens is keyed under.
+    func cacheSalt(forBoundary tokenCount: Int) -> String? {
+        cacheSaltPlan?.salt(forBoundary: tokenCount) ?? mediaSalt
+    }
+
     /// Compiled forward closure captured when this slot's cache is promoted
     /// to `CompilableKVCache` layers. Stage 1B.3 sets this for the solo
     /// slot in a `maxBatchSize == 1` engine when
@@ -185,16 +205,23 @@ struct BatchSlot {
     /// Sample a token from logits, applying processor and sampler.
     ///
     /// Returns the sampled token as an `MLXArray` scalar.
-    mutating func sampleToken(from logits: MLXArray) -> MLXArray {
+    mutating func sampleToken(from logits: MLXArray) throws -> MLXArray {
         // Diagnostic only: the raw `[1, V]` row before any processor rewrite.
         let rawRow = nanTrace != nil ? logits : nil
         var logits = logits
         let token: MLXArray
         if var proc = processor {
             logits = proc.process(logits: logits)
+            if let failure = (proc as? any ConstraintFailureReporting)?.constraintFailure {
+                self.processor = proc
+                throw failure
+            }
             token = sampler.sample(logits: logits)
             proc.didSample(token: token)
             self.processor = proc
+            if let failure = (proc as? any ConstraintFailureReporting)?.constraintFailure {
+                throw failure
+            }
         } else {
             token = sampler.sample(logits: logits)
         }
@@ -216,15 +243,17 @@ extension BatchSlot {
     ///   - request: The pending request to activate.
     ///   - cache: Per-layer KV caches allocated by the model's `newCache()`.
     ///   - stopTokenIDs: Set of EOS token IDs for this model.
-    init(from request: BatchPendingRequest, cache: [KVCache], stopTokenIDs: Set<Int>) {
+    init(from request: BatchPendingRequest, cache: [KVCache], stopTokenIDs: Set<Int>,
+         model: (any LanguageModel)? = nil) {
         self.id = request.id
         self.continuation = request.continuation
         self.parameters = request.parameters
         self.sampler = request.parameters.sampler()
         self.processor = request.parameters.processor()
         self.stopTokenIDs = stopTokenIDs
-        self.maxTokens = MetalLiveBufferGuard.clampedMaxTokens(
+        MetalLiveBufferGuard.reportProjectedBufferPressure(
             requested: request.parameters.maxTokens, cache: cache)
+        self.maxTokens = request.parameters.maxTokens
         self.cache = cache
         self.promptCacheSnapshot = nil
         self.diskSeedSnapshot = nil
@@ -241,7 +270,7 @@ extension BatchSlot {
         self.promptTokenCount = request.input.text.tokens.size
         self.prefillStartTime = Date()
         self.prefillStepSize = request.parameters.prefillStepSize
-        self.mediaSalt = computeCacheSalt(for: request.input, parameters: request.parameters)
+        self.mediaSalt = computeCacheSalt(for: request.input, parameters: request.parameters, model: model)
         self.compiledForward = nil
     }
 }

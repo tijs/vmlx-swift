@@ -30,6 +30,10 @@ public struct BaseConfiguration: Codable, Sendable {
 
         public var asTuple: (Int, Int, QuantizationMode) { (groupSize, bits, mode) }
 
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.groupSize == rhs.groupSize && lhs.bits == rhs.bits && lhs.mode == rhs.mode
+        }
+
         enum CodingKeys: String, CodingKey {
             case groupSize = "group_size"
             case bits = "bits"
@@ -40,38 +44,44 @@ public struct BaseConfiguration: Codable, Sendable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.groupSize = try container.decode(Int.self, forKey: .groupSize)
             self.bits = try container.decode(Int.self, forKey: .bits)
-            if let rawMode = try container.decodeIfPresent(String.self, forKey: ._mode) {
-                let normalized = rawMode.lowercased()
-                if let mode = QuantizationMode(rawValue: normalized) {
-                    self._mode = mode
-                } else if normalized == "affine+mxtq" || normalized == "affine_mxtq" {
-                    // JANG VL bundles use this composite marker to say
-                    // non-routed affine weights plus MXTQ routed-expert
-                    // sidecars. BaseConfiguration only needs the ordinary
-                    // affine fallback; JangLoader consumes the MXTQ sidecar
-                    // metadata separately.
-                    self._mode = .affine
-                } else {
-                    throw DecodingError.dataCorruptedError(
-                        forKey: ._mode,
-                        in: container,
-                        debugDescription:
-                            "Cannot initialize QuantizationMode from invalid String value \(rawMode)")
-                }
-            } else {
-                self._mode = nil
+            self._mode = try Self.decodeMode(from: container)
+        }
+
+        fileprivate static func decodeMode(
+            from container: KeyedDecodingContainer<CodingKeys>
+        ) throws -> QuantizationMode? {
+            guard let rawMode = try container.decodeIfPresent(String.self, forKey: ._mode) else {
+                return nil
             }
+            let normalized = rawMode.lowercased()
+            if let mode = QuantizationMode(rawValue: normalized) {
+                return mode
+            }
+            // Composite markers describe affine weights plus separately handled MXTQ sidecars.
+            if normalized == "affine+mxtq" || normalized == "affine_mxtq" {
+                return .affine
+            }
+            throw DecodingError.dataCorruptedError(
+                forKey: ._mode,
+                in: container,
+                debugDescription:
+                    "Unsupported quantization mode '\(rawMode)'; explicit modes cannot fall back to affine.")
         }
     }
 
     /// handling instructions for ``PerLayerQuantization``
-    public enum QuantizationOption: Sendable {
+    public enum QuantizationOption: Sendable, Equatable {
         case skip
         case quantize(Quantization)
+        /// A module stored in a weight format MLX's quantizer does not express, named by its `mode` (e.g. JANGT
+        /// trellis experts: `{"mode": "jangt", "kbits": 1.5}`). Only that format's loader can build the module (a
+        /// factory's format preparation replaces these entries before construction); generic code treats it as no
+        /// MLX quantization, so an unprepared load fails loudly at weight binding instead of guessing a width.
+        case formatOwned(mode: String)
     }
 
     /// Per-layer ``Quantization`` values with optional default.
-    public struct PerLayerQuantization: Sendable {
+    public struct PerLayerQuantization: Sendable, Equatable {
         public var quantization: Quantization? = nil
         public var perLayerQuantization: [String: QuantizationOption]
 
@@ -122,7 +132,7 @@ public struct BaseConfiguration: Codable, Sendable {
         public func quantization(layer: String) -> Quantization? {
             if let perLayer = explicitQuantizationOption(layer: layer) {
                 switch perLayer {
-                case .skip:
+                case .skip, .formatOwned:
                     return nil
                 case .quantize(let quantization):
                     return quantization
@@ -143,6 +153,23 @@ public struct BaseConfiguration: Codable, Sendable {
 
             func addWithAttentionAlias(_ value: String) {
                 add(value)
+
+                // Qwen4Exp.sanitize splits the checkpoint MTP gate/up bank
+                // and renames its down bank. Keep their explicit quantization
+                // through that structural transformation; otherwise all three
+                // leaves fall through to the unrelated top-level default.
+                var bare = value
+                if bare.hasPrefix("language_model.") { bare.removeFirst("language_model.".count) }
+                if bare.hasPrefix("model.") { bare.removeFirst("model.".count) }
+                if bare.hasPrefix("mtp.layers.") {
+                    for (runtimeName, checkpointName) in [
+                        (".mlp.switch_mlp.gate_proj", ".mlp.experts.gate_up_proj"),
+                        (".mlp.switch_mlp.up_proj", ".mlp.experts.gate_up_proj"),
+                        (".mlp.switch_mlp.down_proj", ".mlp.experts.down_proj"),
+                    ] where value.hasSuffix(runtimeName) {
+                        add(value.replacingOccurrences(of: runtimeName, with: checkpointName))
+                    }
+                }
 
                 // DeepseekV4Model.sanitize structurally renames the dense
                 // shared expert's w1/w2/w3 checkpoint leaves to the runtime's
@@ -225,7 +252,7 @@ public struct BaseConfiguration: Codable, Sendable {
     /// ```
     ///
     /// This mixed type structure requires manual decoding.
-    public struct QuantizationContainer: Codable, Sendable {
+    public struct QuantizationContainer: Codable, Sendable, Equatable {
         public var quantization: Quantization
         public var perLayerQuantization: PerLayerQuantization
 
@@ -298,11 +325,10 @@ public struct BaseConfiguration: Codable, Sendable {
                     let nested = try container.nestedContainer(
                         keyedBy: _DictionaryCodingKey.self, forKey: key)
                     for layerKey in nested.allKeys {
-                        perLayerQuantization[layerKey.stringValue] = .quantize(
-                            try Self.decodeLayerQuantization(
-                                from: nested,
-                                key: layerKey,
-                                defaultGroupSize: quantization.groupSize))
+                        perLayerQuantization[layerKey.stringValue] = try Self.decodeLayerQuantization(
+                            from: nested,
+                            key: layerKey,
+                            defaultGroupSize: quantization.groupSize)
                     }
                     continue
 
@@ -319,11 +345,10 @@ public struct BaseConfiguration: Codable, Sendable {
                         // layer quantization.
                         continue
                     } else {
-                        perLayerQuantization[key.stringValue] = .quantize(
-                            try Self.decodeLayerQuantization(
-                                from: container,
-                                key: key,
-                                defaultGroupSize: quantization.groupSize))
+                        perLayerQuantization[key.stringValue] = try Self.decodeLayerQuantization(
+                            from: container,
+                            key: key,
+                            defaultGroupSize: quantization.groupSize)
                     }
                 }
             }
@@ -331,13 +356,39 @@ public struct BaseConfiguration: Codable, Sendable {
                 quantization: quantization, perLayerQuantization: perLayerQuantization)
         }
 
+        /// One per-module entry. A `mode` that is not an MLX quantization mode and comes without `bits` names a
+        /// custom weight format (`.formatOwned`, e.g. JANGT); an MLX microscaling mode without `bits` / `group_size`
+        /// takes that mode's fixed geometry (mxfp8 8 / 32, mxfp4 4 / 32, nvfp4 4 / 16); an affine entry without
+        /// `group_size` takes the top-level one. Anything else still has to decode as a full ``Quantization``.
         private static func decodeLayerQuantization(
             from container: KeyedDecodingContainer<_DictionaryCodingKey>,
             key: _DictionaryCodingKey,
             defaultGroupSize: Int
-        ) throws -> Quantization {
+        ) throws -> QuantizationOption {
+            if let entry = try? container.nestedContainer(keyedBy: Quantization.CodingKeys.self, forKey: key),
+                !entry.contains(.bits), let rawMode = try? entry.decode(String.self, forKey: ._mode)
+            {
+                switch QuantizationMode(rawValue: rawMode.lowercased()) {
+                case nil:
+                    return .formatOwned(mode: rawMode)
+                case .mxfp8?:
+                    return .quantize(
+                        Quantization(
+                            groupSize: (try? entry.decode(Int.self, forKey: .groupSize)) ?? 32, bits: 8, mode: .mxfp8))
+                case .mxfp4?:
+                    return .quantize(
+                        Quantization(
+                            groupSize: (try? entry.decode(Int.self, forKey: .groupSize)) ?? 32, bits: 4, mode: .mxfp4))
+                case .nvfp4?:
+                    return .quantize(
+                        Quantization(
+                            groupSize: (try? entry.decode(Int.self, forKey: .groupSize)) ?? 16, bits: 4, mode: .nvfp4))
+                case .affine?:
+                    break  // affine has no fixed width: `bits` is required (the decode below reports it)
+                }
+            }
             do {
-                return try container.decode(Quantization.self, forKey: key)
+                return .quantize(try container.decode(Quantization.self, forKey: key))
             } catch DecodingError.keyNotFound(let missing, _)
                 where missing.stringValue == Quantization.CodingKeys.groupSize.rawValue
             {
@@ -345,15 +396,9 @@ public struct BaseConfiguration: Codable, Sendable {
                     keyedBy: Quantization.CodingKeys.self,
                     forKey: key)
                 let bits = try nested.decode(Int.self, forKey: .bits)
-                let mode = try nested.decodeIfPresent(String.self, forKey: ._mode)
-                    .flatMap { QuantizationMode(rawValue: $0.lowercased()) }
-                    ?? quantizationModeDefaultForLayerOverride()
-                return Quantization(groupSize: defaultGroupSize, bits: bits, mode: mode)
+                let mode = try Quantization.decodeMode(from: nested) ?? .affine
+                return .quantize(Quantization(groupSize: defaultGroupSize, bits: bits, mode: mode))
             }
-        }
-
-        private static func quantizationModeDefaultForLayerOverride() -> QuantizationMode {
-            .affine
         }
 
         private static func isScalarMetadata(
@@ -377,6 +422,9 @@ public struct BaseConfiguration: Codable, Sendable {
                     try container.encode(false, forKey: .init(stringValue: key))
                 case .quantize(let q):
                     try container.encode(q, forKey: .init(stringValue: key))
+                case .formatOwned(let mode):
+                    // The format's own fields (e.g. JANGT `kbits`) belong to its loader; only the mode is kept.
+                    try container.encode(["mode": mode], forKey: .init(stringValue: key))
                 }
             }
         }
@@ -424,59 +472,75 @@ public struct BaseConfiguration: Codable, Sendable {
         quantizationContainer?.perLayerQuantization
     }
 
+    private enum QuantizationAliasKeys: String, CodingKey {
+        case method = "quant_method"
+        case bits
+        case groupSize = "group_size"
+    }
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case quantizationContainer = "quantization"
-        case quantizationConfigContainer = "quantization_config"
+        case quantizationConfigAlias = "quantization_config"
         case eosTokenIds = "eos_token_id"
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+
         self.modelType = try container.decode(String.self, forKey: .modelType)
-        self.eosTokenIds = try container.decodeIfPresent(
-            IntOrIntArray.self, forKey: .eosTokenIds)
-        self.quantizationContainer = try Self.decodeQuantizationContainer(from: container)
-    }
+        self.eosTokenIds = try container.decodeIfPresent(IntOrIntArray.self, forKey: .eosTokenIds)
 
-    /// Resolve the quantization map whether the checkpoint spells it
-    /// `quantization` (the historical mlx-swift name) or
-    /// `quantization_config` (the Hugging Face config.json name, used by
-    /// e.g. mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit).
-    ///
-    /// When BOTH keys are present the two must describe exactly the same
-    /// quantization plan; otherwise decoding fails with a clear error
-    /// instead of silently preferring one spelling.
-    private static func decodeQuantizationContainer(
-        from container: KeyedDecodingContainer<CodingKeys>
-    ) throws -> QuantizationContainer? {
-        let quantization = try container.decodeIfPresent(
+        // Hugging Face configs may spell the quantization plan
+        // `quantization_config` instead of the historical `quantization`
+        // key. Accept both spellings, but fail closed when both are present
+        // with different plans rather than silently preferring one.
+        let legacy = try container.decodeIfPresent(
             QuantizationContainer.self, forKey: .quantizationContainer)
-        let quantizationConfig = try container.decodeIfPresent(
-            QuantizationContainer.self, forKey: .quantizationConfigContainer)
-
-        switch (quantization, quantizationConfig) {
-        case (nil, nil):
-            return nil
-        case (let value?, nil):
-            return value
-        case (nil, let value?):
-            return value
-        case (let value?, let config?):
-            guard value.isEquivalent(to: config) else {
-                throw DecodingError.dataCorruptedError(
-                    forKey: .quantizationConfigContainer,
-                    in: container,
-                    debugDescription:
-                        "config.json declares both \"quantization\" and \"quantization_config\" "
-                        + "but they describe different quantization plans; refusing to pick one. "
-                        + "Remove one of the keys or make them identical.")
+        let alias: QuantizationContainer?
+        if container.contains(.quantizationConfigAlias),
+            try !container.decodeNil(forKey: .quantizationConfigAlias)
+        {
+            // Converted bundles may retain the source ModelOpt/FP8 metadata.
+            // Only an MLX-shaped plan is an alias; do not interpret a different
+            // backend's metadata as affine quantization.
+            let metadata = try container.nestedContainer(
+                keyedBy: QuantizationAliasKeys.self, forKey: .quantizationConfigAlias)
+            let method = try metadata.decodeIfPresent(String.self, forKey: .method)
+            if let method, method.lowercased() != "mlx",
+                !metadata.contains(.bits), !metadata.contains(.groupSize)
+            {
+                alias = nil
+            } else {
+                alias = try container.decode(
+                    QuantizationContainer.self, forKey: .quantizationConfigAlias)
             }
-            return value
+        } else {
+            alias = nil
+        }
+        switch (legacy, alias) {
+        case (nil, nil):
+            self.quantizationContainer = nil
+        case (let value?, nil), (nil, let value?):
+            self.quantizationContainer = value
+        case (let legacyValue?, let aliasValue?):
+            guard legacyValue == aliasValue else {
+                let message =
+                    "Both \"quantization\" and \"quantization_config\" are present but "
+                    + "describe different quantization plans; remove one key or make the plans identical."
+                throw DecodingError.dataCorruptedError(
+                    forKey: .quantizationConfigAlias,
+                    in: container,
+                    debugDescription: message)
+            }
+            self.quantizationContainer = legacyValue
         }
     }
 
     public func encode(to encoder: any Encoder) throws {
+        // Encode with the historical `quantization` key so existing consumers
+        // and caches keep seeing the same wire format; the quantization_config
+        // alias is decode-only.
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(modelType, forKey: .modelType)
         try container.encodeIfPresent(quantizationContainer, forKey: .quantizationContainer)

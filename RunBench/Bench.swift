@@ -44,6 +44,15 @@ struct Bench {
         // executable serves any model. Defaults preserve historical Qwen3.5 behavior.
         let env = ProcessInfo.processInfo.environment
         let modelPath = env["BENCH_MODEL"] ?? homePath("models/Qwen3.5-35B-A3B-4bit")
+        if env["BENCH_D3"] == "1" {
+            do {
+                try await D3DecisionProbe.run(directory: URL(fileURLWithPath: modelPath))
+            } catch {
+                FileHandle.standardError.write(Data("D3_ERROR: \(error.localizedDescription)\n".utf8))
+                exit(1)
+            }
+            return
+        }
         let tokensPath = env["BENCH_TOKENS"] ?? "/tmp/qwen35_multiturn_tokens.json"
         let maxNew = Int(env["BENCH_MAX_TOKENS"] ?? "256") ?? 256
         let compileDecode = (env["BENCH_COMPILE_DECODE"] ?? "0") == "1"
@@ -120,38 +129,6 @@ struct Bench {
             return
         }
 
-        // BENCH_JANGPRESS=1 activates the JangPress cold-weight tier
-        // (axis E) for THIS bench run. Holds the runtime alive for
-        // the full bench so the controller's failsafe state machine
-        // ticks during inference. Knobs:
-        //   BENCH_JANGPRESS_PCT=70        compress 70% of routed mass
-        //   BENCH_JANGPRESS_FORCE=0       soft (madvise DONTNEED) vs
-        //                                 force (msync MS_INVALIDATE)
-        //   BENCH_JANGPRESS_PREFETCH=1    pre-fault top hot tiles at arm
-        let jangPressOn = (env["BENCH_JANGPRESS"] ?? "0") == "1"
-        let jangPressOpts: JangPressLoadOptions = jangPressOn ? .init(
-            enabled: true,
-            compressPct: Int(env["BENCH_JANGPRESS_PCT"] ?? "70") ?? 70,
-            backend: .mmap,
-            forceMode: (env["BENCH_JANGPRESS_FORCE"] ?? "0") == "1" ? .force : .soft,
-            enablePrefetch: (env["BENCH_JANGPRESS_PREFETCH"] ?? "1") == "1"
-        ) : .disabled
-        var jangPressRuntime = JangPressRuntime.none
-        if jangPressOn {
-            jangPressRuntime = JangPressActivation.activate(
-                bundleURL: modelDir, options: jangPressOpts)
-            if jangPressRuntime.isActive {
-                FileHandle.standardError.write(Data(
-                    "[bench] JangPress active: pct=\(jangPressOpts.compressPct) force=\(jangPressOpts.forceMode == .force) prefetch=\(jangPressOpts.enablePrefetch)\n".utf8))
-            } else {
-                FileHandle.standardError.write(Data(
-                    "[bench] JangPress activation requested but tier returned .none\n".utf8))
-            }
-        }
-        defer {
-            if jangPressOn { JangPressActivation.deactivate(jangPressRuntime) }
-        }
-
         // BENCH_VL=1 dispatches to VLBench: loads the real HF tokenizer +
         // synthesises a 224×224 image, runs two turns through the VLM
         // processor + cache to verify vision path + multi-turn cache reuse.
@@ -160,6 +137,11 @@ struct Bench {
         // BatchEngine VL path.
         if (env["BENCH_VL"] ?? "0") == "1" {
             try await VLBench.run(modelPath: modelPath, maxNewTokens: maxNew)
+            return
+        }
+
+        if env["BENCH_MEDIA_CACHE_PROOF"] == "1" {
+            try await VLBench.runMediaCacheProof(modelPath: modelPath, maxNewTokens: maxNew)
             return
         }
 
@@ -178,6 +160,26 @@ struct Bench {
         // Validates SSM seed + stepBatchDecode force-unwrap fix +
         // ReasoningParser.forPrompt tail detection, all in one run.
         //   BENCH_VIDEO=/path/to/file.mov overrides the default video.
+        // BENCH_VL_IMAGE_SMOKE=1: one real image file through the production VLM processor and
+        // BatchEngine, then a text-only follow-up with the image in history, then the image again
+        // with the opposite thinking mode. BENCH_VL_IMAGE=/path.png BENCH_VL_PROMPT="..."
+        // BENCH_VL_THINKING=0|1 BENCH_VL_FOLLOWUP="..." BENCH_VL_TEMPERATURE=0.
+        if (env["BENCH_VL_IMAGE_SMOKE"] ?? "0") == "1" {
+            guard let imagePath = env["BENCH_VL_IMAGE"] else {
+                fputs("BENCH_VL_IMAGE_SMOKE needs BENCH_VL_IMAGE=/path/to/image\n", stderr)
+                exit(2)
+            }
+            try await VLBench.runImageSmoke(
+                modelPath: modelPath, imagePath: imagePath,
+                prompt: env["BENCH_VL_PROMPT"]
+                    ?? "What text is written in this image, and what shapes and colors do you see? Answer briefly.",
+                followUp: env["BENCH_VL_FOLLOWUP"] ?? "Now answer in one short sentence: which shape was on the left?",
+                thinking: (env["BENCH_VL_THINKING"] ?? "0") == "1",
+                temperature: Float(env["BENCH_VL_TEMPERATURE"] ?? "0") ?? 0,
+                maxNewTokens: maxNew)
+            return
+        }
+
         if (env["BENCH_VL_MIXED"] ?? "0") == "1" {
             let videoPath = env["BENCH_VIDEO"]
                 ?? "Tests/MLXLMTests/Resources/1080p_30.mov"
@@ -486,20 +488,6 @@ struct Bench {
             return
         }
 
-        // BENCH_JPREG=1 (2026-05-03): per-bundle regression sweep that
-        // exercises the new typed `LoadConfiguration` path end-to-end.
-        // Loads with `LoadConfiguration.default` (JangPress disabled +
-        // 70% caps + mmap), runs 3-turn coherency, samples RSS at four
-        // checkpoints, and exercises hybrid-SSM warm-pass plus
-        // TurboQuant disk round-trip checks where applicable.
-        // Designed to be invoked once per bundle from a shell loop so
-        // each model gets a fresh process.
-        if (env["BENCH_JPREG"] ?? "0") == "1" {
-            try await JangPressRegressionBench.run(
-                modelPath: modelPath, maxNewTokens: maxNew)
-            return
-        }
-
         // Hoist single-load scenarios above the preamble load so they
         // don't double-allocate the model. Critical for huge bundles
         // (DSV4-Flash JANGTQ at 79.5 GB OOMs with two simultaneous
@@ -573,6 +561,121 @@ struct Bench {
         }
         if (env["BENCH_NO_GUARD_SAMPLING"] ?? "0") == "1" {
             try await runNoGuardSamplingProbe(modelPath: modelPath, maxNew: maxNew)
+            return
+        }
+        if (env["BENCH_MTPRESOLVE"] ?? "0") == "1" {
+            try runMTPResolveBench()
+            return
+        }
+        if (env["BENCH_ROWEXACT"] ?? "0") == "1" {
+            try await runRowExactBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_PREFILL_SWEEP"] ?? "0") == "1" {
+            try await runPrefillSweepBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_JANGH_ROUTED_MICRO"] ?? "0") == "1" {
+            for bits in [2, 3] {
+                for line in JANGHRoutedFastBench.run(bits: bits) { print(line) }
+                for line in JANGHRoutedFastBench.run(k: 2048, n: 1024, bits: bits) { print(line) }
+            }
+            return
+        }
+        if (env["BENCH_KERNEL_MICRO"] ?? "0") == "1" {
+            runKernelMicroBench()
+            return
+        }
+        if (env["BENCH_MIXED_QMV_PROBE"] ?? "0") == "1" {
+            runMixedQMVProbe()
+            return
+        }
+        if (env["BENCH_MIXER_MICRO"] ?? "0") == "1" {
+            runMixerMicroBench()
+            return
+        }
+        if (env["BENCH_ROUTED_LAYER_MICRO"] ?? "0") == "1" {
+            try await runRoutedLayerMicroBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_MTP_PROXY"] ?? "0") == "1" {
+            try await runMTPProxyBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_FIDELITY"] ?? "0") == "1" {
+            try await runFidelityBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_K2_MULTITURN"] ?? "0") == "1" {
+            try await runK2MultiturnBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSV41_MISS_PARITY"] ?? "0") == "1" {
+            try await runDSV41MissParityBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSV41_SPLIT_EXACT"] ?? "0") == "1" {
+            try await runDSV41SplitExactBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_COLD_CAPTURE"] ?? "0") == "1" {
+            try await runColdCaptureBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_CACHE_LOOP"] ?? "0") == "1" {
+            try await runCacheReuseLoopBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_GLMCOST"] ?? "0") == "1" {
+            try await runGlm5VerifyCostBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_ROWCOST"] ?? "0") == "1" {
+            try await runRowCostBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DIPLODOC_ROWEXACT"] ?? "0") == "1" {
+            try await runK2RowExactness(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DIPLODOC_FWD_SWEEP"] ?? "0") == "1" {
+            try await runK2ForwardSweep(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DIPLODOC_COMPONENTS"] ?? "0") == "1" {
+            try await runDiplodocusComponentCosts(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_K2_MULTITURN"] ?? "0") == "1" {
+            try await runK2MultiturnBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DIPLODOC"] ?? "0") == "1" {
+            try await runDiplodocusQualification(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_SPEED"] ?? "0") == "1" {
+            try await runSpeedProbe(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSV41_LONG"] ?? "0") == "1" {
+            try await runDSV41LongContext(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSV41_PREFILL"] ?? "0") == "1" {
+            try await runDSV41PrefillBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSV41_KL"] ?? "0") == "1" {
+            try await runDSV41KLBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSPARK_DRAFTS"] ?? "0") == "1" {
+            try await runDSparkDraftDump(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSV41_ROWPARTS"] ?? "0") == "1" {
+            try await runDSV41RowParts(modelPath: modelPath)
             return
         }
         if (env["BENCH_PROD"] ?? "0") == "1" {
@@ -650,6 +753,35 @@ struct Bench {
                 print("[BENCH_GROWING_CHAT_CACHE] error: \(String(reflecting: error))")
                 exit(benchFailureExitCode(for: error))
             }
+            return
+        }
+
+        if (env["BENCH_LILICORR_ACCEPT"] ?? "0") == "1" {
+            do {
+                try await LiLiCorrAcceptBench.run(modelDir: modelDir)
+            } catch {
+                fputs("LILICORR FAILED: \(error)\n", stderr)
+                exit(benchFailureExitCode(for: error))
+            }
+            return
+        }
+
+        if let fixture = env["BENCH_PARITY_FIXTURE"] {
+            do {
+                try await NemotronParityBench.run(
+                    modelDir: modelDir, fixturePath: fixture, imagePath: env["BENCH_PARITY_IMAGE"])
+            } catch {
+                fputs("PARITY FAILED: \(error)\n", stderr)
+                exit(1)
+            }
+            return
+        }
+
+        if let nllFile = env["BENCH_NLL_FILE"] {
+            try await NLLBench.run(
+                modelDir: modelDir, file: nllFile,
+                maxTokens: Int(env["BENCH_NLL_TOKENS"] ?? "2048") ?? 2048,
+                chunk: Int(env["BENCH_PREFILL_STEP"] ?? "512") ?? 512)
             return
         }
 
@@ -1249,7 +1381,7 @@ private func loadBenchModelContext(from modelDir: URL) async throws -> ModelCont
         from: modelDir,
         using: #huggingFaceTokenizerLoader(),
         loadConfiguration: .osaurusProduction)
-    return loaded.0
+    return loaded
 }
 
 // MARK: - BatchEngine multi-turn chat (iter 26)
@@ -2119,13 +2251,25 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
     print("\n=== BatchEngine B=2 concurrent (iter 33) ===")
     print("Loading with real HuggingFace tokenizer...")
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let loaded = try await MLXLMCommon.loadModel(
+        from: modelDir, using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .osaurusProduction)
+    let context = loaded
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
 
-    let params = GenerateParameters(
-        maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+    let env = ProcessInfo.processInfo.environment
+    let bundleSampling = env["BENCH_BATCH_USE_GENERATION_CONFIG"] == "1"
+    var params = bundleSampling
+        ? GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: GenerateParameters(maxTokens: maxNew, prefillStepSize: 512))
+        : GenerateParameters(maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+    params.maxTokens = maxNew
+    params.randomSeed = env["BENCH_BATCH_SEED"].flatMap(UInt64.init)
+    print("Sampling: source=\(bundleSampling ? "bundle-defaults" : "explicit-greedy-diagnostic") " +
+          "temperature=\(params.temperature) topP=\(params.topP) topK=\(params.topK) " +
+          "repetitionPenalty=\(String(describing: params.repetitionPenalty))")
 
     nonisolated(unsafe) let ctx = context
     let engine = BatchEngine(context: ctx, maxBatchSize: 2)
@@ -2161,19 +2305,28 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
     // decode is fine for a small benchmark and avoids the O(n²) relay
     // cost that hammers throughput under HF tokenizers.
     let tokenizer = context.tokenizer
-    let results = await collectBatchStreamsWithOverlap(
+    let results = await collectBatchStreamsWithOverlapAndInfo(
         engine,
         streams: [(0, s0), (1, s1)],
-        maxTokens: maxNew,
         label: "ConcurrentBatch B=2")
     let total = CFAbsoluteTimeGetCurrent() - t0
 
     // Print side-by-side. Guard against empty (stuck) slots.
-    for (slot, ids) in results.sorted(by: { $0.0 < $1.0 }) {
+    for (slot, ids, info) in results.sorted(by: { $0.0 < $1.0 }) {
         let text = tokenizer.decode(tokenIds: ids)
         print("  Slot \(slot) prompt: \"\(prompts[slot])\"")
         print("    tokens: \(ids.count), first 12: \(Array(ids.prefix(12)))")
         printDecodedOutput(label: "ConcurrentBatch slot \(slot)", text: text)
+        guard let info else {
+            fputs("[ConcurrentBatch] FAIL: missing completion telemetry\n", stderr)
+            exit(1)
+        }
+        print("    stop=\(info.stopReason) tokps=\(info.tokensPerSecond) " +
+              "tokens=\(info.generationTokenCount) footprint_mib=\(currentPhysFootprintMiB())")
+        if info.stopReason == .length || lagunaLoopHeuristic(text) {
+            fputs("[ConcurrentBatch] FAIL: length stop or looping output\n", stderr)
+            exit(1)
+        }
         if ids.isEmpty {
             fputs("[ConcurrentBatch] FAIL: slot \(slot) produced zero tokens\n", stderr)
             exit(1)
@@ -2960,18 +3113,17 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             from: modelDir,
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration(
-                jangPress: .disabled,
                 maxResidentBytes: .unlimited,
                 memoryLimit: .unlimited,
                 useMmapSafetensors: true,
                 nativeMTP: true))
-        context = loaded.0
+        context = loaded
     } else if useMmap {
         let loaded = try await MLXLMCommon.loadModel(
             from: modelDir,
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration(useMmapSafetensors: true))
-        context = loaded.0
+        context = loaded
     } else {
         context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader())
@@ -3090,14 +3242,12 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             count: prefixRepeat)
         : ""
     let recallPhrase = env["BENCH_GROWING_RECALL_PHRASE"] ?? "vmlx-cache-green"
-    // `BENCH_GROWING_THINK=1` runs the same conversation with reasoning ON and
-    // replays turn 1 the way a host does — visible text only, think block
-    // stripped. That combination is the only one that makes the post-answer
-    // boundary stop being a prefix of the next prompt, so it is the only shape
-    // in which the turn-start boundary can be shown to matter. With reasoning
-    // off (the default) turn 1 emits no think content, history round-trips
-    // exactly, and both boundaries stay valid.
-    let enableThinking = (env["BENCH_GROWING_THINK"] ?? "0") == "1"
+    // Preserve the bundle template's thinking default unless this diagnostic
+    // explicitly requests an ON/OFF comparison.
+    let thinkingContext: [String: any Sendable]? = env["BENCH_GROWING_THINK"].map {
+        ["enable_thinking": $0 == "1"]
+    }
+    print("Thinking: \(env["BENCH_GROWING_THINK"].map { $0 == "1" ? "explicit-on" : "explicit-off" } ?? "template-default")")
     let firstTurnPrompt = longPrefix
         + "Reply with exactly this phrase and nothing else: \(recallPhrase)"
     let messages: [[String: any Sendable]] = [
@@ -3106,13 +3256,13 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let promptTokens = try context.tokenizer.applyChatTemplate(
         messages: messages,
         tools: nil,
-        additionalContext: ["enable_thinking": enableThinking])
+        additionalContext: thinkingContext)
     let historyBoundaryTokens = try? (
         context.tokenizer as? GenerationPromptControllableTokenizer
     )?.applyChatTemplate(
         messages: messages,
         tools: nil,
-        additionalContext: ["enable_thinking": enableThinking],
+        additionalContext: thinkingContext,
         addGenerationPrompt: false)
     // `BENCH_GROWING_NO_HISTORY_BOUNDARY=1` models a caller that does NOT hand
     // the runtime a turn-start boundary. Osaurus always supplies one, so the
@@ -3134,7 +3284,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         .reshaped(1, promptTokens.count)
     let turn1 = LMInput(
         text: LMInput.Text(tokens: promptArray),
-        cacheScopeSalt: cacheScopeSalt(from: ["enable_thinking": enableThinking]),
+        cacheScopeSalt: cacheScopeSalt(from: thinkingContext),
         cachePrefixTokenCounts: cachePrefixTokenCounts,
         cacheStablePrefixTokenCounts: cachePrefixTokenCounts)
     print("  Cache history-boundary counts: \(cachePrefixTokenCounts)")
@@ -3333,7 +3483,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let turn2Tokens = try context.tokenizer.applyChatTemplate(
         messages: turn2Messages,
         tools: nil,
-        additionalContext: ["enable_thinking": enableThinking])
+        additionalContext: thinkingContext)
     let turn2RenderedTail = context.tokenizer.decode(
         tokenIds: Array(turn2Tokens.suffix(160)),
         skipSpecialTokens: false)
@@ -5894,11 +6044,10 @@ func runThinkingLoopProbe(modelPath: String, maxNew: Int) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     print("\n=== BENCH_THINK_LOOP_PROBE: validation-task </think> emission ===")
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let (context, jangPressRuntime) = try await MLXLMCommon.loadModel(
+    let context = try await MLXLMCommon.loadModel(
         from: modelDir,
         using: #huggingFaceTokenizerLoader(),
         loadConfiguration: .default)
-    _ = jangPressRuntime
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
     print(String(format: "maxTokens budget: %d", maxNew))
@@ -7534,22 +7683,26 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     print("Model: \(type(of: context.model))")
     print("Tool format: \(context.configuration.toolCallFormat.map { "\($0)" } ?? "json (default)")")
     print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
-    guard genericAgentic || context.configuration.toolCallFormat == .dsml else {
+    // DeepSeek-V4 stamps DSML + think_xml; V4.1 (model_type deepseek_v41) its own DSML revision + deepseek_r1.
+    let isV41 = modelTypeForTemplateSmoke(modelPath: modelPath) == "deepseek_v41"
+    let expectedToolFormat: ToolCallFormat = isV41 ? .dsmlV41 : .dsml
+    let expectedReasoning = isV41 ? "deepseek_r1" : "think_xml"
+    guard genericAgentic || context.configuration.toolCallFormat == expectedToolFormat else {
         throw NSError(
             domain: "BENCH_DSV4_AGENTIC_TOOL",
             code: 1,
             userInfo: [
                 NSLocalizedDescriptionKey:
-                    "DSV4 agentic row requires DSML tool-call format, got \(context.configuration.toolCallFormat.map { "\($0)" } ?? "nil")",
+                    "DSV4 agentic row requires \(expectedToolFormat) tool-call format, got \(context.configuration.toolCallFormat.map { "\($0)" } ?? "nil")",
             ])
     }
-    guard genericAgentic || context.configuration.reasoningParserName == "think_xml" else {
+    guard genericAgentic || context.configuration.reasoningParserName == expectedReasoning else {
         throw NSError(
             domain: "BENCH_DSV4_AGENTIC_TOOL",
             code: 2,
             userInfo: [
                 NSLocalizedDescriptionKey:
-                    "DSV4 agentic row requires think_xml reasoning parser, got \(context.configuration.reasoningParserName ?? "nil")",
+                    "DSV4 agentic row requires \(expectedReasoning) reasoning parser, got \(context.configuration.reasoningParserName ?? "nil")",
             ])
     }
 
@@ -7563,7 +7716,12 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     coordConfig.maxCacheBlocks = 1024
     coordConfig.modelKey = "\(modelDir.lastPathComponent)|\(rowName.lowercased())"
     let coordinator = CacheCoordinator(config: coordConfig)
-    let engine = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
+    // Bisect knobs (DSV4.1 GPU-timeout investigation, 2026-10-26): BENCH_AGENTIC_NO_COORDINATOR=1 runs the engine
+    // without the cache coordinator (the cache assertions at the end are skipped), BENCH_AGENTIC_NO_DRAFT=1 drops
+    // the bundle's draft strategy, BENCH_AGENTIC_TEMPERATURE overrides the sampling temperature.
+    let noCoordinator = env["BENCH_AGENTIC_NO_COORDINATOR"] == "1"
+    let engine = BatchEngine(
+        context: ctx, maxBatchSize: 1, cacheCoordinator: noCoordinator ? nil : coordinator)
     defer { Task { await engine.shutdown() } }
 
     let fallbackParams = GenerateParameters(maxTokens: maxTokens, prefillStepSize: 512)
@@ -7573,6 +7731,9 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     params.maxTokens = maxTokens
     params.prefillStepSize = 512
     params.enableCompiledBatchDecode = false
+    if env["BENCH_AGENTIC_NO_DRAFT"] == "1" { params.draftStrategy = nil }
+    if let t = env["BENCH_AGENTIC_TEMPERATURE"].flatMap(Float.init) { params.temperature = t }
+    print("Bisect: coordinator=\(!noCoordinator) draft=\(params.draftStrategy.map { "\($0)" } ?? "nil")")
     print(String(format:
         "Sampling: maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@ seed=%@",
         params.maxTokens ?? -1,
@@ -7625,6 +7786,7 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
             "<think>", "</think>", "<tool_call>", "<|tool_call>",
             "[TOOL_CALLS]", "<｜tool▁calls｜>", "<｜tool▁call▁begin｜>",
             "<\u{FF5C}DSML\u{FF5C}tool_calls>", "<\u{FF5C}DSML\u{FF5C}invoke",
+            "<\u{FF5C}DSML\u{FF5C} calls>", "<\u{FF5C}DSML\u{FF5C} invoke",
         ].filter { text.contains($0) }
     }
 
@@ -7755,6 +7917,11 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     print(
         "DSV4_AGENTIC_CACHE_STATS hybrid=\(snapshot.isHybrid) pagedIncompatible=\(snapshot.isPagedIncompatible) paged{\(paged)} disk{\(disk)} ssm{hits=\(ssm.hits),misses=\(ssm.misses),reDerives=\(ssm.reDerives)}"
     )
+    if noCoordinator {
+        await engine.shutdown()
+        print("=== \(rowName): PASS (no coordinator: cache assertions skipped) ===")
+        return
+    }
     if !genericAgentic, !snapshot.isPagedIncompatible {
         try fail(40, "DSV4 agentic row did not mark cache as paged-incompatible")
     }
@@ -8423,6 +8590,58 @@ func runPerfBench(
     runs: Int,
     useTokenIterator: Bool = false
 ) async throws {
+    let env = ProcessInfo.processInfo.environment
+    if let raw = env["BENCH_PERF_RESIDENT_WIRED_BYTES"] {
+        guard env["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] != "1",
+            env["BENCH_PERF_SELECTED_WIRED_MIB"] == nil,
+            let bytes = Int(raw), bytes > 0,
+            let recommended = GPU.maxRecommendedWorkingSetBytes(), bytes <= recommended
+        else {
+            throw NSError(domain: "BENCH_PERF", code: 7, userInfo: [NSLocalizedDescriptionKey:
+                "Resident wired diagnostic requires a positive budget within the GPU working set and no selected-expert override"])
+        }
+        let ticket = MLX.WiredMemoryTicket(size: bytes, policy: MLX.WiredSumPolicy())
+        print("PERF_RESIDENT_WIRED_DIAGNOSTIC requested_bytes=\(bytes) scope=shared_ticket")
+        try await ticket.withWiredLimit {
+            try await runPerfBenchBody(modelPath: modelPath, maxNew: maxNew, variant: variant,
+                                       warmup: warmup, runs: runs, useTokenIterator: useTokenIterator)
+        }
+        print("PERF_RESIDENT_WIRED_DIAGNOSTIC ticket_ended=true")
+        return
+    }
+    if let raw = env["BENCH_PERF_SELECTED_WIRED_MIB"] {
+        guard env["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] == "1",
+            env["VMLX_JANGH_SELECTED_WHOLE_BANK_VIEWS"] != "1",
+            let mib = Int(raw), (1...16384).contains(mib),
+            let recommended = GPU.maxRecommendedWorkingSetBytes(),
+            mib * 1024 * 1024 <= recommended
+        else {
+            throw NSError(domain: "BENCH_PERF", code: 7, userInfo: [NSLocalizedDescriptionKey:
+                "Selected residency diagnostic requires independent selected mappings and 1...16384 MiB within the GPU working set"])
+        }
+        // Only this owned diagnostic process uses the existing shared ticket
+        // manager. Its cancellation-safe scope restores the prior baseline.
+        let ticket = MLX.WiredMemoryTicket(size: mib * 1024 * 1024, policy: MLX.WiredSumPolicy())
+        print("PERF_SELECTED_RESIDENCY_DIAGNOSTIC requested_mib=\(mib) scope=shared_ticket")
+        try await ticket.withWiredLimit {
+            try await runPerfBenchBody(modelPath: modelPath, maxNew: maxNew, variant: variant,
+                                       warmup: warmup, runs: runs, useTokenIterator: useTokenIterator)
+        }
+        print("PERF_SELECTED_RESIDENCY_DIAGNOSTIC ticket_ended=true")
+    } else {
+        try await runPerfBenchBody(modelPath: modelPath, maxNew: maxNew, variant: variant,
+                                   warmup: warmup, runs: runs, useTokenIterator: useTokenIterator)
+    }
+}
+
+private func runPerfBenchBody(
+    modelPath: String,
+    maxNew: Int,
+    variant: String,
+    warmup: Int,
+    runs: Int,
+    useTokenIterator: Bool
+) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     let env = ProcessInfo.processInfo.environment
     let thinkingContext: [String: any Sendable]?
@@ -8445,13 +8664,31 @@ func runPerfBench(
                     "BENCH_PERF_ENABLE_THINKING must be 0, 1, or unset"
             ])
     }
+    let conversationPrompts: [String]?
+    if let path = env["BENCH_PERF_CONVERSATION_JSON"] {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let prompts = try JSONDecoder().decode([String].self, from: data)
+        let forbidden = ["BENCH_PERF_TEMP", "BENCH_PERF_TOP_P", "BENCH_PERF_TOP_K", "BENCH_PERF_MIN_P",
+            "BENCH_PERF_REPETITION_PENALTY", "BENCH_PERF_REPETITION_CONTEXT", "BENCH_PERF_ENABLE_THINKING",
+            "BENCH_PERF_NATIVE_MTP_DEPTH", "BENCH_PERF_LOAD_NATIVE_MTP", "BENCH_PERF_COMPILED",
+            "BENCH_COMPILE_DECODE", "BENCH_PERF_MAX_KV_SIZE", "BENCH_PERF_KV_MODE"]
+        guard (2...3).contains(prompts.count), prompts.allSatisfy({ !$0.isEmpty }),
+            !useTokenIterator, (env["BENCH_PERF_PATH"] ?? "batch") == "batch",
+            forbidden.allSatisfy({ env[$0] == nil })
+        else {
+            throw NSError(domain: "BENCH_PERF", code: 3, userInfo: [NSLocalizedDescriptionKey:
+                "Conversation proof requires two or three nonempty prompts, parsed batch path and no sampler/thinking/speculation overrides"])
+        }
+        conversationPrompts = prompts
+    } else { conversationPrompts = nil }
+    var conversationHistory: [Chat.Message] = []
     let modelName = modelDir.lastPathComponent
-    let useJangPressLoad = env["BENCH_PERF_JANGPRESS"] == "1"
     let useMmap = env["BENCH_PERF_MMAP"] != "0"
         let pathLabel = useTokenIterator ? "iter" : (env["BENCH_PERF_PATH"] ?? "batch")
         var perfLine = ""
 
         do {
+        ProcessMemoryObservation.log(stage: "before_load")
         let rssBeforeLoad = currentRSSMiB()
         let footprintBeforeLoad = currentPhysFootprintMiB()
         print(String(format:
@@ -8461,23 +8698,10 @@ func runPerfBench(
         var peakFootprintMiB = footprintBeforeLoad
         let loadStart = CFAbsoluteTimeGetCurrent()
         let context: ModelContext
-        let jangPressRuntime: JangPressRuntime?
         let nativeMTPRequestedAtLoad =
             env["BENCH_PERF_NATIVE_MTP_DEPTH"] != nil
             || env["BENCH_PERF_LOAD_NATIVE_MTP"] == "1"
-        if useJangPressLoad {
-            let loaded = try await MLXLMCommon.loadModel(
-                from: modelDir,
-                using: #huggingFaceTokenizerLoader(),
-                loadConfiguration: LoadConfiguration(
-                    jangPress: .enabled(coldFraction: 0.70),
-                    maxResidentBytes: .fraction(0.70),
-                    memoryLimit: .fraction(0.70),
-                    useMmapSafetensors: useMmap,
-                    nativeMTP: nativeMTPRequestedAtLoad))
-            context = loaded.0
-            jangPressRuntime = loaded.1
-        } else if nativeMTPRequestedAtLoad {
+        if nativeMTPRequestedAtLoad {
             let allocatorCap: ResidentCap = env["BENCH_PERF_ALLOCATOR_CACHE_BYTES"]
                 .flatMap(UInt64.init).map(ResidentCap.absolute) ?? .unlimited
             let memoryCap: ResidentCap = env["BENCH_PERF_MEMORY_LIMIT_FRACTION"]
@@ -8486,26 +8710,52 @@ func runPerfBench(
                 from: modelDir,
                 using: #huggingFaceTokenizerLoader(),
                 loadConfiguration: LoadConfiguration(
-                    jangPress: .disabled,
-                    maxResidentBytes: allocatorCap,
+                        maxResidentBytes: allocatorCap,
                     memoryLimit: memoryCap,
                     useMmapSafetensors: useMmap,
                     nativeMTP: true))
-            context = loaded.0
-            jangPressRuntime = loaded.1
+            context = loaded
         } else {
             if useMmap {
+                var requestedLoad = LoadConfiguration(useMmapSafetensors: true)
+                if env["BENCH_PERF_MEMORY_SAFETY_PLAN"] == "1" {
+                    let settings = VMLXServerRuntimeSettings()
+                    let plan = settings.resolvedMemorySafetyPlan(
+                        baseLoadConfiguration: requestedLoad,
+                        bundleFacts: LoadBundleFacts.inspect(bundleURL: modelDir),
+                        host: MemoryStatus.snapshot())
+                    guard plan.blockingIssues.isEmpty else {
+                        throw NSError(domain: "BENCH_PERF", code: 6,
+                            userInfo: [NSLocalizedDescriptionKey: "Memory safety plan blocked load"])
+                    }
+                    requestedLoad = plan.loadConfiguration
+                    print("PERF_HOST_MEMORY_PLAN \(plan.displaySummary) mmap=\(requestedLoad.useMmapSafetensors)")
+                }
                 let loaded = try await MLXLMCommon.loadModel(
                     from: modelDir,
                     using: #huggingFaceTokenizerLoader(),
-                    loadConfiguration: LoadConfiguration(useMmapSafetensors: true))
-                context = loaded.0
-                jangPressRuntime = loaded.1
-            } else {
+                    loadConfiguration: requestedLoad)
+                context = loaded
+                } else {
                 context = try await MLXLMCommon.loadModel(
                     from: modelDir, using: #huggingFaceTokenizerLoader())
-                jangPressRuntime = nil
             }
+        }
+        print("PERF_POST_LOAD_POLICY memory_limit_bytes=\(MLX.Memory.memoryLimit) active_bytes=\(MLX.Memory.activeMemory) cached_bytes=\(MLX.Memory.cacheMemory) recommended_bytes=\(GPU.maxRecommendedWorkingSetBytes().map(String.init) ?? "unknown") supplemental_mapped_bytes=\(context.model.modelWeightAccounting().supplementalMappedBytes) mmap_requested=\(useMmap)")
+        // Explicit diagnostic only. This never changes a production load default.
+        if let raw = env["BENCH_PERF_POST_LOAD_MEMORY_LIMIT_BYTES"] {
+            let physical = ProcessInfo.processInfo.physicalMemory
+            guard let requested = Int(raw), requested > 0,
+                let recommended = GPU.maxRecommendedWorkingSetBytes(), recommended > 0,
+                UInt64(requested) <= physical, requested <= recommended
+            else {
+                throw NSError(domain: "BENCH_PERF", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "Post-load memory limit must be positive and no larger than physical memory or the recommended GPU working set"])
+            }
+            let before = MLX.Memory.memoryLimit
+            let active = MLX.Memory.activeMemory, cached = MLX.Memory.cacheMemory
+            MLX.Memory.memoryLimit = requested
+            print("PERF_MEMORY_LIMIT_DIAGNOSTIC requested_bytes=\(requested) before_bytes=\(before) after_bytes=\(MLX.Memory.memoryLimit) active_bytes=\(active) cached_bytes=\(cached) recommended_bytes=\(recommended) physical_bytes=\(physical) scope=explicit_owned_process_experiment")
         }
         if let persistentAllocatorCap = env["BENCH_PERF_PERSISTENT_ALLOCATOR_CACHE_BYTES"]
             .flatMap(Int.init)
@@ -8513,20 +8763,16 @@ func runPerfBench(
             MLX.Memory.cacheLimit = persistentAllocatorCap
         }
         let rssAfterLoad = currentRSSMiB()
+        ProcessMemoryObservation.log(stage: "after_load")
         let footprintAfterLoad = currentPhysFootprintMiB()
         peakRSSMiB = max(peakRSSMiB, rssAfterLoad)
         peakFootprintMiB = max(peakFootprintMiB, footprintAfterLoad)
-        defer {
-            if let jangPressRuntime {
-                JangPressActivation.deactivate(jangPressRuntime)
-            }
-        }
         let loadSec = CFAbsoluteTimeGetCurrent() - loadStart
         print(String(format:
             "PERF_MEMORY label=after_load rss_mib=%.0f footprint_mib=%.0f loadSec=%.2f",
             rssAfterLoad, footprintAfterLoad, loadSec))
 
-        let promptText = env[
+        let promptText = conversationPrompts?.first ?? env[
             "BENCH_PERF_PROMPT"]
             ?? "Write one long paragraph describing ocean waves. Be verbose and detailed."
         let messages: [[String: any Sendable]] = [
@@ -8553,13 +8799,13 @@ func runPerfBench(
         }
 
         let perfCacheCoordinator: CacheCoordinator?
-        if env["BENCH_PERF_CACHE_COORDINATOR"] == "1" {
+        if env["BENCH_PERF_CACHE_COORDINATOR"] == "1" || conversationPrompts != nil {
             let modelKey = "\(modelName)|perf-cache-coordinator"
             let diskDir = env["BENCH_PERF_CACHE_DIR"].map {
                 URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath)
             }
             let config = CacheCoordinatorConfig(
-                usePagedCache: env["BENCH_PERF_CACHE_PAGED"] != "0",
+                usePagedCache: conversationPrompts != nil ? env["BENCH_PERF_CACHE_PAGED"] == "1" : env["BENCH_PERF_CACHE_PAGED"] != "0",
                 enableDiskCache: env["BENCH_PERF_CACHE_DISK"] == "1",
                 diskCacheMaxGB: Float(env["BENCH_PERF_CACHE_DISK_MAX_GB"] ?? "1") ?? 1,
                 diskCacheDir: diskDir,
@@ -8592,6 +8838,7 @@ func runPerfBench(
             var reasoning = ""
             var toolCalls = 0
             var stopReason = "unknown"
+            var generationFailure: GenerationFailure?
             var unclosedReasoning = false
             var rssMiB = 0.0
             var footprintMiB = 0.0
@@ -8604,8 +8851,7 @@ func runPerfBench(
             var lastTokenDelivery: TimeInterval?
 
             mutating func recordPrefill(_ progress: PrefillProgress) {
-                if prefillStart == nil, progress.stage == .prefill,
-                    progress.detail == "running"
+                if prefillStart == nil, progress.stage == .prefill
                 {
                     prefillStart = progress
                 }
@@ -8662,15 +8908,25 @@ func runPerfBench(
             ].filter { text.contains($0) }
         }
 
-        let useGenerationConfigSampling = env["BENCH_PERF_USE_GENERATION_CONFIG"] == "1"
+        let useGenerationConfigSampling = conversationPrompts != nil || env["BENCH_PERF_USE_GENERATION_CONFIG"] == "1"
         let samplingSource = useGenerationConfigSampling
             ? "bundle-defaults"
             : "explicit-env"
         let perfSeed = env["BENCH_PERF_SEED"].flatMap(UInt64.init)
         let perfSeedLabel = perfSeed.map(String.init) ?? "nil"
 
+        var lastRequestPromptTokenCount = promptTokens.count
         func oneTurn(_ label: String) async throws -> PerfTurnResult {
-            let input = LMInput(text: LMInput.Text(tokens: promptIds))
+            let input: LMInput
+            if conversationPrompts != nil {
+                guard context.configuration.generationDefaults != nil else {
+                    throw NSError(domain: "BENCH_PERF", code: 4, userInfo: [NSLocalizedDescriptionKey:
+                        "Native conversation proof requires bundle generation defaults"])
+                }
+                input = try await context.processor.prepare(input: UserInput(chat: conversationHistory))
+            } else { input = LMInput(text: LMInput.Text(tokens: promptIds)) }
+            let requestPromptTokenCount = input.text.tokens.size
+            lastRequestPromptTokenCount = requestPromptTokenCount
             nonisolated(unsafe) let sendable = input
             let perfRepetitionContext = Int(env["BENCH_PERF_REPETITION_CONTEXT"] ?? "20") ?? 20
             let printPhaseSnapshot = env["BENCH_PERF_PHASE_SNAPSHOT"] == "1"
@@ -8758,6 +9014,15 @@ func runPerfBench(
             }
             if let nativeMTPDepth = env["BENCH_PERF_NATIVE_MTP_DEPTH"].flatMap(Int.init) {
                 params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
+                // BENCH_PERF_MTP_ADAPTIVE_MAX=<n>: the app's On (Adaptive) policy — start at the
+                // requested depth, explore up to n (block drafters reach 7).
+                // Without it the run is a manual fixed-depth measurement (explicit `.fixed`; the
+                // library default is Adaptive).
+                if let ceiling = env["BENCH_PERF_MTP_ADAPTIVE_MAX"].flatMap(Int.init) {
+                    params.nativeMTPDepthPolicy = .adaptive(maximumDepth: ceiling)
+                } else {
+                    params.nativeMTPDepthPolicy = .fixed
+                }
             }
             if let maxKVSize = env["BENCH_PERF_MAX_KV_SIZE"].flatMap(Int.init) {
                 params.maxKVSize = maxKVSize
@@ -8776,6 +9041,13 @@ func runPerfBench(
                 break
             }
             params.cacheChainId = env["BENCH_PERF_CACHE_CHAIN_ID"]
+            if conversationPrompts != nil {
+                params = GenerateParameters(generationConfig: context.configuration.generationDefaults,
+                    fallback: GenerateParameters(maxTokens: maxNew))
+                params.maxTokens = maxNew
+                params.randomSeed = perfSeed
+                params.cacheChainId = env["BENCH_PERF_CACHE_CHAIN_ID"] ?? "native-conversation-proof"
+            }
             var result = PerfTurnResult()
             let start = CFAbsoluteTimeGetCurrent()
             let whichPath = env["BENCH_PERF_PATH"] ?? "batch"
@@ -8809,6 +9081,7 @@ func runPerfBench(
                         result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
+                        result.generationFailure = info.generationFailure
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
@@ -8831,6 +9104,7 @@ func runPerfBench(
                         result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
+                        result.generationFailure = info.generationFailure
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
@@ -8864,10 +9138,18 @@ func runPerfBench(
                         result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
+                        result.generationFailure = info.generationFailure
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
             }
+            if let failure = result.generationFailure,
+               let encoded = try? JSONSerialization.data(withJSONObject: [
+                    "stage": failure.stage.rawValue, "cause": failure.cause]),
+               let json = String(data: encoded, encoding: .utf8) {
+                print("  PERF_FAILURE label=\(label) failure=\(json)")
+            }
+            ProcessMemoryObservation.log(stage: "after_\(label)")
             result.rssMiB = currentRSSMiB()
             result.footprintMiB = currentPhysFootprintMiB()
             peakRSSMiB = max(peakRSSMiB, result.rssMiB)
@@ -8896,7 +9178,7 @@ func runPerfBench(
                     label, samplingSource, perfSeedLabel,
                     result.ttftSec * 1000,
                     result.promptSec * 1000,
-                    result.promptTokensPerSecond(promptTokenCount: promptTokens.count),
+                    result.promptTokensPerSecond(promptTokenCount: requestPromptTokenCount),
                     result.firstDecodeSecEstimate * 1000,
                     result.genTokens, result.genSec, result.tokps,
                     result.tailTokpsEstimate,
@@ -8913,7 +9195,7 @@ func runPerfBench(
                     let restored = min(progress.completedUnitCount, progress.totalUnitCount)
                     let remaining = progress.totalUnitCount - restored
                     print(
-                        "  PERF_PREFILL label=\(label) logical_tokens=\(promptTokens.count) reported_restored_units=\(restored) reported_remaining_units=\(remaining) source=first_running_progress"
+                        "  PERF_PREFILL label=\(label) logical_tokens=\(requestPromptTokenCount) reported_restored_units=\(restored) reported_remaining_units=\(remaining) source=first_running_progress"
                     )
                 } else {
                     print("  PERF_PREFILL label=\(label) reported_restored_units=unknown reported_remaining_units=unknown")
@@ -8934,11 +9216,22 @@ func runPerfBench(
                     print("    REASONING_PREVIEW \"\(compactPreview(result.reasoning))\"")
                 }
                 print("    TEXT_PREVIEW \"\(compactPreview(result.text.isEmpty ? result.reasoning : result.text))\"")
+                print("    PERF_MLX_MEMORY label=\(label) active_bytes=\(MLX.Memory.activeMemory) cache_bytes=\(MLX.Memory.cacheMemory) peak_bytes=\(MLX.Memory.peakMemory)")
                 if env["BENCH_PERF_FULL_TEXT"] == "1" {
                     printDecodedOutput(
                         label: label,
                         text: result.text.isEmpty ? result.reasoning : result.text)
                 }
+            }
+            if conversationPrompts != nil {
+                let record: [String: Any] = ["label": label, "messages": conversationHistory.count,
+                    "prompt_tokens": requestPromptTokenCount, "user": conversationHistory.last?.content ?? "", "visible": result.text, "reasoning": result.reasoning,
+                    "stop": result.stopReason, "generation_tokens": result.genTokens,
+                    "generation_seconds": result.genSec, "tokens_per_second": result.tokps,
+                    "ttft_seconds": result.ttftSec, "unclosed_reasoning": result.unclosedReasoning,
+                    "tool_calls": result.toolCalls, "sampling_source": "bundle-defaults"]
+                let data = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
+                print("PERF_CONVERSATION_TURN " + String(decoding: data, as: UTF8.self))
             }
             if let snapshot = perfCacheCoordinator?.snapshotStats() {
                 let paged = snapshot.pagedStats.map {
@@ -8955,22 +9248,38 @@ func runPerfBench(
             return result
         }
 
-        for i in 0..<warmup {
-            _ = try await oneTurn("warmup\(i)")
+        if conversationPrompts == nil {
+            for i in 0..<warmup { _ = try await oneTurn("warmup\(i)") }
         }
 
         var tokps: [Double] = []
         var lastGenTokens = 0
         var lastGenSec = 0.0
         var lastResult = PerfTurnResult()
-        for i in 0..<runs {
+        var conversationFailures: [String] = []
+        for i in 0..<(conversationPrompts?.count ?? runs) {
+            if let prompts = conversationPrompts { conversationHistory.append(.user(prompts[i])) }
             let result = try await oneTurn("run\(i)")
+            if conversationPrompts != nil {
+                conversationHistory.append(Chat.Message(role: .assistant, content: result.text,
+                    reasoningContent: result.reasoning.isEmpty ? nil : result.reasoning))
+                if result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || result.stopReason != "stop" || result.genTokens <= 0 || result.tokps <= 0
+                    || result.unclosedReasoning || result.toolCalls != 0
+                    || lagunaLoopHeuristic(result.text) || !markerLeaks(in: result.text).isEmpty {
+                    conversationFailures.append("turn\(i + 1)")
+                }
+            }
             tokps.append(result.tokps)
             lastGenTokens = result.genTokens
             lastGenSec = result.genSec
             lastResult = result
         }
         await engine.shutdown()
+        if !conversationFailures.isEmpty {
+            throw NSError(domain: "BENCH_PERF", code: 5, userInfo: [NSLocalizedDescriptionKey:
+                "Conversation proof failed visible/stop/rate/protocol gates: " + conversationFailures.joined(separator: ",")])
+        }
 
         let median = tokps.sorted()[tokps.count / 2]
         let best = tokps.max() ?? 0
@@ -8982,12 +9291,14 @@ func runPerfBench(
         let head = String(
             gitShortHead(modelDir: FileManager.default.currentDirectoryPath))
         perfLine = String(format:
-            "PERF model=%@ variant=%@ path=%@ samplingSource=%@ seed=%@ kvMode=%@ jangpress=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d peak_rss_mib=%.0f peak_footprint_mib=%.0f graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
+            "PERF model=%@ variant=%@ path=%@ samplingSource=%@ seed=%@ kvMode=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d max_observed_rss_mib=%.0f max_observed_footprint_mib=%.0f memory_sampling=post_load_and_post_turn graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
             modelName, variant, pathLabel, samplingSource, perfSeedLabel,
             env["BENCH_PERF_KV_MODE"] ?? "none",
-            useJangPressLoad ? "on" : "off",
-            useMmap ? "on" : "off",
-            head, loadSec, promptTokens.count,
+            context.model.modelWeightAccounting().supplementalMappedBytes > 0
+                ? "custom-banks-mapped"
+                : (LoadBundleFacts.inspect(bundleURL: modelDir).resolveMmapSafetensors(requested: useMmap)
+                    ? "policy-enabled" : "policy-disabled"),
+            head, loadSec, lastRequestPromptTokenCount,
             peakRSSMiB, peakFootprintMiB,
             graphStats.map { String($0.nodes) } ?? "na",
             graphStats.map { String($0.asType) } ?? "na",
@@ -9894,12 +10205,11 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
             from: modelDir,
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration(
-                jangPress: .disabled,
                 maxResidentBytes: .unlimited,
                 memoryLimit: .unlimited,
                 useMmapSafetensors: true,
                 nativeMTP: true))
-        context = loaded.0
+        context = loaded
     } else {
         context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader())

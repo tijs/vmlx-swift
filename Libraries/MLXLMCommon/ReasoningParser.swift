@@ -228,6 +228,18 @@ public struct ReasoningParser: Sendable {
             return out
         }
 
+        if startTag == "<ifm|think>",
+            !K2HorizonToolCallParser().startTagAliases.contains(where: buffer.contains)
+        {
+            let tags = openerSpellings + closerSpellings
+            for length in stride(from: buffer.count, through: 2, by: -1) {
+                let suffix = String(buffer.suffix(length))
+                if tags.contains(where: { $0.hasPrefix(suffix) && $0 != suffix }) {
+                    buffer.removeLast(length)
+                    break
+                }
+            }
+        }
         var out = drain(allowPartialTagAtEnd: false)
         if !buffer.isEmpty {
             // Anything left over after the final drain is plain text — emit
@@ -744,6 +756,28 @@ public struct ReasoningParser: Sendable {
                         $0, among: firstTagIsOpener ? openerSpellings : closerSpellings)
                 } == true
 
+            // K2 tool payloads own literal think tags in argument strings.
+            // Keep the native envelope intact for the downstream tool parser.
+            if startTag == "<ifm|think>", !insideReasoning,
+                let tool = K2HorizonToolCallParser().startTagAliases.compactMap({ buffer.range(of: $0) })
+                    .min(by: { $0.lowerBound < $1.lowerBound }),
+                firstTagRange.map({ tool.lowerBound < $0.lowerBound }) ?? true
+            {
+                let before = String(buffer[..<tool.lowerBound])
+                if !before.isEmpty { out.append(.content(before)) }
+                buffer = String(buffer[tool.lowerBound...])
+                if let end = K2HorizonToolCallParser().completeToolCallEnd(in: buffer) {
+                    out.append(.content(String(buffer[..<end])))
+                    buffer.removeSubrange(buffer.startIndex..<end)
+                    continue
+                }
+                if !allowPartialTagAtEnd {
+                    out.append(.content(buffer))
+                    buffer.removeAll(keepingCapacity: false)
+                }
+                break
+            }
+
             if preservesQwenToolCallPayloads, !insideReasoning,
                 let tool = buffer.range(of: "<tool_call>"),
                 firstTagRange.map({ tool.lowerBound < $0.lowerBound }) ?? true
@@ -850,6 +884,9 @@ public struct ReasoningParser: Sendable {
                 if preservesQwenToolCallPayloads && !insideReasoning {
                     literalOpeners.append("<tool_call>")
                 }
+                if startTag == "<ifm|think>", !insideReasoning {
+                    literalOpeners += K2HorizonToolCallParser().startTagAliases
+                }
                 let longestTag = (openerSpellings + closerSpellings + literalOpeners)
                     .map(\.count).max() ?? 0
                 let safeTail = max(0, longestTag - 1)
@@ -951,6 +988,22 @@ extension ReasoningParser {
                 endTag: "<channel|>",
                 startInReasoning: false,
                 stripStrayTags: false)
+        }
+
+        // MiniMax-M3 / M3.1: `<mm:think>…</mm:think>`. M3.1's template is adaptive: the generation prompt carries no
+        // reasoning prefix and the first generated token is the decision, `<mm:think>` (reasoning follows, closed by
+        // `</mm:think>`) or `</mm:think>` (answer directly). So the parser starts in content: `<mm:think>` opens the
+        // rail, and a leading `</mm:think>` is consumed as the close of an empty rail. A prompt that does end inside
+        // the rail (M3's enabled thinking mode prefills `<mm:think>`) is resolved by `forPrompt`. Plain `<think>` /
+        // `</think>` are accepted as aliases (vMLX's `minimax_m3` parser; observed in live M3 output).
+        if normalized == "minimax_m3" || normalized.hasPrefix("minimax_m3_") {
+            return ReasoningParser(
+                startTag: "<mm:think>",
+                endTag: "</mm:think>",
+                startInReasoning: false,
+                stripStrayTags: true,
+                startTagAliases: ["<think>"],
+                endTagAliases: ["</think>"])
         }
 
         // `glm_think_block` is the stamp GLM-5.3 bundles actually ship
@@ -1106,6 +1159,11 @@ extension ReasoningParser {
                 // that we don't want to silently strip it.
                 stripStrayTags: false,
                 startTagAliases: ["\u{2B55}thought\n"])
+        case "k2_horizon", "k2horizon":
+            return ReasoningParser(
+                startTag: "<ifm|think>", endTag: "</ifm|think>", startInReasoning: true,
+                startTagAliases: ["<ifm|think_fast>", "<ifm|think_faster>"],
+                endTagAliases: ["</ifm|think_fast>", "</ifm|think_faster>"])
         case "none", "off", "disabled", "mistral", "gemma":
             return nil
         case "muse_glimmer", "muse-glimmer", "muse", "atem":
@@ -1359,6 +1417,12 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
         .replacingOccurrences(of: "-", with: "_")
         .replacingOccurrences(of: ".", with: "_")
     let compact = normalized.replacingOccurrences(of: "_", with: "")
+
+    if compact == "k2horizon" { return "k2_horizon" }
+
+    // MiniMax-M3 / M3.1 (`minimax_m3`, `minimax_m3_vl`): `<mm:think>` rail, not the M2 `<think>` one. Checked before
+    // the `minimax` think_xml prefix below.
+    if compact.hasPrefix("minimaxm3") { return "minimax_m3" }
 
     // Official Hunyuan v3 uses `:opensource`-suffixed think markers; the
     // dedicated stamp resolves to that parser (see `fromCapabilityName`).

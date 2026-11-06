@@ -66,6 +66,8 @@ struct QuotaRow: Equatable, Sendable {
     /// The conversation. `nil` = a row written before chains existed: it is
     /// its own single-row chain.
     let chainId: String?
+    /// Model/quantization namespace; nil and empty retain the legacy namespace.
+    var modelKey: String? = nil
     /// A companion payload with no KV row.
     let isLegacyCompanion: Bool
 }
@@ -105,6 +107,7 @@ struct QuotaPlan: Equatable {
     /// Always `totalBefore - evictedBytes`.
     let totalAfter: Int64
     let event: DiskCachePressureEvent?
+    var activeModelKey: String? = nil
 
     /// A selected victim is not proof of lost progress: its file deletion can fail.
     /// `lostRows` includes a KV payload or required companion actually removed.
@@ -112,6 +115,7 @@ struct QuotaPlan: Equatable {
         guard let event else { return nil }
         let active = rows.filter {
             !$0.isStableRoot && !$0.isLegacyCompanion && $0.chainId == event.chainId
+                && ($0.modelKey ?? "") == (activeModelKey ?? "")
         }
         if event.kind == .activeTipDropped {
             let tip = DiskQuotaPlanner.resumePoint(of: active)
@@ -126,10 +130,12 @@ struct QuotaPlan: Equatable {
 /// SQLite, no locks, no clock.
 ///
 /// Vocabulary. A **chain** is every non-stable, non-legacy row sharing a
-/// `chainId`; a row with `chainId == nil` is a chain of one. A chain's **tip**
-/// is its row with the greatest `tokenCount` (ties: greatest recency, then
-/// greatest `id`). **Chain recency** is the greatest recency among its rows.
-/// The **active** chain is the one named by `activeChain`; every other chain
+/// `chainId` and model namespace; nil/empty model namespaces are equivalent.
+/// A row with `chainId == nil` is a chain of one. A chain's **tip**
+/// is its most recent marked resume boundary (ties: greatest `tokenCount`,
+/// then greatest `id`). With no marked boundary, the largest row remains
+/// the tip (ties: recency, then id). **Chain recency** is the greatest recency among its rows.
+/// The **active** chain is named by `activeChain` and `activeModelKey`; every other chain
 /// is **cold**. `low = Int64(Double(cap) * lowWatermarkFraction)`.
 ///
 /// The policy:
@@ -192,7 +198,7 @@ enum DiskQuotaPlanner {
     static let lowWatermarkFraction = 0.90
 
     private enum ChainKey: Hashable {
-        case named(String)
+        case named(String, modelNamespace: String)
         /// A chain-less row, keyed by its own id so it can never collide with
         /// a named chain or with another chain-less row.
         case solo(String)
@@ -223,7 +229,9 @@ enum DiskQuotaPlanner {
         let recency: Double
     }
 
-    static func plan(rows: [QuotaRow], capBytes: Int64, activeChain: String?) -> QuotaPlan {
+    static func plan(
+        rows: [QuotaRow], capBytes: Int64, activeChain: String?, activeModelKey: String? = nil
+    ) -> QuotaPlan {
         assert(Set(rows.map(\.id)).count == rows.count, "QuotaRow ids must be unique")
         let totalBefore = IndexedBytes.total(rows.lazy.map(\.bytes))
         var total = totalBefore
@@ -233,7 +241,8 @@ enum DiskQuotaPlanner {
         func finish() -> QuotaPlan {
             QuotaPlan(
                 evict: evict, evictedBytes: totalBefore - total,
-                totalBefore: totalBefore, totalAfter: total, event: event)
+                totalBefore: totalBefore, totalAfter: total, event: event,
+                activeModelKey: activeModelKey)
         }
         /// Evicts from `candidates`, in order, until `total <= goal`.
         /// Returns whether it took anything.
@@ -251,7 +260,7 @@ enum DiskQuotaPlanner {
         // 1. The trigger is the cap.
         guard total > capBytes else { return finish() }
 
-        let activeKey = activeChain.map(ChainKey.named)
+        let activeKey = activeChain.map { ChainKey.named($0, modelNamespace: activeModelKey ?? "") }
         let activeTipBefore =
             rows
             .filter { isChainRow($0) && !$0.isCanonicalCheckpoint && chainKey($0) == activeKey }
@@ -356,7 +365,7 @@ enum DiskQuotaPlanner {
     }
 
     private static func chainKey(_ row: QuotaRow) -> ChainKey {
-        row.chainId.map(ChainKey.named) ?? .solo(row.id)
+        row.chainId.map { ChainKey.named($0, modelNamespace: row.modelKey ?? "") } ?? .solo(row.id)
     }
 
     /// The row a conversation resumes from: its newest resume boundary, or
@@ -369,10 +378,15 @@ enum DiskQuotaPlanner {
     }
 
     /// `max(by:)` order for a chain's tip: a resume boundary over any other
-    /// row, then tokens, then recency, then id.
+    /// row. Marked boundaries prefer recency: editing an earlier turn can
+    /// produce a shorter current branch than the abandoned history. Unmarked
+    /// rows retain the legacy tokens-first order. Ties always end on id.
     private static func tipOrder(_ a: QuotaRow, _ b: QuotaRow) -> Bool {
         if a.isCanonicalCheckpoint != b.isCanonicalCheckpoint { return a.isCanonicalCheckpoint }
         if a.isResumeBoundary != b.isResumeBoundary { return !a.isResumeBoundary }
+        if a.isResumeBoundary && b.isResumeBoundary && a.recency != b.recency {
+            return a.recency < b.recency
+        }
         if a.tokenCount != b.tokenCount { return a.tokenCount < b.tokenCount }
         if a.recency != b.recency { return a.recency < b.recency }
         return a.id < b.id

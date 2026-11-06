@@ -42,8 +42,7 @@ struct VMLXMemorySafetySettingsTests {
         #expect(plan.allowed)
         #expect(plan.loadConfiguration.memoryLimit == .fraction(0.70))
         #expect(plan.loadConfiguration.maxResidentBytes == .absolute(128 << 20))
-        #expect(plan.loadConfiguration.useMmapSafetensors)
-        #expect(plan.loadConfiguration.jangPress == .disabled)
+        #expect(!plan.loadConfiguration.useMmapSafetensors)
         #expect(plan.cache.prefix.enabled)
         #expect(!plan.cache.pagedKV.enabled)
         #expect(plan.cache.blockDisk.enabled)
@@ -199,49 +198,17 @@ struct VMLXMemorySafetySettingsTests {
         #expect(overBudget.cache.defaultMaxKVSize == 16_384)
     }
 
-    @Test("memory safety does not make MLXPress the universal slider")
-    func memorySafetyDoesNotMakeMLXPressTheUniversalSlider() {
-        var settings = VMLXServerRuntimeSettings()
-        let denseGemma = LoadBundleFacts(
-            totalSafetensorsBytes: 30 << 30,
-            isRouted: false,
-            physicalMemory: 24 << 30,
-            modelType: "gemma4",
-            weightFormat: "mxfp4")
-        let routedJang = LoadBundleFacts(
-            totalSafetensorsBytes: 30 << 30,
-            isRouted: true,
-            physicalMemory: 24 << 30,
-            modelType: "mimo_v2",
-            weightFormat: "jangtq",
-            hasJangConfig: true,
-            hasJangTQRuntime: true,
-            numRoutedExperts: 64,
-            topK: 8)
-
-        let densePlan = settings.resolvedMemorySafetyPlan(
-            baseLoadConfiguration: .osaurusProduction,
-            bundleFacts: denseGemma)
-        var provenRoutedBase = LoadConfiguration.osaurusProduction
-        provenRoutedBase.jangPress = .auto(envFallback: true)
-        let routedWithoutOptIn = settings.resolvedMemorySafetyPlan(
-            baseLoadConfiguration: provenRoutedBase,
-            bundleFacts: routedJang)
-        settings.memorySafety.allowExperimentalMLXPress = true
-        let routedPlan = settings.resolvedMemorySafetyPlan(
-            baseLoadConfiguration: provenRoutedBase,
-            bundleFacts: routedJang)
-
-        #expect(densePlan.loadConfiguration.jangPress == .disabled)
-        #expect(densePlan.warnings.isEmpty)
-        #expect(routedWithoutOptIn.loadConfiguration.jangPress == .disabled)
-        #expect(routedWithoutOptIn.warnings.contains {
-            $0.contains("MLXPress/JangPress was not selected")
-        })
-        #expect(routedPlan.loadConfiguration.jangPress == .auto(envFallback: true))
+    @Test("retired cold-tier settings cannot re-enable it on migration")
+    func ignoresRetiredColdTierSetting() throws {
+        let data = Data(#"{"mode":"safe_auto","allowExperimentalMLXPress":true,"keepModelInMemory":false}"#.utf8)
+        let settings = try JSONDecoder().decode(VMLXMemorySafetySettings.self, from: data)
+        #expect(settings.mode == .safeAuto)
+        #expect(!settings.keepModelInMemory)
+        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(settings)) as? [String: Any]
+        #expect(encoded?["allowExperimentalMLXPress"] == nil)
     }
 
-    @Test("near-RAM-scale packs materialize instead of mmap when they fit")
+    @Test("owned loading preserves near-RAM allowance and explicit safety limits")
     func nearRAMScalePacksMaterializeInsteadOfMmapWhenTheyFit() {
         var settings = VMLXServerRuntimeSettings()
         let hy3Scale = LoadBundleFacts(
@@ -256,25 +223,26 @@ struct VMLXMemorySafetySettingsTests {
             bundleFacts: hy3Scale)
         #expect(!plan.loadConfiguration.useMmapSafetensors)
         #expect(plan.loadConfiguration.memoryLimit == .fraction(94.0 / 128.0 + 0.06))
-        #expect(plan.warnings.contains { $0.contains("materialized instead of mmap") })
+        #expect(plan.warnings.contains { $0.contains("using owned weights") })
 
         // A user-pinned load fraction wins: the rule must not override it.
         settings.memorySafety.customPhysicalMemoryFraction = 0.75
         let pinned = settings.resolvedMemorySafetyPlan(
             baseLoadConfiguration: .osaurusProduction,
             bundleFacts: hy3Scale)
-        #expect(pinned.loadConfiguration.useMmapSafetensors)
+        #expect(!pinned.loadConfiguration.useMmapSafetensors)
         #expect(pinned.loadConfiguration.memoryLimit == .fraction(0.75))
 
-        // Strict mode never opts in.
+        // Strict keeps its original cap; ownership is independent of the safety profile.
         settings.memorySafety.customPhysicalMemoryFraction = nil
         settings.memorySafety.mode = .strict
         let strict = settings.resolvedMemorySafetyPlan(
             baseLoadConfiguration: .osaurusProduction,
             bundleFacts: hy3Scale)
-        #expect(strict.loadConfiguration.useMmapSafetensors)
+        #expect(!strict.loadConfiguration.useMmapSafetensors)
+        #expect(strict.loadConfiguration.memoryLimit == .fraction(0.60))
 
-        // A pack that cannot fit in RAM keeps mmap streaming.
+        // An oversized pack must not silently gain a larger allowance or mmap fallback.
         settings.memorySafety.mode = .safeAuto
         let cannotFit = LoadBundleFacts(
             totalSafetensorsBytes: 30 << 30,
@@ -285,8 +253,9 @@ struct VMLXMemorySafetySettingsTests {
         let oversized = settings.resolvedMemorySafetyPlan(
             baseLoadConfiguration: .osaurusProduction,
             bundleFacts: cannotFit)
-        #expect(oversized.loadConfiguration.useMmapSafetensors)
-        #expect(!oversized.warnings.contains { $0.contains("materialized instead of mmap") })
+        #expect(!oversized.loadConfiguration.useMmapSafetensors)
+        #expect(oversized.loadConfiguration.memoryLimit == .fraction(0.70))
+        #expect(!oversized.warnings.contains { $0.contains("using owned weights") })
     }
 
     @Test("memory safety preserves hybrid SSM and engine selected cache topology")

@@ -6,26 +6,9 @@ import Testing
 
 @testable import MLXLMCommon
 
-/// The ONLY two native-MTP models we ship are:
-///   - `OsaurusAI/Qwen3.6-27B-MXFP8-MTP`      (model_type `qwen3_5`)
-///   - `OsaurusAI/Qwen3.6-35B-A3B-MXFP8-MTP`  (model_type `qwen3_5_moe`)
-///
-/// Both must auto-launch native MTP at **depth 3** with no user action. The depth
-/// is not guessed from the model name or the MTP layer count (both bundles ship a
-/// SINGLE MTP head, `mtp_layers: 1` — depth 3 comes from iterating that head, not
-/// from having three of them). It is read from the bundle-local, measured
-/// `vmlx_mtp_tuning.json`.
-///
-/// That makes the tuning artifact load-bearing in a way nothing guards today:
-/// `NativeMTPAutoDecodePolicy.recommendation` is FAIL-CLOSED and returns nil —
-/// silently disabling speculative decode entirely, not merely lowering the depth —
-/// if ANY of six gates misses. Re-publishing a bundle without the file, or with a
-/// tuning row whose `speedup_vs_baseline` slips to 1.0, turns MTP off with no
-/// error anywhere.
-///
-/// These fixtures are the REAL published tuning rows (verified against
-/// huggingface.co/OsaurusAI/Qwen3.6-27B-MXFP8-MTP and .../Qwen3.6-35B-A3B-MXFP8-MTP).
-@Suite("Both shipped native-MTP models auto-launch at depth 3")
+/// Non-Flash families require workload-general tuning and explicit Adaptive.
+/// Historical narrow counting artifacts must not become production defaults.
+@Suite("Native MTP family-default and workload-general tuning contracts")
 struct NativeMTPDepth3AutoLaunchTests {
 
     /// The published `vmlx_mtp_tuning.json`, verbatim.
@@ -46,8 +29,14 @@ struct NativeMTPDepth3AutoLaunchTests {
         }
         """
 
-    private static func publishedTuning() throws -> NativeMTPTuning {
-        let data = Data(publishedTuningJSON.utf8)
+    private static func publishedTuning(workloadGeneral: Bool = true) throws -> NativeMTPTuning {
+        // Synthetic general-workload control; the unchanged historical artifact
+        // is retained below as a rejection regression, not represented as proof.
+        let json =
+            workloadGeneral
+            ? publishedTuningJSON.replacingOccurrences(
+                of: "deterministic_count_96_tokens", with: "general_mixed") : publishedTuningJSON
+        let data = Data(json.utf8)
         let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         let native = try #require(root?["native_mtp"] as? [String: Any])
         let nativeData = try JSONSerialization.data(withJSONObject: native)
@@ -75,7 +64,7 @@ struct NativeMTPDepth3AutoLaunchTests {
     // MARK: - The load-bearing contract
 
     @Test(
-        "the two shipped MTP models auto-launch at depth 3",
+        "workload-general tuning admits depth 3 for supported non-Flash families",
         arguments: [
             ("qwen3_5", "Qwen3.6-27B-MXFP8-MTP"),
             ("qwen3_5_moe", "Qwen3.6-35B-A3B-MXFP8-MTP"),
@@ -113,14 +102,19 @@ struct NativeMTPDepth3AutoLaunchTests {
         arguments: ["qwen3_5", "qwen3_5_moe"])
     func resolvedDraftStrategyIsNativeMTPDepth3(modelType: String) throws {
         let status = Self.shippedStatus(tuning: try Self.publishedTuning())
-        let settings = VMLXServerRuntimeSettings()
+        var settings = VMLXServerRuntimeSettings()
+        #expect(
+            settings.resolvedMTPDraftStrategy(
+                configData: Self.config(modelType: modelType), jangConfig: nil, status: status)
+                == nil)
+        settings.mtp.mode = .auto
 
         let strategy = try #require(
             settings.resolvedMTPDraftStrategy(
                 configData: Self.config(modelType: modelType),
                 jangConfig: nil,
                 status: status),
-            "default settings must resolve a native-MTP strategy for \(modelType)")
+            "explicit Adaptive with general tuning must resolve for \(modelType)")
 
         guard case .nativeMTP(let depth, _) = strategy else {
             Issue.record("expected .nativeMTP, got \(strategy)")
@@ -129,6 +123,19 @@ struct NativeMTPDepth3AutoLaunchTests {
         #expect(depth == 3)
         #expect(strategy.usesNativeMTP)
         #expect(strategy.usesBlockDiffusion == false)
+    }
+
+    @Test("historical counting-only tuning remains ineligible even for explicit Adaptive")
+    func narrowPublishedTuningRemainsRejected() throws {
+        let tuning = try Self.publishedTuning(workloadGeneral: false)
+        #expect(!tuning.isWorkloadGeneral)
+        #expect(tuning.usableBestDepth == nil)
+        var settings = VMLXServerRuntimeSettings()
+        settings.mtp.mode = .auto
+        #expect(
+            settings.resolvedMTPDraftStrategy(
+                configData: Self.config(modelType: "qwen3_5"),
+                jangConfig: nil, status: Self.shippedStatus(tuning: tuning)) == nil)
     }
 
     // MARK: - Why the artifact is load-bearing (the silent-off traps)

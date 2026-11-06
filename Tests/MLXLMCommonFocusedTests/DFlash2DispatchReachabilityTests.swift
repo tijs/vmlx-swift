@@ -33,6 +33,23 @@ final class DFlash2DispatchReachabilityTests: XCTestCase {
         return try String(contentsOf: url, encoding: .utf8)
     }
 
+    func testStagedVerificationDoesNotEnableCompilationWithoutPromotedCaches() throws {
+        let text = try source("Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift")
+        let promotionStart = try XCTUnwrap(text.range(of: "if useStagedVerify, HardwareInfo.isCompiledDecodeSupported"))
+        let promotionEnd = try XCTUnwrap(text.range(of: "self.useCompiledVerify = true"))
+        let promotion = text[promotionStart.lowerBound..<promotionEnd.upperBound]
+        XCTAssertTrue(promotion.contains("VMLX_DFLASH2_COMPILED_VERIFY"))
+        XCTAssertTrue(promotion.contains("CompilableKVCache(from: layer"))
+        XCTAssertTrue(text.contains("if !useCompiledVerify || !stagedWarmedSizes.contains(bs) {"),
+                      "Default eager staging must not build a compiled forward on cycle two")
+        XCTAssertEqual(text.components(separatedBy: "self.useCompiledVerify = true").count - 1, 1)
+        let abandonStart = try XCTUnwrap(text.range(of: "private mutating func abandonInFlightVerify("))
+        let abandonEnd = try XCTUnwrap(text.range(of: "private mutating func buildCompiledVerify("))
+        XCTAssertTrue(text[abandonStart.lowerBound..<abandonEnd.lowerBound]
+            .contains("compiledVerify.removeAll(keepingCapacity: true)"),
+            "Replacing staging slots must release traces that captured the old arrays")
+    }
+
     /// `BatchEngine.generate` is what the host chat window calls. Missing
     /// here means speculation silently never runs in the product, which is
     /// exactly the bug this file was written for.
@@ -48,6 +65,23 @@ final class DFlash2DispatchReachabilityTests: XCTestCase {
         XCTAssertTrue(
             text.contains("strategy.dflash2DrafterPath"),
             "BatchEngine's solo path must read the drafter path off the strategy")
+    }
+
+    /// A DFlash 2 request that arrives while the engine serves another request (continuous batching
+    /// > 1: a spawned subagent, a parallel delegation) decodes as a batched AR slot, with a log line,
+    /// instead of being cancelled. The second of two concurrent requests used to fail outright.
+    func testBatchEngineGenerateServesABusyEngineDFlash2RequestAutoregressively() throws {
+        let text = try source("Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift")
+        XCTAssertFalse(
+            text.contains("Rejected BatchEngine.generate DFlash 2 request"),
+            "a busy engine must not cancel a DFlash 2 request")
+        guard let notice = text.range(of: "BatchEngine.generate DFlash 2 request decodes autoregressively") else {
+            return XCTFail("the autoregressive fallback must be logged")
+        }
+        let after = text[notice.upperBound...].prefix(400)
+        XCTAssertTrue(
+            after.contains("parameters.draftStrategy = nil"),
+            "the fallback must drop the strategy so the batched path does not carry it")
     }
 
     /// The raw batched submit path has no way to express a draft/verify
@@ -90,7 +124,7 @@ final class DFlash2DispatchReachabilityTests: XCTestCase {
     /// there too, or the ordering in `Evaluate` never gets a chance.
     func testSettingsResolutionPrefersDFlash2OverNativeMTP() throws {
         let text = try source("Libraries/MLXLMCommon/ServerRuntimeSettings.swift")
-        guard let selectionIndex = text.range(of: "resolvedDFlash2Selection(configData:")?.lowerBound,
+        guard let selectionIndex = text.range(of: "let selection = resolvedDFlash2Selection(")?.lowerBound,
             let mtpIndex = text.range(of: "return .nativeMTP(depth: depth")?.lowerBound
         else {
             return XCTFail("could not locate the strategy resolution branches")

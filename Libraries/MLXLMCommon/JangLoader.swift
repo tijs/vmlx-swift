@@ -401,6 +401,11 @@ public enum ParserResolution {
                 .chatTemplate
             )
         }
+        // MiniMax-M3 / M3.1 templates render reasoning as `<mm:think>…</mm:think>` (and an answer without reasoning
+        // as `</mm:think>answer`): that envelope names the M3 parser, whatever generic tags the template also uses.
+        if let chatTemplate, chatTemplate.contains("<mm:think>"), chatTemplate.contains("</mm:think>") {
+            return (ReasoningParser.fromCapabilityName("minimax_m3"), .chatTemplate)
+        }
         // Template-native `<think>...</think>` envelope. This is the PRECISE
         // reasoning signal: a reasoning-tuned bundle (e.g. VibeThinker, a
         // qwen2-based thinker) carries the literal tag pair in its chat
@@ -430,6 +435,14 @@ public enum ParserResolution {
             ReasoningParser.fromCapabilityName(stamp),
             .modelTypeHeuristic
         )
+    }
+
+    /// The stamp name a factory records for a parser `reasoning(...)` resolved from the chat template (the
+    /// generation loop rebuilds the parser from this name): `minicpm5`, `minimax_m3` or the `<think>` family's `qwen3`.
+    public static func templateReasoningStampName(_ parser: ReasoningParser?) -> String {
+        if parser?.preservesXMLFunctionPayloads == true { return "minicpm5" }
+        if parser?.startTag == "<mm:think>" { return "minimax_m3" }
+        return "qwen3"
     }
 
     /// True when the chat template carries a literal `<think>...</think>`
@@ -1912,6 +1925,39 @@ public struct JangLoader: Sendable {
         }
         let chat: JangChatConfig?
         if let chDict = chatDict {
+            // Some bundles declare thinking and its effort vocabulary separately.
+            // Normalize that explicit contract once; canonical reasoning blocks
+            // remain authoritative when both forms are present.
+            let splitReasoning: JangChatReasoning?
+            if chDict["reasoning"] == nil, topLevelReasoning == nil,
+                let thinking = chDict["thinking"] as? [String: Any],
+                thinking["supported"] as? Bool != false,
+                thinking["template_flag"] as? String == "enable_thinking",
+                let enabled = thinking["default"] as? Bool,
+                let effort = chDict["reasoning_effort"] as? [String: Any],
+                let rawLevels = effort["values"] as? [String], !rawLevels.isEmpty,
+                rawLevels.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                ),
+                Set(
+                    rawLevels.map {
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    }
+                ).count
+                    == rawLevels.count
+            {
+                let levels = rawLevels.map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                }
+                let declaredDefault = (effort["default"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                splitReasoning = JangChatReasoning(
+                    supported: thinking["supported"] as? Bool,
+                    defaultMode: enabled ? "thinking" : "chat",
+                    defaultEffort: declaredDefault.flatMap { levels.contains($0) ? $0 : nil },
+                    reasoningEffortLevels: levels.map(Optional.some))
+            } else {
+                splitReasoning = nil
+            }
             // reasoning subblock
             let reasoning: JangChatReasoning?
             if let rDict = chDict["reasoning"] as? [String: Any] {
@@ -1953,7 +1999,9 @@ public struct JangLoader: Sendable {
                     reasoningEffortLevels: effortsDeclared
                         ? parseEffortLevels(rDict["supported_reasoning_efforts"]) : nil
                 )
-            } else { reasoning = nil }
+            } else {
+                reasoning = splitReasoning
+            }
 
             // tool_calling subblock
             let toolCalling: JangChatToolCalling?
@@ -2010,6 +2058,9 @@ public struct JangLoader: Sendable {
                 // context), changing Raptor's prompt bytes between releases.
                 templateKwargsDefaults = ChatTemplateKwargsDefaults(
                     enableThinking: false)
+            } else if let splitReasoning {
+                templateKwargsDefaults = ChatTemplateKwargsDefaults(
+                    enableThinking: splitReasoning.defaultMode == "thinking")
             } else {
                 templateKwargsDefaults = nil
             }
@@ -2478,7 +2529,7 @@ public struct JangLoader: Sendable {
                 switch declared {
                 case .quantize(let quantization):
                     return quantization
-                case .skip:
+                case .skip, .formatOwned:
                     return nil
                 }
             }
@@ -2537,16 +2588,26 @@ public struct JangLoader: Sendable {
             let packedDim = weightArray.shape.last ?? 0
             let numGroups = scalesArray.shape.last ?? 1
             let (bits, inferredGroupSize): (Int, Int)
-            let declaredForLayer = declaredQuantization(for: basePath)
+            let hasOtherTower = basePath.lowercased().split(separator: ".").contains {
+                component in
+                ["visual", "vision", "audio", "speech"].contains { component.hasPrefix($0) }
+            }
+            let skipsDeclaredAliases =
+                declaredPerLayerQuantization?
+                .declaresSkipForAnyAlias(of: basePath) ?? false
+            // Language geometry can resolve conflicting aliases. It cannot
+            // resolve another tower's width: preserve that tower's existing
+            // consistent declaration rather than applying a language hint.
+            let declaredForLayer =
+                skipsDeclaredAliases && !hasOtherTower
+                ? nil : declaredQuantization(for: basePath)
             let explicitForLayer: BaseConfiguration.Quantization? = {
                 guard let declaredPerLayerQuantization else { return nil }
                 // Contradictory aliases (one spelling `.quantize`, another
                 // `.skip`) make the declaration a coin flip decided by candidate
                 // order. Set it aside so the packed width is resolved from the
                 // tensors instead — see `declaresSkipForAnyAlias`.
-                guard !declaredPerLayerQuantization
-                    .declaresSkipForAnyAlias(of: basePath)
-                else { return nil }
+                guard !skipsDeclaredAliases else { return nil }
                 guard let explicit = declaredPerLayerQuantization
                     .explicitQuantizationOption(layer: basePath)
                 else { return nil }
@@ -2702,8 +2763,46 @@ public struct JangLoader: Sendable {
                 return (declared.bits, declared.groupSize)
             }()
 
+            // The TOP-LEVEL declared affine default (config.json `quantization` / jang_config
+            // `affine_bits`+`affine_group_size`), when it can actually have packed THIS tensor. It is
+            // the producer's explicit statement for every non-overridden affine leaf, and -- unlike a
+            // per-layer declaration -- is only reached below as a tie-break against the validInDims
+            // heuristic, never over a semantic-width hint. Needed because `validInDims` is derived
+            // from config dims and does not include every projection's input width: DSV4's grouped
+            // o-proj first stage `wo_a` consumes groupFeat = hidden*heads/oGroups (4096 here), a width
+            // no other tensor exposes, so it is absent from validInDims while the WRONG alternative
+            // (8192) is present -- `inferFromUniqueValidInDim` then uniquely picks 4-bit/g128 and the
+            // 8-bit weights dequantize to an empty output that collapses the forward.
+            let isDeepseekGroupedOProjFirstStage =
+                basePath.hasSuffix(".attn.wo_a") || basePath.hasSuffix(".self_attn.wo_a")
+                || basePath == "attn.wo_a"
+            let declaredDefaultIfConsistent: (bits: Int, groupSize: Int)? = {
+                guard let d = declaredDefaultQuantization, d.bits > 0, d.groupSize > 0
+                else { return nil }
+                let inDim = numGroups * d.groupSize
+                guard inDim > 0, packedDim > 0, packedDim * 32 == inDim * d.bits
+                else { return nil }
+                return (d.bits, d.groupSize)
+            }()
+
+            // A packed row can realize two different widths. For language
+            // anchors and hidden-input projections, the graph's exact hidden
+            // width disambiguates stale per-module metadata. Other towers have
+            // their own widths and retain their declarations.
+            let semanticHiddenOverride: (bits: Int, groupSize: Int)? = {
+                guard let declared = declaredIfConsistent,
+                    isLanguageHiddenAnchor || isHiddenInputProjection,
+                    let hiddenSize = hiddenSizeHint,
+                    let exact = inferExactQuantization(expectedInDim: hiddenSize),
+                    exact.bits != declared.bits || exact.groupSize != declared.groupSize
+                else { return nil }
+                return hasOtherTower ? nil : exact
+            }()
+
             if let manifest = manifestQuantization(for: basePath) {
                 (bits, inferredGroupSize) = (manifest.bits, manifest.groupSize)
+            } else if let exact = semanticHiddenOverride {
+                (bits, inferredGroupSize) = exact
             } else if let declared = declaredIfConsistent {
                 (bits, inferredGroupSize) = declared
             } else if isLanguageHiddenAnchor,
@@ -2827,6 +2926,19 @@ public struct JangLoader: Sendable {
                     knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: hiddenSize)
+            } else if isDeepseekGroupedOProjFirstStage,
+                      let dd = declaredDefaultIfConsistent,
+                      let g = inferFromUniqueValidInDim(),
+                      g.bits != dd.bits || g.groupSize != dd.groupSize
+            {
+                // DSV4-family grouped o-proj first stage ONLY (`…attn.wo_a`): its input width
+                // groupFeat is absent from validInDims, so the unique-membership guess can
+                // CONTRADICT a shape-consistent explicit default (V4.1: 4-bit/g128 picked for
+                // 8-bit/g64 weights -> empty dequant -> collapsed forward). Trust the
+                // producer's default there. Scoped to the contradiction on `wo_a` so every
+                // other tensor, and any bundle where the guess already agreed (or found
+                // nothing), resolves exactly as before.
+                (bits, inferredGroupSize) = dd
             } else if let picked = inferFromUniqueValidInDim() {
                 (bits, inferredGroupSize) = picked
             } else if isExpertDownProjection && !validInDims.isEmpty {
@@ -2917,7 +3029,7 @@ public struct JangLoader: Sendable {
                     + "-> shape-inferred (bits=\(inferred.0), gs=\(inferred.1)), "
                     + "\(disagreementCount) per-layer override\(plural) applied.\n"
             )
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
 
         return BaseConfiguration.PerLayerQuantization(
@@ -3161,7 +3273,7 @@ public struct JangLoader: Sendable {
 
         var allWeights: [String: MLXArray] = [:]
         for file in files {
-            let (weights, _) = try loadArraysAndMetadata(url: file)
+            let (weights, _) = try ResidentSafetensorsReader.loadWeights(url: file)
             for (key, array) in weights {
                 if array.dtype == .uint8 {
                     allWeights[key] = repackUint8ToUint32(array)
@@ -3184,10 +3296,10 @@ public struct JangLoader: Sendable {
         newShape.append(4)
 
         let reshaped = array.reshaped(newShape)
-        let b0 = reshaped[0..., 0].asType(.uint32)
-        let b1 = reshaped[0..., 1].asType(.uint32) << 8
-        let b2 = reshaped[0..., 2].asType(.uint32) << 16
-        let b3 = reshaped[0..., 3].asType(.uint32) << 24
+        let b0 = reshaped[.ellipsis, 0].asType(.uint32)
+        let b1 = reshaped[.ellipsis, 1].asType(.uint32) << 8
+        let b2 = reshaped[.ellipsis, 2].asType(.uint32) << 16
+        let b3 = reshaped[.ellipsis, 3].asType(.uint32) << 24
         return b0 | b1 | b2 | b3
     }
 

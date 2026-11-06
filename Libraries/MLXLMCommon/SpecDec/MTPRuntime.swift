@@ -561,6 +561,9 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
     /// Bundle-local blocks remain authoritative except for the exact frozen
     /// 4M block whose recorded runtime limitation PR #365 removed.
     public let measuredFamilyAutoDepth: Int?
+    /// Why the physically present MTP tensors do not form a usable head (no fusion projection or no compute
+    /// block). `nil` = topology complete, or not inspected (hand-built statuses). Set only by the inspector.
+    public let incompleteTopologyReason: String?
 
     public init(
         bundleHasMTP: Bool = false,
@@ -573,8 +576,10 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         configEvidence: [String] = [],
         nativeMTPTuning: NativeMTPTuning? = nil,
         quantizationFingerprint: String? = nil,
-        measuredFamilyAutoDepth: Int? = nil
+        measuredFamilyAutoDepth: Int? = nil,
+        incompleteTopologyReason: String? = nil
     ) {
+        self.incompleteTopologyReason = incompleteTopologyReason
         self.bundleHasMTP = bundleHasMTP
         self.configuredLayers = configuredLayers
         self.tensorCount = tensorCount
@@ -589,7 +594,7 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
     }
 
     public var hasCompleteMTPArtifact: Bool {
-        bundleHasMTP && configuredLayers > 0 && tensorCount > 0
+        bundleHasMTP && configuredLayers > 0 && tensorCount > 0 && incompleteTopologyReason == nil
     }
 
     public var hasUsableNativeMTPTuning: Bool {
@@ -702,7 +707,15 @@ public struct NativeMTPForwardResult {
     }
 }
 
-/// Capability exposed only by loaded models that have a real native MTP head.
+/// A model whose verifier cannot check drafts deeper than this exactly declares it here: it becomes the
+/// runtime's top rung for adaptive requests (``NativeMTPDepthPolicy/runtimeTopRung(model:environment:)``;
+/// ``VMLX_MTP_DEPTH_CAP`` still overrides). A CORRECTNESS bound only: a measured cost curve or "best depth"
+/// is never declared here (no hard draft depth: the adaptive controller demotes a losing depth, it is not
+/// capped below it). Fixed requests are unaffected.
+public protocol NativeMTPAdaptiveCeilingModel {
+    var nativeMTPAdaptiveDepthCeiling: Int { get }
+}
+
 public protocol NativeMTPModel: LanguageModel {
     /// True only when the concrete model instance has an instantiated MTP module
     /// whose weights were allowed through the loader.
@@ -742,6 +755,31 @@ public extension NativeMTPModel {
     ) -> NativeMTPForwardResult {
         nativeBackboneForward(inputs, cache: cache)
     }
+}
+
+/// A native-MTP proposer that drafts a whole block from target-side context in
+/// one call instead of one recursive head step per depth (Nemotron-3.5 Bolt's
+/// LiLiCorr drafter). Its proposals are deterministic: the iterator gives the
+/// verifier point masses (q = 1 at the drafted token), which keeps exact
+/// rejection sampling exact, and — unlike copy windows — they feed the adaptive
+/// depth controller like head drafts do.
+public protocol NativeMTPBlockDraftModel: NativeMTPModel {
+    /// True only when this loaded instance actually drafts by blocks (a
+    /// drafter is attached and no recursive head is). A family type can carry
+    /// both capabilities; the iterator asks the instance.
+    var nativeMTPUsesBlockDrafts: Bool { get }
+
+    /// Deepest proposal one block draft can produce (block size - 1).
+    var nativeMTPBlockDraftDepthLimit: Int { get }
+
+    /// Vocabulary width of the target's logits (the point-mass row width).
+    var nativeMTPBlockDraftVocabularySize: Int { get }
+
+    /// Draft `depth` tokens that follow `nextToken`. `nextToken` sits at the
+    /// target cache's committed position (not yet fed to the target); every
+    /// earlier position has been through a target forward on `targetCache`.
+    /// Returns int32 `[depth]`, left on the graph.
+    func nativeMTPBlockDraft(nextToken: MLXArray, depth: Int, targetCache: [KVCache]) -> MLXArray
 }
 
 /// Optional target scheduling specialization used only by the iterator's
@@ -785,9 +823,10 @@ public enum NativeMTPActivationError: Error, LocalizedError, CustomStringConvert
 
 /// Fail-closed native-MTP activation policy.
 ///
-/// The runtime never enables native MTP from a path or marketing name. The first
-/// Swift implementation is deliberately Qwen3.6/Qwen3.5 only and requires an
-/// explicit per-load request, supported config model type, and real MTP tensor keys.
+/// The runtime never enables native MTP from a path or marketing name. Loading
+/// requires an explicit per-load request, a supported config model type, and
+/// complete physical MTP tensor evidence. Automatic depth selection also needs
+/// measured tuning or an explicitly validated family policy.
 public enum NativeMTPActivation {
     @TaskLocal public static var explicitRequestOverride: Bool?
 
@@ -971,12 +1010,12 @@ public struct NativeMTPAutoDecodeRecommendation: Codable, Sendable, Equatable {
     }
 }
 
-/// Fail-closed native-MTP depth policy for tensor-proven Qwen3.5/Qwen3.6 artifacts.
+/// Native-MTP depth policy for tensor-proven, runtime-supported architectures.
 ///
 /// This policy never looks at the model path or marketing name. It uses config
 /// metadata, JANG quantization/profile metadata, and the MTP tensor census.
 /// Metadata-only bundles never receive a recommendation. Complete tensor-proven
-/// supported Qwen bundles resolve to a production launch recommendation only
+/// supported bundles resolve to a production launch recommendation only
 /// when their bundle-local `vmlx_mtp_tuning.json` row is usable.
 public enum NativeMTPAutoDecodePolicy {
     /// Architecture support for the server's Auto/manual-depth launch policy.
@@ -986,7 +1025,7 @@ public enum NativeMTPAutoDecodePolicy {
         guard let config = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any]
         else { return false }
         return modelTypes(config: config, fallback: nil).contains(
-            where: isSupportedQwenMTPModelType)
+            where: NativeMTPActivation.isSupportedNativeMTPModelType)
     }
 
     /// Manual-depth recommendation: validates the same family/tensor evidence
@@ -1008,7 +1047,7 @@ public enum NativeMTPAutoDecodePolicy {
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
-        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
+        guard modelTypes.contains(where: NativeMTPActivation.isSupportedNativeMTPModelType) else { return nil }
         let evidence = [
             "model_types=\(modelTypes.sorted().joined(separator: ","))",
             "mtp_tensors=\(status.tensorCount)",
@@ -1037,7 +1076,7 @@ public enum NativeMTPAutoDecodePolicy {
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
-        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
+        guard modelTypes.contains(where: NativeMTPActivation.isSupportedNativeMTPModelType) else { return nil }
         let familyColdStartDepth = measuredFamilyColdStartDepth(
             config: config,
             fallback: jangConfig?.sourceModel.architecture)
@@ -1108,7 +1147,7 @@ public enum NativeMTPAutoDecodePolicy {
             return NativeMTPAutoDecodeRecommendation(
                 depth: depth,
                 verifierMode: tuning.explicitVerifierMode,
-                reason: "Qwen native MTP uses \(NativeMTPTuning.fileName) best_depth=\(depth).",
+                reason: "Native MTP uses \(NativeMTPTuning.fileName) best_depth=\(depth).",
                 evidence: tuningEvidence)
         }
 
@@ -1128,7 +1167,7 @@ public enum NativeMTPAutoDecodePolicy {
                 depth: familyColdStartDepth,
                 verifierMode: nil,
                 reason:
-                    "Qwen3.8 Flash-Next uses measured family cold-start depth 3; live acceptance may adapt downward.",
+                    "Measured family cold-start depth \(familyColdStartDepth) (\(Self.isOrnith122BTopology(config) ? "Ornith 1.5 122B" : "Qwen3.8 Flash-Next")); live acceptance may adapt downward.",
                 evidence: evidence + [
                     "activation=qwen4_exp_measured_family_cold_start",
                     "family_cold_start_depth=\(familyColdStartDepth)",
@@ -1182,7 +1221,7 @@ public enum NativeMTPAutoDecodePolicy {
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
-        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else {
+        guard modelTypes.contains(where: NativeMTPActivation.isSupportedNativeMTPModelType) else {
             return "Bundle model type is not on the native-MTP allowlist."
         }
 
@@ -1226,8 +1265,32 @@ public enum NativeMTPAutoDecodePolicy {
         config: [String: Any]?,
         fallback: String?
     ) -> Int? {
-        modelTypes(config: config, fallback: fallback).contains(where: isQwen4ExpModelType)
-            ? 3 : nil
+        let types = modelTypes(config: config, fallback: fallback)
+        if types.contains(where: isQwen4ExpModelType) { return 3 }
+        // Ornith 1.5 122B (Qwen 3.5 MoE, 48 layers x 3072, 256 experts / top-8, one native MTP layer):
+        // its verify rows are bitwise the AR step (row-exact verify, 2026-10-20), so greedy MTP output
+        // equals AR, and depth 1 measured faster than AR on code and prose. Keyed from model_type plus
+        // topology (never a path or name); a bundle's explicit tuning block still wins, and the request's
+        // adaptive controller still falls back to AR on a workload that does not accept drafts.
+        if isOrnith122BTopology(config) { return ornith122BColdStartDepth }
+        // Nemotron's row-exact verifier and LiLiCorr proposer still need an
+        // in-app speedup measurement. Physical head presence establishes
+        // capability, not profitability. Keep Auto tuning-file driven;
+        // explicit manual depths remain available for measurement.
+        return nil
+    }
+
+    static let ornith122BColdStartDepth = 1
+
+    static func isOrnith122BTopology(_ config: [String: Any]?) -> Bool {
+        guard let config else { return false }
+        let text = (config["text_config"] as? [String: Any]) ?? config
+        func int(_ key: String) -> Int? { (text[key] as? NSNumber)?.intValue }
+        let modelType = normalize((text["model_type"] as? String) ?? "")
+        return (modelType == "qwen3_5_moe_text" || modelType == "qwen3_5_moe")
+            && int("hidden_size") == 3072 && int("num_hidden_layers") == 48
+            && int("num_experts") == 256 && int("num_experts_per_tok") == 8
+            && (int("mtp_num_hidden_layers") ?? 0) >= 1
     }
 
     private static func isQwen4ExpModelType(_ value: String) -> Bool {
@@ -1326,20 +1389,6 @@ public enum NativeMTPAutoDecodePolicy {
             return false
         }
         return true
-    }
-
-    private static func isSupportedQwenMTPModelType(_ value: String) -> Bool {
-        switch value {
-        case "qwen4_exp", "qwen4_exp_text", "qwen4exp", "qwen4exp_text":
-            return true
-        case "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
-             "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
-             "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
-             "qwen36", "qwen36_text", "qwen36_moe", "qwen36_moe_text":
-            return true
-        default:
-            return false
-        }
     }
 
     private static func normalize(_ value: String) -> String {
@@ -1518,13 +1567,16 @@ public enum NativeMTPVerifierStatePolicy {
     }
 
     public static func mode(for requestedMode: String?) -> Mode {
-        let env = ProcessInfo.processInfo.environment
+        // Read per recurrent layer per verify: the request's own mode needs no parsing, and the fallbacks use
+        // getenv (`RuntimeEnvironment`), never `ProcessInfo.environment`, which rebuilds the whole environment
+        // dictionary per call (~2 ms of host time per Allosaurus verify window, 36 GDN layers x 3 reads).
+        if requestedMode == Mode.inputCaptureStaged.rawValue { return .inputCaptureStaged }
         let raw =
             (requestedMode
-                ?? env["VMLX_NATIVE_MTP_STATE_COMMIT"]
-                ?? env["VMLINUX_NATIVE_MTP_STATE_COMMIT"]
-                ?? env["VMLX_NATIVE_MTP_HYBRID_VERIFY"]
-                ?? env["VMLINUX_NATIVE_MTP_HYBRID_VERIFY"]
+                ?? RuntimeEnvironment.value("VMLX_NATIVE_MTP_STATE_COMMIT")
+                ?? RuntimeEnvironment.value("VMLINUX_NATIVE_MTP_STATE_COMMIT")
+                ?? RuntimeEnvironment.value("VMLX_NATIVE_MTP_HYBRID_VERIFY")
+                ?? RuntimeEnvironment.value("VMLINUX_NATIVE_MTP_HYBRID_VERIFY")
                 ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -1740,19 +1792,27 @@ public struct MTPRecursiveDraftContract: Codable, Sendable, Equatable {
         return Int(ceil(Double(outputTokens) / Double(maxCommittedTokensPerVerify)))
     }
 
-    public static let mtplxDepth3 = MTPRecursiveDraftContract(depth: 3)
+    public static let recursiveDepth3 = MTPRecursiveDraftContract(depth: 3)
 }
 
 /// No-load MTP/VL inspector. It reads JSON metadata and safetensors headers only;
 /// it never materializes tensors or changes the active generation path.
 public enum MTPBundleInspector {
+    /// Tensor names physically present in the same shard scope used by the
+    /// loader. Also used for optional media modules: an index entry alone is
+    /// not evidence that its tensor exists, and index-less bundles are valid.
+    /// Reads bounded headers only, without allocating model tensors.
+    public static func loadableTensorNames(from directory: URL) throws -> [String] {
+        try loadTensorNames(from: directory)
+    }
+
     public static func inspect(
         modelDirectory: URL,
         jangConfig suppliedJangConfig: JangConfig? = nil
     ) throws -> MTPBundleStatus {
         let config = try loadJSONObjectIfExists(modelDirectory.appendingPathComponent("config.json"))
         let jangConfig = suppliedJangConfig ?? (try? JangLoader.loadConfig(at: modelDirectory))
-        let (configuredLayers, evidence, mtpLayerPrefixes) = configuredMTPLayers(
+        let (headLayers, evidence, mtpLayerPrefixes) = configuredMTPLayers(
             config: config,
             jangConfig: jangConfig)
         let tensorNames = try loadTensorNames(from: modelDirectory)
@@ -1768,11 +1828,20 @@ public enum MTPBundleInspector {
             fallback: jangConfig?.sourceModel.architecture)
         let quantizationFingerprint = MTPQuantizationTopology.fingerprint(config: config)
 
+        // A block drafter shipped beside the target (Nemotron-3.5 Bolt's `lilicorr/`) is the
+        // bundle's MTP artifact when it has no recursive head: its own config and shard headers
+        // are the physical evidence, read the same way as the target's.
+        let blockDrafter = inspectBlockDrafter(modelDirectory: modelDirectory, config: config)
+        let configuredLayers = Swift.max(headLayers, blockDrafter?.layers ?? 0)
         let runtimeMode = jangConfig?.runtime.mtpMode ?? .none
         let runtimeBundleHasMTP = jangConfig?.runtime.bundleHasMTP ?? false
         let metadataClaimsMTP = runtimeBundleHasMTP || runtimeMode != .none || configuredLayers > 0
-        let bundleHasMTP = !mtpNames.isEmpty
+        let bundleHasMTP = !mtpNames.isEmpty || blockDrafter != nil
         var statusEvidence = evidence
+        if let blockDrafter {
+            statusEvidence.append(
+                "block_drafter=lilicorr layers=\(blockDrafter.layers) tensors=\(blockDrafter.names.count)")
+        }
         if runtimeBundleHasMTP {
             statusEvidence.append("jang_config.runtime.bundle_has_mtp=true")
         }
@@ -1809,6 +1878,11 @@ public enum MTPBundleInspector {
             }
         }
 
+        let topologyGap = !mtpNames.isEmpty ? mtpTopologyGap(mtpNames) : nil
+        if let topologyGap {
+            statusEvidence.append("mtp_topology_incomplete=\(topologyGap)")
+        }
+
         let mode: MTPRuntimeMode
         if !bundleHasMTP && metadataClaimsMTP {
             mode = .metadataOnlyMissingWeights
@@ -1823,15 +1897,37 @@ public enum MTPBundleInspector {
         return MTPBundleStatus(
             bundleHasMTP: bundleHasMTP,
             configuredLayers: configuredLayers,
-            tensorCount: mtpNames.count,
+            tensorCount: mtpNames.count + (blockDrafter?.names.count ?? 0),
             visionTensorCount: visionNames.count,
             mode: mode,
-            tensorSamples: Array(mtpNames.sorted().prefix(8)),
+            tensorSamples: Array(
+                (mtpNames.sorted() + (blockDrafter?.names.sorted().map { "lilicorr/" + $0 } ?? []))
+                    .prefix(8)),
             visionTensorSamples: Array(visionNames.sorted().prefix(8)),
             configEvidence: Array(Set(statusEvidence)).sorted(),
             nativeMTPTuning: nativeMTPTuning,
             quantizationFingerprint: quantizationFingerprint,
-            measuredFamilyAutoDepth: measuredFamilyAutoDepth)
+            measuredFamilyAutoDepth: measuredFamilyAutoDepth,
+            incompleteTopologyReason: topologyGap)
+    }
+
+    /// `lilicorr/` beside a Nemotron-H target: its config must declare the LiLiCorr projector and
+    /// its shard headers must hold tensors.
+    private static func inspectBlockDrafter(
+        modelDirectory: URL, config: [String: Any]?
+    ) -> (layers: Int, names: [String])? {
+        let text = (config?["text_config"] as? [String: Any]) ?? config
+        let type = ((text?["model_type"] as? String) ?? (config?["model_type"] as? String) ?? "")
+            .lowercased().replacingOccurrences(of: "-", with: "_")
+        guard type == "nemotron_h" || type == "nemotron_h_text" else { return nil }
+        let dir = modelDirectory.appendingPathComponent("lilicorr")
+        guard let drafterConfig = try? loadJSONObjectIfExists(dir.appendingPathComponent("config.json")),
+            let dflash = drafterConfig["dflash_config"] as? [String: Any],
+            (dflash["projector_type"] as? String)?.lowercased() == "lilicorr",
+            let layers = drafterConfig["num_hidden_layers"] as? Int, layers > 0,
+            let names = try? loadTensorNames(from: dir), !names.isEmpty
+        else { return nil }
+        return (layers, names)
     }
 
     private static func configuredMTPLayers(
@@ -1889,13 +1985,16 @@ public enum MTPBundleInspector {
         // complete. Union the index keys with the header scan; headers cost
         // one small read per shard and this runs only at load-time
         // inspection.
+        // Names come from shard HEADERS only, and only entries whose byte range lies inside the file. The index
+        // selects which shards are inspected but never contributes a name on its own: an index entry whose shard
+        // is missing, whose shard does not contain it, or whose payload is truncated is not a loadable tensor
+        // (final sweep 2026-10-07: each of those made a one-tensor or phantom head look complete).
         var names: Set<String> = []
         var indexedFiles: Set<String> = []
         let indexURL = directory.appendingPathComponent("model.safetensors.index.json")
         if let index = try loadJSONObjectIfExists(indexURL),
             let weightMap = index["weight_map"] as? [String: Any]
         {
-            names.formUnion(weightMap.keys)
             indexedFiles.formUnion(weightMap.values.compactMap { $0 as? String })
         }
 
@@ -1997,7 +2096,38 @@ public enum MTPBundleInspector {
         else {
             return []
         }
-        return header.keys.filter { $0 != "__metadata__" }
+        let fileSize = try handle.seekToEnd()
+        let payload = fileSize >= 8 + headerLength ? fileSize - 8 - headerLength : 0
+        return header.compactMap { name, value in
+            guard name != "__metadata__", let entry = value as? [String: Any],
+                let offsets = entry["data_offsets"] as? [Int], offsets.count == 2,
+                offsets[0] >= 0, offsets[1] >= offsets[0], UInt64(offsets[1]) <= payload
+            else { return nil }
+            return name
+        }
+    }
+
+    /// A usable head needs a fusion projection (Qwen `fc` / `fc_hidden`+`fc_embedding`, DeepSeek-style
+    /// `eh_proj`, `input_proj`) AND at least one compute block (attention, Mamba-style `mixer`, MLP or experts).
+    /// Matched on dotted name components, never on a model name; every installed MTP family (Flash-Next affine
+    /// and JANGH, Allosaurus, Ling, Nemotron Lightning, Ornith, Qwen3.8 sources) satisfies it.
+    static func mtpTopologyGap(_ names: [String]) -> String? {
+        let fusion: Set<String> = ["fc", "eh_proj", "input_proj"]
+        let compute: Set<String> = [
+            "self_attn", "attn", "attention", "linear_attn", "mixer", "mlp", "experts", "shared_expert",
+            "feed_forward", "block_sparse_moe",
+        ]
+        let components = names.map { Set($0.lowercased().split(separator: ".").map(String.init)) }
+        let hasSplitFusion = components.contains { $0.contains("fc_hidden") }
+            && components.contains { $0.contains("fc_embedding") }
+        let hasFusion = hasSplitFusion || components.contains { !$0.isDisjoint(with: fusion) }
+        let hasCompute = components.contains { !$0.isDisjoint(with: compute) }
+        switch (hasFusion, hasCompute) {
+        case (true, true): return nil
+        case (false, true): return "no fusion projection"
+        case (true, false): return "no attention, mixer or MLP block"
+        case (false, false): return "no fusion projection and no compute block"
+        }
     }
 
     private static func isMTPName(_ name: String, mtpLayerPrefixes: [String]) -> Bool {

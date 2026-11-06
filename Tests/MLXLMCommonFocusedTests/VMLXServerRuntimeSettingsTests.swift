@@ -1,6 +1,7 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -8,6 +9,17 @@ import Testing
 
 @Suite("VMLX server runtime settings")
 struct VMLXServerRuntimeSettingsTests {
+    // Swift Testing can run outside the XCTest bundle that contains the Metal
+    // resource. Explicit test-only path keeps the fixture independent of that runner.
+    private static let metalFixture: Void = {
+        if let path = ProcessInfo.processInfo.environment["VMLX_TEST_METALLIB_PATH"] {
+            precondition(FileManager.default.isReadableFile(atPath: path))
+            precondition(mlx_metal_set_metallib_path(path) == 0)
+        }
+    }()
+
+    init() { _ = Self.metalFixture }
+
     @Test("explicit allocator maxima survive resident-family performance policy")
     func explicitAllocatorMaximumSurvivesResidentPolicy() {
         let gib = UInt64(1 << 30)
@@ -30,14 +42,15 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
-    @Test("native MTP is opt-in on initialization and missing-mode decode")
-    func sharedMTPDefaultsOffAndPreservesExplicitChoices() throws {
-        #expect(VMLXServerMTPSettings().mode == .off)
+    @Test("native MTP defaults to the family default on initialization and missing-mode decode")
+    func sharedMTPDefaultsToFamilyDefaultAndPreservesExplicitChoices() throws {
+        #expect(VMLXServerMTPSettings().mode == .familyDefault)
         #expect(
-            try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode == .off
+            try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode
+                == .familyDefault
         )
         for settings in [
-            VMLXServerMTPSettings(mode: .off), .init(mode: .auto),
+            VMLXServerMTPSettings(mode: .off), .init(mode: .auto), .init(mode: .familyDefault),
             .init(mode: .forceOn, explicitDepth: 3),
         ] {
             #expect(
@@ -46,9 +59,170 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
+    @Test("stored Off remains Off across schema migration")
+    func mtpOffSurvivesSchemaMigration() {
+        var legacy = VMLXServerRuntimeSettings(mtp: .init(mode: .off), schemaVersion: 4)
+        legacy.migrateToCurrentSchema()
+        #expect(legacy.mtp.mode == .off)
+        #expect(legacy.schemaVersion == VMLXServerRuntimeSettings.contractVersion)
+        var chosen = VMLXServerRuntimeSettings(mtp: .init(mode: .off), schemaVersion: 5)
+        chosen.migrateToCurrentSchema()
+        #expect(chosen.mtp.mode == .off)
+        var explicitOn = VMLXServerRuntimeSettings(mtp: .init(mode: .auto), schemaVersion: 4)
+        explicitOn.migrateToCurrentSchema()
+        #expect(explicitOn.mtp.mode == .auto)
+    }
+
+    @Test("the family default launches Flash-Next only; explicit Adaptive keeps its contract")
+    func familyDefaultLaunchesFlashNextOnly() {
+        let flash = MTPBundleStatus(
+            bundleHasMTP: true, configuredLayers: 1, tensorCount: 57, mode: .preservedEnabled,
+            nativeMTPTuning: nil, measuredFamilyAutoDepth: 3)
+        let flashConfig = Data(
+            #"{"model_type": "qwen4_exp", "text_config": {"model_type": "qwen4_exp_text"}}"#.utf8)
+        let defaults = VMLXServerRuntimeSettings()
+        let flashLaunch = defaults.resolvedMTPLaunch(
+            configData: flashConfig, jangConfig: nil, status: flash)
+        #expect(flashLaunch.launchMode == .speculative)
+        #expect(flashLaunch.recommendation?.depth == 3)
+
+        let other = MTPBundleStatus(
+            bundleHasMTP: true, configuredLayers: 1, tensorCount: 15, mode: .preservedEnabled)
+        let otherConfig = Data(#"{"model_type": "qwen3_5"}"#.utf8)
+        #expect(
+            defaults.resolvedMTPLaunch(configData: otherConfig, jangConfig: nil, status: other)
+                .launchMode == .off)
+
+        var off = VMLXServerRuntimeSettings()
+        off.mtp.mode = .off
+        #expect(
+            off.resolvedMTPLaunch(configData: flashConfig, jangConfig: nil, status: flash)
+                .launchMode == .off)
+    }
+
+    @Test("known headless bundles do not advertise native-MTP activation")
+    func familyDefaultExplainsAbsentHeadWithoutCreatingOne() {
+        let settings = VMLXServerRuntimeSettings()
+        let config = Data(#"{"model_type":"llama"}"#.utf8)
+        let status = MTPBundleStatus()
+        let launch = settings.resolvedMTPLaunch(configData: config, jangConfig: nil, status: status)
+        #expect(launch.launchMode == .off)
+        #expect(launch.recommendation == nil)
+        #expect(launch.reason == "This bundle has no native MTP head or tensors.")
+        #expect(settings.resolvedMTPDraftStrategy(configData: config, jangConfig: nil, status: status) == nil)
+    }
+
+    @Test("partial native-head evidence is distinct from an available opt-in", arguments: [
+        "missing-tensors", "missing-layers", "incomplete-topology",
+    ])
+    func familyDefaultExplainsIncompleteHead(_ kind: String) {
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: kind == "missing-layers" ? 0 : 1,
+            tensorCount: kind == "missing-tensors" ? 0 : 57,
+            mode: .preservedEnabled,
+            incompleteTopologyReason: kind == "incomplete-topology" ? "Missing fusion projection" : nil)
+        let launch = VMLXServerRuntimeSettings().resolvedMTPLaunch(
+            configData: nil, jangConfig: nil, status: status)
+        #expect(launch.launchMode == .off)
+        #expect(launch.recommendation == nil)
+        #expect(launch.reason == "This bundle has incomplete native MTP head/tensor evidence.")
+    }
+
+    @Test("unknown and complete head evidence retain the family-default opt-in policy")
+    func familyDefaultDoesNotInventMissingEvidence() {
+        let complete = MTPBundleStatus(
+            bundleHasMTP: true, configuredLayers: 1, tensorCount: 57, mode: .preservedEnabled)
+        for status in [complete, nil] as [MTPBundleStatus?] {
+            let launch = VMLXServerRuntimeSettings().resolvedMTPLaunch(
+                configData: nil, jangConfig: nil, status: status)
+            #expect(launch.launchMode == .off)
+            #expect(launch.reason.contains("choose On (Adaptive)"))
+        }
+    }
+
+    @Test("headless reason does not override explicit Off or unavailable explicit On")
+    func explicitHeadlessModesKeepTheirPolicy() {
+        for mode in [VMLXMTPServerMode.off, .forceOn] {
+            var settings = VMLXServerRuntimeSettings()
+            settings.mtp.mode = mode
+            let launch = settings.resolvedMTPLaunch(
+                configData: nil, jangConfig: nil, status: MTPBundleStatus())
+            if mode == .off {
+                #expect(launch.launchMode == .off)
+                #expect(launch.reason == "MTP disabled by server settings.")
+            } else {
+                #expect(launch.launchMode == .blocked)
+                #expect(launch.recommendation == nil)
+            }
+        }
+    }
+
+    @Test("a bundled dflash2 drafter is used unless speculation is switched off")
+    func bundledDFlash2DrafterDiscovery() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bundled-dflash2-\(UUID().uuidString)")
+        let drafter = root.appendingPathComponent("dflash2")
+        try FileManager.default.createDirectory(at: drafter, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let drafterConfig = #"""
+            {"architectures": ["DFlash2DraftModel"], "vocab_size": 248320, "hidden_size":5120, "num_target_layers": 64, "num_hidden_layers":1, "num_attention_heads":40, "num_key_value_heads":8, "head_dim":128, "intermediate_size":64,
+             "dflash_config": {"block_size": 8, "target_layer_ids": [5, 19, 33, 47, 61],
+             "mask_token_id": 248070, "selector_rank": 256, "selector_top_k": 16, "conv_kernel_size": 2, "conv_group_size":16}}
+            """#
+        try Data(drafterConfig.utf8).write(to: drafter.appendingPathComponent("config.json"))
+        let shapes = try DFlash2ArtifactMetadata.requiredShapes(
+            configData: Data(drafterConfig.utf8))
+        var offset = 0
+        var header: [String: Any] = [:]
+        for (name, shape) in shapes {
+            let end = offset + shape.reduce(2, *)
+            header[name] = ["dtype": "BF16", "shape": shape, "data_offsets": [offset, end]]
+            offset = end
+        }
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(bytes)
+        let url = drafter.appendingPathComponent("model.safetensors")
+        try file.write(to: url)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(file.count + offset))
+        try handle.close()
+        let targetConfig = Data(
+            #"{"model_type": "qwen3_5", "text_config": {"vocab_size": 248320, "hidden_size":5120, "num_hidden_layers": 64}}"#
+                .utf8)
+        guard VMLXDFlash2DrafterInfo.read(at: drafter) != nil else {
+            Issue.record(
+                "fixture is not recognised as a DFlash 2 drafter; update it to the reader's discriminator"
+            )
+            return
+        }
+        let defaults = VMLXServerRuntimeSettings()
+        #expect(
+            defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root)
+                != nil)
+        #expect(defaults.resolvedMTPDraftStrategy(
+            configData: targetConfig, jangConfig: nil, status: MTPBundleStatus(), bundleDirectory: root
+        )?.usesDFlash2 == true, "The native-head explanation cannot disable a valid independent drafter")
+        var off = defaults
+        off.mtp.mode = .off
+        #expect(
+            off.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root) == nil)
+        #expect(
+            defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: nil) == nil
+        )
+        // Weights decide: a fitting drafter folder is used whatever jang_config.json stamps.
+        try Data(#"{"speculative": {"method": "dflash2", "default": false}}"#.utf8)
+            .write(to: root.appendingPathComponent("jang_config.json"))
+        #expect(
+            defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root)
+                != nil)
+    }
+
     @Test("selection capability shares the launch policy across architecture aliases")
     func selectionCapabilityMatchesLaunchPolicy() {
-        for type in ["qwen4_exp", "qwen3_5", "qwen3_5_moe", "qwen3_6_moe_text", "qwen35"] {
+        for type in ["qwen4_exp", "qwen3_5", "qwen3_5_moe", "qwen3_6_moe_text", "qwen35", "nemotron_h"] {
             for config in [
                 "{\"model_type\":\"\(type)\"}",
                 "{\"model_type\":\"vlm\",\"text_config\":{\"model_type\":\"\(type)\"}}",
@@ -61,14 +235,16 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
-    @Test("default Off prevents native MTP launch without changing capability")
-    func defaultOffPreventsNativeMTPLaunch() {
+    @Test("explicit Off prevents native MTP launch without changing capability")
+    func explicitOffPreventsNativeMTPLaunch() {
         for type in ["qwen4_exp", "qwen3_5"] {
             let config = Data("{\"model_type\":\"\(type)\",\"mtp_num_hidden_layers\":1}".utf8)
             let status = MTPBundleStatus(
                 bundleHasMTP: true, configuredLayers: 1, tensorCount: 57,
                 mode: .preservedEnabled, measuredFamilyAutoDepth: 3)
-            let settings = VMLXServerRuntimeSettings()
+            // The shipped default is `.familyDefault` (on for Flash-Next); Off must still switch it off.
+            var settings = VMLXServerRuntimeSettings()
+            settings.mtp.mode = .off
             var base = LoadConfiguration.default
             base.nativeMTP = true
             #expect(settings.resolvedMTPLaunch(
@@ -101,14 +277,14 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.generation.topK == nil)
         #expect(settings.generation.minP == nil)
         #expect(settings.generation.repetitionPenalty == nil)
-        #expect(settings.mtp.mode == .off)
+        #expect(settings.mtp.mode == .familyDefault)
         #expect(settings.mtp.keepDraftCacheSeparate)
         #expect(settings.mtp.acceptedTokensOnlyEnterBaseCache)
         #expect(settings.effectivePerformance.deepseekV4ActivationQAT == false)
     }
 
-    @Test("Osaurus production preset keeps MLXPress opt-in while preserving MTP resolution")
-    func osaurusProductionPresetKeepsMLXPressOptInWhilePreservingMTPResolution() {
+    @Test("Osaurus production preset preserves memory and MTP resolution")
+    func osaurusProductionPresetPreservesMemoryAndMTPResolution() {
         let settings = VMLXServerRuntimeSettings()
 
         let resolved = settings.resolvedLoadConfiguration(
@@ -117,10 +293,9 @@ struct VMLXServerRuntimeSettingsTests {
             jangConfig: nil,
             status: nil)
 
-        #expect(resolved.jangPress == .disabled)
         #expect(resolved.maxResidentBytes == .default)
         #expect(resolved.memoryLimit == .default)
-        #expect(resolved.useMmapSafetensors)
+        #expect(!resolved.useMmapSafetensors)
         #expect(!resolved.nativeMTP)
         #expect(resolved.deepseekV4ActivationQAT == false)
     }
@@ -152,23 +327,6 @@ struct VMLXServerRuntimeSettingsTests {
             VMLXServerPerformanceSettings.self, from: data)
 
         #expect(decoded.deepseekV4ActivationQAT == false)
-    }
-
-    @Test("experimental MLXPress preset remains available for explicit host opt-in")
-    func experimentalMLXPressPresetRemainsAvailableForExplicitHostOptIn() {
-        let settings = VMLXServerRuntimeSettings()
-
-        let resolved = settings.resolvedLoadConfiguration(
-            base: .experimentalJangPressAuto,
-            configData: nil,
-            jangConfig: nil,
-            status: nil)
-
-        #expect(resolved.jangPress == .auto(envFallback: true))
-        #expect(resolved.maxResidentBytes == .default)
-        #expect(resolved.memoryLimit == .default)
-        #expect(resolved.useMmapSafetensors)
-        #expect(!resolved.nativeMTP)
     }
 
     @Test("tool parser settings resolve into model configuration overrides")

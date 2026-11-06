@@ -219,6 +219,78 @@ func indexedShardFileNames(at modelDirectory: URL) -> [String]? {
     return names.isEmpty ? nil : names.sorted()
 }
 
+/// Every safetensors file in `modelDirectory` that may hold this model's
+/// weights. The index-manifest contract in ``loadWeights`` narrows this
+/// further for JANG bundles.
+func candidateShardURLs(in modelDirectory: URL, skipDSV4Sidecar: Bool) -> [URL] {
+    var urls: [URL] = []
+    let indexedNames = Set(indexedShardFileNames(at: modelDirectory) ?? [])
+    let enumerator = FileManager.default.enumerator(
+        at: modelDirectory, includingPropertiesForKeys: nil)!
+    for case let url as URL in enumerator {
+        guard url.pathExtension == "safetensors" else { continue }
+        if url.lastPathComponent == "jangtq_runtime.safetensors" { continue }
+        // Converter calibration captures are provenance artifacts, not
+        // inference weights.  DSV4's AWQ/imatrix converter folds these
+        // statistics completely into the indexed model tensors and marks
+        // the resulting bundle as requiring no runtime sidecar.  Loading
+        // the capture alongside the 102 indexed shards injects keys such
+        // as `layers.0.experts_input` into model.update(), which correctly
+        // rejects them as unhandled parameters.
+        if isAuxiliaryCalibrationSafetensor(url.lastPathComponent) {
+            LoadDiagnostics.write(Data(
+                "[loadWeights] skipping non-inference calibration artifact \(url.lastPathComponent)\n".utf8))
+            continue
+        }
+        if isNestedModelBundleShard(url, in: modelDirectory, indexedNames: indexedNames) {
+            LoadDiagnostics.write(Data(
+                "[loadWeights] skipping \(url.path): it belongs to a nested model with its own config.json\n".utf8))
+            continue
+        }
+        if skipDSV4Sidecar
+            && url.lastPathComponent == "jangtq_stacked.safetensors"
+        {
+            LoadDiagnostics.write(Data(
+                "[loadWeights] VMLX_DSV4_SKIP_SIDECAR=1 — skipping jangtq_stacked.safetensors\n".utf8))
+            continue
+        }
+        urls.append(url)
+    }
+    return urls
+}
+
+/// A safetensors file below a subdirectory that has its own config.json
+/// belongs to another model: a drafter shipped beside its target, such as
+/// the `mtp-drafter/` in bottlecapai/ThinkingCap-Qwen3.8-27B-MLX-4bit-DWQ.
+/// Merged into the target, its prefix-free keys (`fc`, `layers`, `norm`)
+/// fail `model.update()` as unhandled parameters. A file the root index
+/// names is still this model's.
+private func isNestedModelBundleShard(
+    _ url: URL, in modelDirectory: URL, indexedNames: Set<String>
+) -> Bool {
+    let base = modelDirectory.standardizedFileURL.resolvingSymlinksInPath()
+    let baseComponents = base.pathComponents
+    // Only the directories are resolved: a Hugging Face cache stores every file as a symlink into
+    // `blobs/`, and resolving the file itself would lose its place in the bundle.
+    let fileComponents = url.deletingLastPathComponent().standardizedFileURL
+        .resolvingSymlinksInPath().pathComponents + [url.lastPathComponent]
+    guard fileComponents.count > baseComponents.count + 1,
+        Array(fileComponents.prefix(baseComponents.count)) == baseComponents
+    else { return false }
+    let relative = fileComponents.dropFirst(baseComponents.count)
+    if indexedNames.contains(relative.joined(separator: "/")) { return false }
+    var directory = base
+    for component in relative.dropLast() {
+        directory.appendPathComponent(component, isDirectory: true)
+        if FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("config.json").path)
+        {
+            return true
+        }
+    }
+    return false
+}
+
 private func loadJangConfigSanitizeMetadata(at modelDirectory: URL) -> [String: String] {
     guard let url = JangLoader.findConfigPath(at: modelDirectory),
         let data = try? Data(contentsOf: url),
@@ -329,33 +401,8 @@ public func loadWeights(
         // docs/OSAURUS-DSV4-INTEGRATION.md.
         let skipDSV4Sidecar =
             ProcessInfo.processInfo.environment["VMLX_DSV4_SKIP_SIDECAR"] == "1"
-        var allShardURLs: [URL] = []
-        let enumerator = FileManager.default.enumerator(
-            at: modelDirectory, includingPropertiesForKeys: nil)!
-        for case let url as URL in enumerator {
-            guard url.pathExtension == "safetensors" else { continue }
-            if url.lastPathComponent == "jangtq_runtime.safetensors" { continue }
-            // Converter calibration captures are provenance artifacts, not
-            // inference weights.  DSV4's AWQ/imatrix converter folds these
-            // statistics completely into the indexed model tensors and marks
-            // the resulting bundle as requiring no runtime sidecar.  Loading
-            // the capture alongside the 102 indexed shards injects keys such
-            // as `layers.0.experts_input` into model.update(), which correctly
-            // rejects them as unhandled parameters.
-            if isAuxiliaryCalibrationSafetensor(url.lastPathComponent) {
-                FileHandle.standardError.write(Data(
-                    "[loadWeights] skipping non-inference calibration artifact \(url.lastPathComponent)\n".utf8))
-                continue
-            }
-            if skipDSV4Sidecar
-                && url.lastPathComponent == "jangtq_stacked.safetensors"
-            {
-                FileHandle.standardError.write(Data(
-                    "[loadWeights] VMLX_DSV4_SKIP_SIDECAR=1 — skipping jangtq_stacked.safetensors\n".utf8))
-                continue
-            }
-            allShardURLs.append(url)
-        }
+        var allShardURLs = candidateShardURLs(
+            in: modelDirectory, skipDSV4Sidecar: skipDSV4Sidecar)
         // FINAL bundle-layout contract (2026-09-04, JANG bundles): when the
         // bundle ships `model.safetensors.index.json`, the index IS the load
         // manifest — load exactly the files its weight_map names, nothing
@@ -369,8 +416,11 @@ public func loadWeights(
         // `jangpress-prestacked`) are deliberate artifacts, not indexed
         // weights, so they keep their exact-path opt-in. Gated to JANG
         // bundles: stock community bundles keep the historical glob and are
-        // untouched by this contract.
-        if jangConfig != nil,
+        // untouched by this contract. Custom-bank (JANGH/JANGHT) loads pass no
+        // `jangConfig` (their typed contract bypasses legacy shape inference) but
+        // are still JANG bundles: key the manifest on the sidecar file, so a
+        // bundled `dflash2/` drafter never globs into the target's weights.
+        if jangConfig != nil || JangLoader.findConfigPath(at: modelDirectory) != nil,
             let indexedNames = indexedShardFileNames(at: modelDirectory)
         {
             let decision = indexManifestDecision(
@@ -387,7 +437,7 @@ public func loadWeights(
                     + missing.sorted().joined(separator: ", ")
                     + ". The bundle layout is incomplete or superseded — "
                     + "re-download the bundle."
-                FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                LoadDiagnostics.write(Data("[loadWeights] \(message)\n".utf8))
                 throw TruncatedSafetensorsError(description: message)
             case .staleIndex(let missing, let replacement):
                 // The index describes a layout that is not in this directory
@@ -407,7 +457,7 @@ public func loadWeights(
                         let message =
                             "model.safetensors.index.json is stale (names \(missing.count) absent file(s)) "
                             + "and the replacement shard \(name) has an unreadable header — re-download the bundle."
-                        FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                        LoadDiagnostics.write(Data("[loadWeights] \(message)\n".utf8))
                         throw TruncatedSafetensorsError(description: message)
                     }
                     for key in keys {
@@ -419,10 +469,10 @@ public func loadWeights(
                         "model.safetensors.index.json is stale and the \(replacement.count)-shard replacement "
                         + "declares \(duplicates.count) duplicate tensor(s): "
                         + duplicates.sorted().prefix(5).joined(separator: ", ") + " — re-download the bundle."
-                    FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                    LoadDiagnostics.write(Data("[loadWeights] \(message)\n".utf8))
                     throw TruncatedSafetensorsError(description: message)
                 }
-                FileHandle.standardError.write(Data(
+                LoadDiagnostics.write(Data(
                     ("[loadWeights] model.safetensors.index.json is stale: none of the "
                         + "\(missing.count) file(s) it names exist in \(modelDirectory.path) "
                         + "(e.g. \(missing.sorted().first ?? "")); loading the complete "
@@ -442,7 +492,7 @@ public func loadWeights(
                 !selected.contains(where: { $0.path == url.path })
             }.count
             if droppedCount > 0 {
-                FileHandle.standardError.write(Data(
+                LoadDiagnostics.write(Data(
                     ("[loadWeights] index-manifest load: ignoring \(droppedCount) "
                         + "non-indexed safetensors file(s) in the bundle\n").utf8))
             }
@@ -485,7 +535,7 @@ public func loadWeights(
                 + "shard sets (\(summary)). Using only "
                 + "`-of-\(completeTag).safetensors`. Delete the partial "
                 + "set(s) to silence this warning.\n"
-            FileHandle.standardError.write(Data(warning.utf8))
+            LoadDiagnostics.write(Data(warning.utf8))
             allShardURLs = allShardURLs.filter {
                 $0.lastPathComponent.hasSuffix(
                     "-of-\(String(format: "%05d", completeTotal)).safetensors")
@@ -518,22 +568,17 @@ public func loadWeights(
                 + "garbage output that varies per launch. Re-download the bundle.\n"
                 + detail
             if ProcessInfo.processInfo.environment["VMLX_ALLOW_TRUNCATED_SHARDS"] == "1" {
-                FileHandle.standardError.write(Data(
+                LoadDiagnostics.write(Data(
                     "[loadWeights] WARNING (VMLX_ALLOW_TRUNCATED_SHARDS=1): \(message)\n".utf8))
             } else {
-                FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                LoadDiagnostics.write(Data("[loadWeights] \(message)\n".utf8))
                 throw TruncatedSafetensorsError(description: message)
             }
         }
 
-        // Canonical loader entry. On patched osaurus mlx-swift pins,
-        // `loadArraysAndMetadata(url:)` honors the safetensors mmap
-        // environment set by `ModelFactory.withMmapSafetensorsEnv`,
-        // returning MLX arrays backed by whole-shard file mappings.
-        // Older pins ignore the env and fall back to the stock
-        // pread/allocator path. `MmapSafetensorsLoader.swift` remains
-        // a header/parser test utility, not the production tensor path.
-        let prestackedRoutedKeys = (try? JangPressPrestacker
+        // Read packed tensor bytes directly into their final allocator-owned buffers.
+        // Neither source shard mappings nor a tensor-sized staging Data survives load.
+        let prestackedRoutedKeys = (try? LegacyRoutedTensorLayout
             .prestackedRoutedReplacementKeys(in: modelDirectory)) ?? []
         var skippedPrestackedSourceTensors = 0
         var skippedStreamingSourceTensors = 0
@@ -557,13 +602,13 @@ public func loadWeights(
         // A model requesting owned compute weights must not also retain a
         // complete filesystem-backed copy while loading them. Model-owned
         // auxiliary tensors remain excluded by the existing key contract.
-        let uncachedResidentRead = ResidentSafetensorsReader.shouldUse(
-            requiresOwnedCompute: modelKeyExcluder?.requiresResidentSafetensorsWeights == true,
-            readerOverride: RuntimeEnvironment.value("VMLX_FLASH_RESIDENT_READER"))
-        if uncachedResidentRead {
-            FileHandle.standardError.write(Data(
-                "[loadWeights] resident_reader=uncached_owned source_files_unchanged=true\n".utf8))
-        }
+        #if canImport(Darwin)
+        let uncachedResidentRead = true
+        #else
+        let uncachedResidentRead = false
+        #endif
+        LoadDiagnostics.write(Data(
+            "[loadWeights] weight_storage=owned resident_reader=direct source_files_unchanged=true\n".utf8))
         for url in allShardURLs {
             let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
             let headerNames = (try? loadSafetensorsHeaderNamesForBaseLoad(url)) ?? []
@@ -584,7 +629,7 @@ public func loadWeights(
                         excludedKeys.insert(key)
                         skippedStreamingSourceTensors += 1
                     } else if !isPrestackedShard,
-                        let replacementKey = JangPressPrestacker.prestackedReplacementKey(
+                        let replacementKey = LegacyRoutedTensorLayout.prestackedReplacementKey(
                             forPerExpertKey: key),
                         prestackedRoutedKeys.contains(replacementKey)
                     {
@@ -623,7 +668,7 @@ public func loadWeights(
                     continue
                 }
                 if !isPrestackedShard,
-                   let replacementKey = JangPressPrestacker.prestackedReplacementKey(
+                   let replacementKey = LegacyRoutedTensorLayout.prestackedReplacementKey(
                     forPerExpertKey: key),
                    prestackedRoutedKeys.contains(replacementKey)
                 {
@@ -653,19 +698,19 @@ public func loadWeights(
             }
         }
         if skippedPrestackedSourceTensors > 0 {
-            FileHandle.standardError.write(Data(
-                "[loadWeights] using MLXPress prestacked routed overlay; skipped \(skippedPrestackedSourceTensors) original per-expert tensor(s)\n".utf8))
+            LoadDiagnostics.write(Data(
+                "[loadWeights] using existing stacked routed tensors; skipped \(skippedPrestackedSourceTensors) original per-expert tensor(s)\n".utf8))
         }
         if skippedStreamingSourceTensors > 0 {
-            FileHandle.standardError.write(Data(
-                "[loadWeights] using MLXPress active-expert streaming; skipped \(skippedStreamingSourceTensors) per-expert tensor(s) during weight load\n".utf8))
+            LoadDiagnostics.write(Data(
+                "[loadWeights] using active-expert streaming; skipped \(skippedStreamingSourceTensors) per-expert tensor(s) during weight load\n".utf8))
         }
         if skippedPreservedMTPTensors > 0 {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[loadWeights] preserved MTP tensors are isolated from base AR load; skipped \(skippedPreservedMTPTensors) tensor(s) across \(skippedPreservedMTPShards) MTP-only shard(s)\n".utf8))
         }
         if skippedModelExcludedTensors > 0 {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 ("[loadWeights] model-owned file-backed tensors bypassed generic MLX load; "
                     + "skipped \(skippedModelExcludedTensors) tensor(s) including "
                     + "\(skippedModelExcludedShards) auxiliary-only shard(s); "
@@ -673,12 +718,12 @@ public func loadWeights(
                     + "\(modelKeyExcluder?.requiresExactTensorMmapBuffers == true)\n").utf8))
         }
         if residentSafetensorsBytes > 0 {
-            FileHandle.standardError.write(Data(String(format:
+            LoadDiagnostics.write(Data(String(format:
                 "[loadWeights] resident compute materialization complete bytes=%.3f_GiB auxiliary_model_owned_tensors=excluded\n",
                 Double(residentSafetensorsBytes) / 1_073_741_824).utf8))
         }
         if loadPreservedMTP {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[loadWeights] native MTP requested; preserved MTP tensors are included in model update\n".utf8))
         }
     }
@@ -708,7 +753,7 @@ public func loadWeights(
                     "affine-1 manifest weight must be a non-empty uint32 tensor: \(key)")
             }
         }
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             "[Load] JANG affine-1 validated \(contract.modulePaths.count) native 1-bit weight(s)\n".utf8))
     }
 
@@ -775,7 +820,7 @@ public func loadWeights(
             throw error
         }
     } else if declaresJANGTQNative {
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             "[loadWeights] JANGTQ runtime sidecar missing; generating deterministic signs/codebooks on demand\n".utf8))
     }
 
@@ -847,7 +892,7 @@ public func loadWeights(
         if !inferred.perLayerQuantization.isEmpty {
             let b = inferred.quantization?.bits ?? -1
             let g = inferred.quantization?.groupSize ?? -1
-            FileHandle.standardError.write(
+            LoadDiagnostics.write(
                 Data("[Load] JANG shape walk produced \(inferred.perLayerQuantization.count) per-layer quant override(s) over default (bits=\(b), gs=\(g))\n".utf8))
         }
         if ProcessInfo.processInfo.environment["VMLX_LOAD_QUANT_TRACE"] == "1" {
@@ -878,7 +923,7 @@ public func loadWeights(
                         "MISSING (weight=\(weightArr != nil) scales=\(scales != nil)) "
                         + "override=\(String(describing: override))"
                 }
-                FileHandle.standardError.write(
+                LoadDiagnostics.write(
                     Data("[Load][quant-trace] \(probe): \(desc)\n".utf8))
             }
         }
@@ -950,7 +995,7 @@ public func loadWeights(
         )
         if ProcessInfo.processInfo.environment["VMLX_LOAD_DIAG"] == "1" {
             let topQ = declaredAffineQuantization ?? inferred.quantization
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[merge-diag] top-level quantization = \(topQ.map { "(b=\($0.bits), gs=\($0.groupSize), mode=\($0.mode.rawValue))" } ?? "NIL"); merged_count=\(merged.count); inferred_count=\(inferred.perLayerQuantization.count); explicit_count=\(perLayerQuantization?.perLayerQuantization.count ?? 0); hidden_hint=\(hiddenHint.map(String.init) ?? "nil"); valid_dims=\(validInDims.sorted())\n".utf8))
         }
     } else if let perLayerQuantization {
@@ -1022,7 +1067,7 @@ public func loadWeights(
                 }
             }
             if corrections > 0 {
-                FileHandle.standardError.write(
+                LoadDiagnostics.write(
                     Data("[Load] config per-layer quant disagreed with safetensors shapes — patched \(corrections) layer(s) from shape walk\n".utf8))
             }
         }
@@ -1047,7 +1092,7 @@ public func loadWeights(
         if let inferred, !inferred.perLayerQuantization.isEmpty {
             let b = inferred.quantization?.bits ?? -1
             let g = inferred.quantization?.groupSize ?? -1
-            FileHandle.standardError.write(
+            LoadDiagnostics.write(
                 Data("[Load] non-JANG shape walk produced \(inferred.perLayerQuantization.count) per-layer quant override(s) over default (bits=\(b), gs=\(g))\n".utf8))
         }
         effectivePerLayerQuantization = inferred
@@ -1062,7 +1107,7 @@ public func loadWeights(
         if let inferred {
             let b = inferred.quantization?.bits ?? -1
             let g = inferred.quantization?.groupSize ?? -1
-            FileHandle.standardError.write(
+            LoadDiagnostics.write(
                 Data("[Load] config has no quant block — shape walk inferred default (bits=\(b), gs=\(g)) plus \(inferred.perLayerQuantization.count) override(s)\n".utf8))
         }
         effectivePerLayerQuantization = inferred
@@ -1220,7 +1265,7 @@ public func loadWeights(
             let linearCount = updates.count { $0.1 is Qwen4ExpBF16QuantizedLinear }
             let switchCount = updates.count { $0.1 is Qwen4ExpBF16QuantizedSwitchLinear }
             let embeddingCount = updates.count { $0.1 is Qwen4ExpBF16QuantizedEmbedding }
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 ("[Qwen4Exp] native_bf16_affine_modules linear=\(linearCount) "
                     + "switch=\(switchCount) embedding=\(embeddingCount) "
                     + "total_updates=\(updates.count)\n").utf8))
@@ -1257,6 +1302,44 @@ public func loadWeights(
     weights.removeAll(keepingCapacity: false)
     MLX.Memory.clearCache()
 
+    // Convert float16/float32 parameters to bfloat16 to prevent AsType cascades.
+    // float16 causes AsType when mixed with internal float32 ops (softmax, RMSNorm).
+    // bfloat16 shares float32's exponent range, so promotion is cheaper/eliminated.
+    //
+    // JANGTQ caveat: TurboQuant Metal kernels infer their signature from
+    // `tq_norms`, and casting those norms to bf16 breaks routed projections
+    // (verified on MiniMax M2.7 JANGTQ_2L). Keep the JANGTQ tensors raw.
+    //
+    // Storage ownership must not change the model's numerical contract. Keep
+    // the established exact F16 affine metadata for these families, even though
+    // its bytes now live in owned buffers. The model controls activation dtype.
+    // JANGTQ kernels keep raw packed/norm tensors; only the families with an
+    // established BF16 affine requirement convert their remaining parameters.
+    let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)
+    // SPEED-CRITICAL: keep exact affine metadata and GDN fused-row replacement.
+    // The Oct 14 Allosaurus/Flash-Next regression disabled fusion when metadata
+    // was counted as a nonreplaceable bank. Storage changes need matched app
+    // adaptive-MTP code/prose timings; a loader test alone is insufficient.
+    let preserveJANGAffineDtypes = !isJANGTQNative
+        && (shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)
+            || shouldPreserveQwen4ExpJANGAffineMmapDtypes(modelDirectory: modelDirectory)
+            || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(modelDirectory: modelDirectory))
+    // Prism's ternary QAT contract stores exact F16 scales and F32 norms,
+    // state projections and signs. Preserve that contract independent of
+    // mmap; recasting it is not the stock Qwen/JANG dtype policy.
+    let materialiseBFloat16 =
+        hadamardContract == nil
+        && !model.preservesCheckpointParameterDTypes
+        && !preserveJANGAffineDtypes
+        && (!isJANGTQNative || autoJANGTQMmapBFloat16)
+    if materialiseBFloat16 {
+        convertToBFloat16(
+            model: model,
+            shouldSkip: isJANGTQNative ? isJANGTQParameterKey : { _ in false })
+    }
+    // Run the optional head codec after normal dtype materialisation. Its
+    // embedding output must match the effective unconverted-head path, not
+    // the earlier checkpoint dtype, or mixed F16/BF16 norms promote KV to F32.
     // Tied-head load-time quantization: quantize a plain fp16/bf16
     // `embed_tokens` at load. Tied-embedding families (Gemma4 QAT) ship
     // the decoder quantized but the 262k-vocab embedding unquantized;
@@ -1285,68 +1368,24 @@ public func loadWeights(
                 let emb = mod as? Embedding
             else { continue }
             headUpdates.append(
-                (path, QuantizedEmbedding(emb, groupSize: headGroupSize, bits: headBits)))
+                (
+                    path,
+                    quantizeTiedEmbeddingPreservingOutputDType(
+                        emb, groupSize: headGroupSize, bits: headBits)
+                ))
         }
         if !headUpdates.isEmpty {
             try model.update(modules: ModuleChildren.unflattened(headUpdates), verify: .none)
             MLX.eval(model)
             MLX.Memory.clearCache()
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[Load] quantized tied embedding head bits=\(headBits) gs=\(headGroupSize) paths=\(headUpdates.map(\.0))\n".utf8))
         }
     }
 
-    // Convert float16/float32 parameters to bfloat16 to prevent AsType cascades.
-    // float16 causes AsType when mixed with internal float32 ops (softmax, RMSNorm).
-    // bfloat16 shares float32's exponent range, so promotion is cheaper/eliminated.
-    //
-    // JANGTQ caveat: TurboQuant Metal kernels infer their signature from
-    // `tq_norms`, and casting those norms to bf16 breaks routed projections
-    // (verified on MiniMax M2.7 JANGTQ_2L). Keep the JANGTQ tensors raw.
-    //
-    // For non-mmap JANGTQ loads, still convert non-TQ Mamba/attention/router
-    // weights so resident decode avoids preventable fp16 AsType cascades. For
-    // mmap/JangPress loads, default to preserving file-backed tensor residency
-    // unless the bundle has live proof that affine quant metadata must be
-    // materialized to bf16 while raw TurboQuant tensors stay untouched.
-    let mmapSafetensorsActive = envFlag("MLX_SAFETENSORS_MMAP")
-        || RuntimeEnvironment.flag("VMLX_MMAP_SAFETENSORS")
-    let allowJANGTQMmapBFloat16 = RuntimeEnvironment.flag("VMLX_JANGTQ_BF16_MMAP")
-        || envFlag("MLX_JANGTQ_BF16_MMAP")
-    let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)
-    // Gemma 4 and Qwen4-exp JANG affine bundles carry F16 scales/biases whose
-    // checkpoint values must remain exact and file-backed. MLX's production
-    // quantized kernels accept BF16 activations with F16 affine metadata; do
-    // not turn Qwen's 61+ GiB packed bank plus 7+ GiB metadata into anonymous
-    // resident allocations merely to align storage dtypes. Validated
-    // pre-stacked DSV4 affine bundles have the same constraint at larger scale.
-    // Recasting zero-points to BF16 both materializes a second bank and can
-    // alter logits; activation dtype is owned by each model runtime.
-    // Split DSV4 bundles intentionally remain on the resident conversion path.
-    let preserveJANGAffineMmapDtypes = mmapSafetensorsActive
-        && !isJANGTQNative
-        && (shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)
-            || shouldPreserveQwen4ExpJANGAffineMmapDtypes(
-                modelDirectory: modelDirectory)
-            || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
-                modelDirectory: modelDirectory))
-    // Prism's ternary QAT contract stores exact F16 scales and F32 norms,
-    // state projections and signs. Preserve that contract independent of
-    // mmap; recasting it is not the stock Qwen/JANG dtype policy.
-    let materialiseBFloat16 =
-        hadamardContract == nil
-        && !model.preservesCheckpointParameterDTypes
-        && !preserveJANGAffineMmapDtypes
-        && (!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16
-            || autoJANGTQMmapBFloat16)
-    if materialiseBFloat16 {
-        convertToBFloat16(
-            model: model,
-            shouldSkip: isJANGTQNative ? isJANGTQParameterKey : { _ in false })
-    }
     if let hadamardContract {
         try hadamardContract.verifyLoaded(model: model)
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             ("[Load] JANG Hadamard verified=\(hadamardContract.modulePaths.count) "
                 + "block=\(hadamardContract.blockSize) compute=float32 stored_dtypes_preserved=true\n").utf8))
     }
@@ -1362,37 +1401,29 @@ public func loadWeights(
         }
         let summary = histogram.sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }.joined(separator: " ")
-        FileHandle.standardError.write(Data(
-            ("[Load] dtype-materialisation bf16=\(materialiseBFloat16) mmap=\(mmapSafetensorsActive) "
-                + "jangtqNative=\(isJANGTQNative) preserveJANGAffine=\(preserveJANGAffineMmapDtypes) "
+        LoadDiagnostics.write(Data(
+            ("[Load] dtype-materialisation bf16=\(materialiseBFloat16) weight_storage=owned "
+                + "jangtqNative=\(isJANGTQNative) preserveJANGAffine=\(preserveJANGAffineDtypes) "
                 + "preserveCheckpointDTypes=\(model.preservesCheckpointParameterDTypes) "
-                + "autoJANGTQBF16=\(autoJANGTQMmapBFloat16) allowJANGTQBF16=\(allowJANGTQMmapBFloat16) "
+                + "autoJANGTQBF16=\(autoJANGTQMmapBFloat16) "
                 + "params[\(summary)]\n").utf8))
     }
 
     // The Gemma-4 / DSV4-prestacked preserve branches keep f16 affine
-    // metadata file-backed (correct: materializing the scale banks costs
+    // metadata exact (recasting the scale banks costs
     // gigabytes and can alter logits), but `dequantized` types embedding
     // output from the SCALES dtype — so the quantized EMBEDDING seeded f16
     // into a bf16 stream and the first mixed op promoted the whole
     // activation path to fp32 (doubled KV caches, refused fused-decode
     // gates). Pin only the embedding OUTPUT to bf16: the dequant math still
-    // reads the exact file-backed f16 metadata; qwen4_exp bundles are
+    // reads the exact f16 metadata; qwen4_exp bundles are
     // excluded because their native-module swap already handles this.
-    if hadamardContract == nil, preserveJANGAffineMmapDtypes,
+    if hadamardContract == nil, preserveJANGAffineDtypes,
         !shouldUseQwen4ExpNativeBF16Affine(modelDirectory: modelDirectory)
     {
-        var pinned = 0
-        for (_, module) in model.leafModules().flattened() {
-            if let embedding = module as? QuantizedEmbedding,
-                embedding.scales.dtype == .float16
-            {
-                embedding.outputDType = .bfloat16
-                pinned += 1
-            }
-        }
+        let pinned = pinPreservedAffineEmbeddingOutputDTypes(model)
         if pinned > 0 {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[Load] jang_affine_preserve embedding_output_dtype=bfloat16 modules=\(pinned)\n"
                     .utf8))
         }
@@ -1409,7 +1440,7 @@ public func loadWeights(
             count += 1
             dtypes.insert(String(describing: value.dtype))
         }
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             ("[Qwen4Exp] runtime_affine_metadata_dtype="
                 + dtypes.sorted().joined(separator: ",")
                 + " runtime_affine_metadata_count=\(count)"
@@ -1431,13 +1462,13 @@ public func loadWeights(
                 key.contains(needle) ? "\(key)=\(value.dtype)" : nil
             }.sorted().joined(separator: ",")
         }
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             ("[Qwen4Exp] runtime_parameter_dtypes bf16_count=\(bf16Count)"
                 + " f16_count=\(f16Keys.count)"
                 + " f16_keys=\(f16Keys.isEmpty ? "none" : f16Keys.prefix(8).joined(separator: ","))"
                 + " f32_count=\(f32Keys.count)"
                 + " f32_keys=\(f32Keys.isEmpty ? "none" : f32Keys.prefix(8).joined(separator: ","))\n").utf8))
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             ("[Qwen4Exp] runtime_parameter_boundaries embedding={"
                 + parameterDTypeSummary(matching: "embed_tokens")
                 + "} lm_head={" + parameterDTypeSummary(matching: "lm_head") + "}\n").utf8))
@@ -1457,6 +1488,34 @@ public func loadWeights(
         // ship it, and only calibrated bundles have earned an eligibility
         // derivation (speed-audit mlx_lm packs stay unstamped on purpose).
         isCalibratedBundle: jangConfig != nil)
+}
+
+/// A host-requested storage conversion must preserve the original embedding's
+/// activation precision. In particular, changing a Gemma QAT fp16 embedding to
+/// bf16 makes its fp16 router and layer scales promote activations to fp32.
+/// This also preserves the tied output projection's original result precision.
+func quantizeTiedEmbeddingPreservingOutputDType(
+    _ embedding: Embedding, groupSize: Int, bits: Int
+) -> QuantizedEmbedding {
+    let quantized = QuantizedEmbedding(embedding, groupSize: groupSize, bits: bits)
+    quantized.outputDType = embedding.weight.dtype
+    return quantized
+}
+
+/// Checkpoint-quantized embeddings retain the existing bf16 alignment policy.
+/// An explicit activation contract, including a newly quantized floating-point
+/// tied embedding's source dtype, takes precedence over that inferred policy.
+func pinPreservedAffineEmbeddingOutputDTypes(_ model: Module) -> Int {
+    var pinned = 0
+    for (_, module) in model.leafModules().flattened() {
+        if let embedding = module as? QuantizedEmbedding,
+            embedding.scales.dtype == .float16, embedding.outputDType == nil
+        {
+            embedding.outputDType = .bfloat16
+            pinned += 1
+        }
+    }
+    return pinned
 }
 
 /// Safetensors files emitted or copied by converters for calibration and
@@ -1791,6 +1850,37 @@ private func readValidInDims(at modelDirectory: URL) -> Set<Int> {
             let channels = (vision["in_channels"] as? Int) ?? 3
             let temporal = (vision["temporal_patch_size"] as? Int) ?? 1
             dims.insert(channels * temporal * patch * patch)
+        }
+    }
+    // Nemotron Omni / 3.5 VL bundles keep the vision geometry in a sibling
+    // `config_omni.json` (config.json is the LLM config). Same reason as the
+    // vision_config block above: without these widths the RADIO tower and the
+    // mlp1 projector (8-bit g64 on Nemotron 3.5) are ambiguous with 4-bit g128.
+    let omniURL = modelDirectory.appendingPathComponent("config_omni.json")
+    if let omniData = try? Data(contentsOf: omniURL),
+       let omni = try? JSONSerialization.jsonObject(with: omniData) as? [String: Any]
+    {
+        let vision = omni["vision_config"] as? [String: Any] ?? [:]
+        let vitHidden = (omni["vit_hidden_size"] as? Int) ?? (vision["hidden_size"] as? Int)
+        add(vitHidden)
+        if let hidden = vitHidden, let ratio = vision["mlp_ratio"] as? Double, ratio > 0 {
+            dims.insert(Int((Double(hidden) * ratio).rounded()))
+        }
+        if let hidden = vitHidden, let downsample = omni["downsample_ratio"] as? Double,
+           downsample > 0
+        {
+            let factor = Int((1 / downsample).rounded())
+            dims.insert(hidden * factor * factor)
+        }
+        add(omni["projector_hidden_size"])
+        if let patch = (vision["patch_size"] as? Int) ?? (omni["patch_size"] as? Int), patch > 0 {
+            let channels = (vision["num_channels"] as? Int) ?? 3
+            dims.insert(channels * patch * patch)
+            if let temporal = (omni["video_temporal_patch_size"] as? Int)
+                ?? (vision["video_temporal_patch_size"] as? Int), temporal > 1
+            {
+                dims.insert(temporal * channels * patch * patch)
+            }
         }
     }
     add(config["expert_intermediate_size"])

@@ -130,162 +130,174 @@ struct TokenIteratorAdditionalProcessorTests {
 
     @Test("a request-supplied processor is accepted and composed with the built-in one")
     func requestSuppliedProcessorIsAcceptedAndComposed() throws {
-        let recorder = Recorder()
-        var parameters = GenerateParameters(maxTokens: 4, temperature: 0)
-        parameters.repetitionPenalty = 2.0
-        parameters.repetitionContextSize = 8
+        try FocusedMLXTestSupport.withLock {
+            let recorder = Recorder()
+            var parameters = GenerateParameters(maxTokens: 4, temperature: 0)
+            parameters.repetitionPenalty = 2.0
+            parameters.repetitionContextSize = 8
 
-        let iterator = try TokenIterator(
-            input: makeInput([1, 2]),
-            model: SeamTestModel(),
-            parameters: parameters,
-            additionalProcessor: RecordingProcessor(recorder: recorder, markerIndex: 5))
+            let iterator = try TokenIterator(
+                input: makeInput([1, 2]),
+                model: SeamTestModel(),
+                parameters: parameters,
+                additionalProcessor: RecordingProcessor(recorder: recorder, markerIndex: 5))
 
-        let processor = try #require(iterator.processor)
-        #expect(
-            processor is CompositeLogitProcessor,
-            "the request-supplied processor must be composed with the built-in effective processor")
+            let processor = try #require(iterator.processor)
+            #expect(
+                processor is CompositeLogitProcessor,
+                "the request-supplied processor must be composed with the built-in effective processor")
+            }
     }
 
     // MARK: - 2. Ordinary callers are untouched
 
     @Test("without an additional processor the built-in effective processor is unchanged")
     func defaultPathKeepsBuiltInProcessor() throws {
-        var parameters = GenerateParameters(maxTokens: 4, temperature: 0)
-        parameters.repetitionPenalty = 2.0
-        parameters.repetitionContextSize = 8
+        try FocusedMLXTestSupport.withLock {
+            var parameters = GenerateParameters(maxTokens: 4, temperature: 0)
+            parameters.repetitionPenalty = 2.0
+            parameters.repetitionContextSize = 8
 
-        let iterator = try TokenIterator(
-            input: makeInput([1, 2]),
-            model: SeamTestModel(),
-            parameters: parameters)
+            let iterator = try TokenIterator(
+                input: makeInput([1, 2]),
+                model: SeamTestModel(),
+                parameters: parameters)
 
-        let processor = try #require(iterator.processor)
-        #expect(!(processor is CompositeLogitProcessor))
-        #expect(processor is PenaltyProcessor)
+            let processor = try #require(iterator.processor)
+            #expect(!(processor is CompositeLogitProcessor))
+            #expect(processor is PenaltyProcessor)
+            }
     }
 
     @Test("a request with no configured penalties and no additional processor keeps a nil processor")
     func noPenaltiesNoAdditionalProcessorStaysNil() throws {
-        let parameters = GenerateParameters(maxTokens: 4, temperature: 0)
-        let iterator = try TokenIterator(
-            input: makeInput([1, 2]),
-            model: SeamTestModel(),
-            parameters: parameters)
-        #expect(iterator.processor == nil)
+        try FocusedMLXTestSupport.withLock {
+            let parameters = GenerateParameters(maxTokens: 4, temperature: 0)
+            let iterator = try TokenIterator(
+                input: makeInput([1, 2]),
+                model: SeamTestModel(),
+                parameters: parameters)
+            #expect(iterator.processor == nil)
+            }
     }
 
     // MARK: - 3. Order: penalties first, additional constraint last
 
     @Test("the additional constraint sees already-penalised logits (penalties run first)")
     func penaltiesRunBeforeTheAdditionalConstraint() throws {
-        let recorder = Recorder()
-        var parameters = GenerateParameters(maxTokens: 4, temperature: 0)
-        parameters.repetitionPenalty = 2.0
-        parameters.repetitionContextSize = 8
+        try FocusedMLXTestSupport.withLock {
+            let recorder = Recorder()
+            var parameters = GenerateParameters(maxTokens: 4, temperature: 0)
+            parameters.repetitionPenalty = 2.0
+            parameters.repetitionContextSize = 8
 
-        var iterator = try TokenIterator(
-            input: makeInput([1, 2]),
-            model: SeamTestModel(),
-            parameters: parameters,
-            additionalProcessor: RecordingProcessor(recorder: recorder, markerIndex: 5))
+            var iterator = try TokenIterator(
+                input: makeInput([1, 2]),
+                model: SeamTestModel(),
+                parameters: parameters,
+                additionalProcessor: RecordingProcessor(recorder: recorder, markerIndex: 5))
 
-        // Ring after init: prompt {1, 2} plus the first sampled token {5}.
-        // Probe row: in-ring positives must be halved (4 -> 2), the in-ring
-        // negative doubled (-4 -> -8), the out-of-ring positive untouched.
-        let probe = MLXArray([Float(0), 4, 4, 4, 0, -4, 0, 0]).reshaped(1, 1, 8)
-        let sampled = iterator.convertToToken(logits: probe)
+            // Ring after init: prompt {1, 2} plus the first sampled token {5}.
+            // Probe row: in-ring positives must be halved (4 -> 2), the in-ring
+            // negative doubled (-4 -> -8), the out-of-ring positive untouched.
+            let probe = MLXArray([Float(0), 4, 4, 4, 0, -4, 0, 0]).reshaped(1, 1, 8)
+            let sampled = iterator.convertToToken(logits: probe)
 
-        let observed = try #require(recorder.processRows.last)
-        #expect(observed.count == 8)
-        #expect(
-            observed[1] == 2.0,
-            "positive in-ring logit must already be halved when the additional processor sees it")
-        #expect(
-            observed[5] == -8.0,
-            "negative in-ring logit must already be doubled when the additional processor sees it")
-        #expect(observed[3] == 4.0, "out-of-ring logit must be untouched by the penalty stage")
+            let observed = try #require(recorder.processRows.last)
+            #expect(observed.count == 8)
+            #expect(
+                observed[1] == 2.0,
+                "positive in-ring logit must already be halved when the additional processor sees it")
+            #expect(
+                observed[5] == -8.0,
+                "negative in-ring logit must already be doubled when the additional processor sees it")
+            #expect(observed[3] == 4.0, "out-of-ring logit must be untouched by the penalty stage")
 
-        // And the additional processor's own return value reaches the sampler:
-        // its +100 marker at index 5 (92 after the penalty) is the argmax.
-        #expect(sampled.item(Int.self) == 5)
-        #expect(recorder.didSampleIDs.last == 5)
+            // And the additional processor's own return value reaches the sampler:
+            // its +100 marker at index 5 (92 after the penalty) is the argmax.
+            #expect(sampled.item(Int.self) == 5)
+            #expect(recorder.didSampleIDs.last == 5)
+            }
     }
 
     // MARK: - 4. prompt / process / didSample forwarding
 
     @Test("prompt, process and didSample are forwarded through the seam in order")
     func promptProcessDidSampleAreForwarded() throws {
-        let recorder = Recorder()
-        var parameters = GenerateParameters(maxTokens: 4, temperature: 0)
-        parameters.repetitionPenalty = 2.0
-        parameters.repetitionContextSize = 8
+        try FocusedMLXTestSupport.withLock {
+            let recorder = Recorder()
+            var parameters = GenerateParameters(maxTokens: 4, temperature: 0)
+            parameters.repetitionPenalty = 2.0
+            parameters.repetitionContextSize = 8
 
-        var iterator = try TokenIterator(
-            input: makeInput([1, 2]),
-            model: SeamTestModel(),
-            parameters: parameters,
-            additionalProcessor: RecordingProcessor(recorder: recorder, markerIndex: 5))
+            var iterator = try TokenIterator(
+                input: makeInput([1, 2]),
+                model: SeamTestModel(),
+                parameters: parameters,
+                additionalProcessor: RecordingProcessor(recorder: recorder, markerIndex: 5))
 
-        // The initializer's own prefill must have primed the processor with
-        // the full prompt, then produced exactly one sample.
-        #expect(recorder.events.first == .prompt([1, 2]))
+            // The initializer's own prefill must have primed the processor with
+            // the full prompt, then produced exactly one sample.
+            #expect(recorder.events.first == .prompt([1, 2]))
 
-        let sampled = iterator.convertToToken(logits: MLXArray.zeros([1, 1, 8]))
-        let sampledID = sampled.item(Int.self)
+            let sampled = iterator.convertToToken(logits: MLXArray.zeros([1, 1, 8]))
+            let sampledID = sampled.item(Int.self)
 
-        let expected: [Recorder.Event] = [
-            .prompt([1, 2]),
-            .process([0, 0, 0, 0, 0, 0, 0, 0]),
-            .didSample(5),
-            .process([0, 0, 0, 0, 0, 0, 0, 0]),
-            .didSample(sampledID),
-        ]
-        #expect(recorder.events == expected)
-        #expect(sampledID == 5)
+            let expected: [Recorder.Event] = [
+                .prompt([1, 2]),
+                .process([0, 0, 0, 0, 0, 0, 0, 0]),
+                .didSample(5),
+                .process([0, 0, 0, 0, 0, 0, 0, 0]),
+                .didSample(sampledID),
+            ]
+            #expect(recorder.events == expected)
+            #expect(sampledID == 5)
+            }
     }
 
     // MARK: - 5. independentCopy isolates state
 
     @Test("independentCopy isolates both halves of the composite")
     func independentCopyIsolatesBothHalves() throws {
-        let recorder = Recorder()
-        var parameters = GenerateParameters(maxTokens: 4, temperature: 0)
-        parameters.presencePenalty = 0.5  // unbounded mode: reference-typed counts
+        try FocusedMLXTestSupport.withLock {
+            let recorder = Recorder()
+            var parameters = GenerateParameters(maxTokens: 4, temperature: 0)
+            parameters.presencePenalty = 0.5  // unbounded mode: reference-typed counts
 
-        let iterator = try TokenIterator(
-            input: makeInput([1, 2]),
-            model: SeamTestModel(),
-            parameters: parameters,
-            additionalProcessor: RecordingProcessor(recorder: recorder))
+            let iterator = try TokenIterator(
+                input: makeInput([1, 2]),
+                model: SeamTestModel(),
+                parameters: parameters,
+                additionalProcessor: RecordingProcessor(recorder: recorder))
 
-        // Init sampled one token: the ORIGINAL's built-in presence counts hold
-        // it, and the ORIGINAL's additional box recorded it.
-        let originalBox = try #require(iteratorAdditionalBox(of: iterator))
-        let boxBefore = originalBox.samples
-        let inherited = try #require(boxBefore.last, "init must have sampled through the seam")
+            // Init sampled one token: the ORIGINAL's built-in presence counts hold
+            // it, and the ORIGINAL's additional box recorded it.
+            let originalBox = try #require(iteratorAdditionalBox(of: iterator))
+            let boxBefore = originalBox.samples
+            let inherited = try #require(boxBefore.last, "init must have sampled through the seam")
 
-        var copy = try #require(iterator.processor?.independentCopy())
-        let eventsBeforeCopy = recorder.events.count
-        _ = copy.process(logits: MLXArray.zeros([1, 8]))
-        // The copy's process still forwards through its own additional half.
-        #expect(recorder.events.count == eventsBeforeCopy + 1)
-        for _ in 0 ..< 4 { copy.didSample(token: MLXArray([Int32(3)])) }
+            var copy = try #require(iterator.processor?.independentCopy())
+            let eventsBeforeCopy = recorder.events.count
+            _ = copy.process(logits: MLXArray.zeros([1, 8]))
+            // The copy's process still forwards through its own additional half.
+            #expect(recorder.events.count == eventsBeforeCopy + 1)
+            for _ in 0 ..< 4 { copy.didSample(token: MLXArray([Int32(3)])) }
 
-        // The additional half's reference state was replaced, not shared.
-        #expect(originalBox.samples == boxBefore, "copy wrote into the original's box")
+            // The additional half's reference state was replaced, not shared.
+            #expect(originalBox.samples == boxBefore, "copy wrote into the original's box")
 
-        // The copy's own built-in half advanced from its own samples ...
-        let copyRow = row(of: copy.process(logits: MLXArray.zeros([1, 8])))
-        #expect(copyRow[3] == -0.5, "the copy must accumulate its own presence penalty")
-        // ... and inherited the pre-copy state rather than starting empty.
-        #expect(copyRow[inherited] == -0.5, "the copy must inherit the original's counts")
+            // The copy's own built-in half advanced from its own samples ...
+            let copyRow = row(of: copy.process(logits: MLXArray.zeros([1, 8])))
+            #expect(copyRow[3] == -0.5, "the copy must accumulate its own presence penalty")
+            // ... and inherited the pre-copy state rather than starting empty.
+            #expect(copyRow[inherited] == -0.5, "the copy must inherit the original's counts")
 
-        // The original's built-in half must NOT have seen the copy's samples.
-        let original = try #require(iterator.processor)
-        let originalRow = row(of: original.process(logits: MLXArray.zeros([1, 8])))
-        #expect(originalRow[inherited] == -0.5, "the original keeps its own state")
-        #expect(originalRow[3] == 0.0, "the copy's samples leaked into the original")
+            // The original's built-in half must NOT have seen the copy's samples.
+            let original = try #require(iterator.processor)
+            let originalRow = row(of: original.process(logits: MLXArray.zeros([1, 8])))
+            #expect(originalRow[inherited] == -0.5, "the original keeps its own state")
+            #expect(originalRow[3] == 0.0, "the copy's samples leaked into the original")
+            }
     }
 
     private func row(of logits: MLXArray) -> [Float] {

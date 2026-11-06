@@ -27,6 +27,8 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/metal/binary.cpp",
         "mlx/mlx/backend/metal/compiled.cpp",
         "mlx/mlx/backend/metal/conv.cpp",
+        "mlx/mlx/backend/metal/cross_entropy.cpp",
+        "mlx/mlx/backend/metal/gated_delta_update.cpp",
         "mlx/mlx/backend/metal/copy.cpp",
         "mlx/mlx/backend/metal/custom_kernel.cpp",
         "mlx/mlx/backend/metal/device.cpp",
@@ -189,6 +191,7 @@ let cmlx = Target.target(
 
         // example code + mlx-c distributed
         "mlx-c/examples",
+        "mlx-c/tests",
         "mlx-c/mlx/c/distributed.cpp",
         "mlx-c/mlx/c/distributed_group.cpp",
 
@@ -208,7 +211,6 @@ let cmlx = Target.target(
         // mlx files that are not part of the build
         "mlx/ACKNOWLEDGMENTS.md",
         "mlx/CMakeLists.txt",
-        "mlx/CODE_OF_CONDUCT.md",
         "mlx/CONTRIBUTING.md",
         "mlx/LICENSE",
         "mlx/MANIFEST.in",
@@ -231,6 +233,7 @@ let cmlx = Target.target(
         "mlx/mlx/backend/cuda/conv.cpp",
         "mlx/mlx/backend/cuda/cublas_utils.cpp",
         "mlx/mlx/backend/cuda/cudnn_utils.cpp",
+        "mlx/mlx/backend/cuda/cusolver_utils.cpp",
         "mlx/mlx/backend/cuda/custom_kernel.cpp",
         "mlx/mlx/backend/cuda/delayload.cpp",
         "mlx/mlx/backend/cuda/device_info.cpp",
@@ -248,6 +251,8 @@ let cmlx = Target.target(
         "mlx/mlx/backend/cuda/slicing.cpp",
         "mlx/mlx/backend/cuda/utils.cpp",
         "mlx/mlx/backend/cuda/worker.cpp",
+        "mlx/mlx/backend/cuda/wddm.cpp",
+        "mlx/mlx/backend/cuda/cholesky.cu",
 
         "mlx/mlx/backend/cuda/binary",
         "mlx/mlx/backend/cuda/conv",
@@ -272,7 +277,10 @@ let cmlx = Target.target(
         "mlx/mlx/distributed/mpi/mpi.cpp",
         "mlx/mlx/distributed/ring/ring.cpp",
         "mlx/mlx/distributed/nccl/nccl.cpp",
+        // SDK-gated wrappers under distributed/ select the real JACCL
+        // backend on supported macOS SDKs and the upstream stub elsewhere.
         "mlx/mlx/distributed/jaccl/jaccl.cpp",
+        "mlx/mlx/distributed/jaccl/no_jaccl.cpp",
         "mlx/mlx/distributed/jaccl/lib",
     ],
     cSettings: [
@@ -283,8 +291,9 @@ let cmlx = Target.target(
         .headerSearchPath("mlx"),
         .headerSearchPath("mlx-c"),
         .headerSearchPath("json/single_include/nlohmann"),
+        .headerSearchPath("mlx/mlx/distributed/jaccl/lib"),
         .headerSearchPath("fmt/include"),
-        .define("MLX_VERSION", to: "\"0.32.2\""),
+        .define("MLX_VERSION", to: "\"0.32.3\""),
     ],
     linkerSettings: linkerSettings
 )
@@ -324,7 +333,6 @@ let package = Package(
         .library(name: "MLXDistributedTransport", targets: ["MLXDistributedTransport"]),
         .library(name: "MLXDistributedJACCL", targets: ["MLXDistributedJACCL"]),
         .library(name: "MLXDistributedTP", targets: ["MLXDistributedTP"]),
-        .library(name: "MLXPress", targets: ["MLXPress"]),
         .library(name: "VMLX", targets: ["VMLX"]),
         // Native mFLUX image/video generation (vendored from jjang-ai/vmlx-flux).
         .library(name: "vMLXFluxKit", targets: ["vMLXFluxKit"]),
@@ -345,8 +353,6 @@ let package = Package(
         .executable(name: "OmniAudioLatencyBench", targets: ["OmniAudioLatencyBench"]),
         .executable(name: "OmniAudioChunkStabilityBench", targets: ["OmniAudioChunkStabilityBench"]),
         .executable(name: "Qwen35TPProofRunner", targets: ["Qwen35TPProofRunner"]),
-        .executable(name: "mlxpress", targets: ["MLXPressCLI"]),
-        .executable(name: "mlxpress-selfcheck", targets: ["MLXPressSelfCheck"]),
         .executable(name: "BonsaiPrismFWHTParity", targets: ["BonsaiPrismFWHTParity"]),
     ],
     dependencies: [
@@ -484,8 +490,31 @@ let package = Package(
         ),
 
         .target(
+            name: "MLXCXGrammar",
+            path: "Libraries/MLXCXGrammar",
+            exclude: ["PROVENANCE.md", "xgrammar/cpp/grammar_functor.cc"],
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .headerSearchPath("xgrammar/include"),
+                .headerSearchPath("xgrammar/cpp"),
+                .headerSearchPath("xgrammar/3rdparty/picojson"),
+                .headerSearchPath("xgrammar/3rdparty/dlpack/include"),
+                .define("XGRAMMAR_ENABLE_CPPTRACE", to: "0"),
+                .define("XGRAMMAR_ENABLE_INTERNAL_CHECK", to: "0"),
+                .define("xgrammar", to: "vmlx_xgrammar"),
+                .define("picojson", to: "vmlx_picojson"),
+            ],
+            linkerSettings: [
+                .linkedLibrary("c++", .when(platforms: [.macOS, .iOS, .visionOS, .tvOS]))
+            ]
+        ),
+
+        .target(
             name: "MLXLMCommon",
-            dependencies: ["MLX", "MLXFast", "MLXNN", "MLXOptimizers", "MLXRandom"],
+            dependencies: [
+                "MLX", "MLXFast", "MLXNN", "MLXOptimizers", "MLXRandom", "CmlxGraphShim",
+                "MLXCXGrammar",
+            ],
             path: "Libraries/MLXLMCommon",
             exclude: mlxLMCommonExcludedFiles,
             // Compile this target in the Swift 5 language mode. The package is
@@ -617,16 +646,7 @@ let package = Package(
             dependencies: ["MLXHuggingFaceMacros", "MLXLMCommon"],
             path: "Libraries/MLXHuggingFace"
         ),
-        .target(
-            name: "MLXPress",
-            dependencies: [
-                "MLXLLM",
-                "MLXLMCommon",
-                "MLXHuggingFace",
-                "VMLXTokenizers",
-            ],
-            path: "Sources/MLXPress"
-        ),
+
         .target(
             name: "VMLX",
             dependencies: [
@@ -651,23 +671,14 @@ let package = Package(
                 "MLXDistributedTransport",
                 "MLXDistributedJACCL",
                 "MLXDistributedTP",
-                "MLXPress",
             ],
             path: "Libraries/VMLX",
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
         ),
-        .executableTarget(
-            name: "MLXPressCLI",
-            dependencies: ["MLXPress", "MLXLMCommon"],
-            path: "Sources/MLXPressCLI"
-        ),
-        .executableTarget(
-            name: "MLXPressSelfCheck",
-            dependencies: ["MLXPress"],
-            path: "Sources/MLXPressSelfCheck"
-        ),
+
+
         .executableTarget(
             name: "CompileBench",
             dependencies: ["MLX", "MLXNN", "MLXRandom"],
@@ -805,6 +816,18 @@ let package = Package(
         ),
 
         .testTarget(
+            name: "ToolSchemaReferenceTests",
+            dependencies: ["MLXLMCommon", "VMLXJinja"],
+            path: "Tests/ToolSchemaReferenceTests"
+        ),
+        .testTarget(
+            name: "JinjaReferenceTests",
+            dependencies: ["VMLXJinja"],
+            path: "Tests/JinjaReferenceTests",
+            exclude: ["README.md"],
+            resources: [.copy("Fixtures")]
+        ),
+        .testTarget(
             name: "MLXTests",
             dependencies: [
                 "MLX", "MLXNN", "MLXOptimizers",
@@ -837,6 +860,7 @@ let package = Package(
                 .copy("Resources/modernbert-tiny.safetensors"),
                 .copy("Resources/modernbert-tiny.json"),
                 .process("Resources/PrismBonsaiPinnedFWHTFixture.json"),
+                .copy("Resources/minicpmv47"),
             ]
         ),
         .testTarget(
@@ -854,10 +878,28 @@ let package = Package(
             dependencies: ["MLX", "MLXLMCommon", "MLXLLM", "MLXVLM", "VMLXJinja", "VMLX"],
             path: "Tests/MLXLMCommonFocusedTests",
             sources: [
+                "MultiRowDecodeAttentionTests.swift",
                 "ProposalHeadStampTests.swift",
+                "DFlash2TreeAndTopKAcceptanceTests.swift",
+                "LaneQMMGroup128Tests.swift",
+                "LaneQMMTargetClassificationTests.swift",
+                "DFlash2WidthChooserTests.swift",
+                "DFlash2PrefixContextTests.swift",
+                "BatchWarmMediaBoundaryTests.swift",
+                "DSparkDrafterTests.swift",
+                "ChunkedVectorAttentionTests.swift",
+                "SpeculativeAcceptanceBoundaryTests.swift",
                 "NativeMTPARSafetyTests.swift",
+                "NativeMTPDemotionHeadHistory119Tests.swift",
+                "NativeMTPDemotionCompatibilityTests.swift",
                 "NativeMTPDepthPolicyTests.swift",
+                "NativeMTPRuntimeTopRungTests.swift",
+                "NemotronMTPFamilyColdStartTests.swift",
+                "OrnithMTPFamilyColdStartTests.swift",
+                "DefaultSpeculationAuditTests.swift",
                 "NativeMTPDepthExecutionTests.swift",
+                "WireBudgetPolicyTests.swift",
+                "ModelResidencyTests.swift",
                 "RaptorTopLevelStampTests.swift",
                 "HybridRestoreBoundaryInvariantTests.swift",
                 "DualPathFamiliesTests.swift",
@@ -899,6 +941,7 @@ let package = Package(
                 "ProcessorPatchSizeShapeTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "NativeDiskDurabilityTests.swift",
+                "NativeForwardedStopTailTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",
                 "ExpertDownProjectionQuantOrderTests.swift",
                 "VMLXUmbrellaProductTests.swift",
@@ -909,8 +952,6 @@ let package = Package(
                 "JANGTQHadamardShuffleTests.swift",
                 "Glm4GridInvariantTests.swift",
                 "MiniMaxJANGTQResidentExpertTests.swift",
-                "JangPressMachCacheTests.swift",
-                "JangPressPrestackerCleanupTests.swift",
                 "JangAffine1RuntimeContractTests.swift",
                 "DeepseekV4IndexerCausalTopKTests.swift",
                 "DeepseekV4ReasoningPolicyTests.swift",
@@ -936,11 +977,11 @@ let package = Package(
                 "DFlash2ReferenceParityTests.swift",
                 "DFlash2StageProbeTests.swift",
                 "DFlash2DrafterSelectionTests.swift",
+                "DFlash2DrafterResolverTests.swift",
                 "CompilableKVCacheSnapshotTests.swift",
                 "DFlash2DispatchReachabilityTests.swift",
                 "MixedGroupSizeQuantizationFocusedTests.swift",
                 "JangSamplingDefaultsTests.swift",
-                "MLXPressCLISourceContractsTests.swift",
                 "ChatTemplateResolutionTests.swift",
                 "VMLXServerRuntimeSettingsTests.swift",
                 "VMLXMemorySafetySettingsTests.swift",
@@ -949,12 +990,34 @@ let package = Package(
                 "DSV4AgenticToolSourceTests.swift",
                 "AgenticTaskBenchConfinementFocusedTests.swift",
                 "NoHiddenReasoningCloseBiasFocusedTests.swift",
-                "MinimumReasoningFloorFocusedTests.swift",
+                "NativeReasoningLogitsFocusedTests.swift",
+                "BlockDiffusionEOSContractFocusedTests.swift",
+                "DeepseekV41ChatEncoderFocusedTests.swift",
+                "EngramV41FocusedTests.swift",
+                "DeepseekV41PoolBitsFocusedTests.swift",
+                "DeepseekV41LongPoolDiskRestoreFocusedTests.swift",
+                "DeepseekV41IndexerFocusedTests.swift",
+                "DeepseekV41FusedIndexScoresFocusedTests.swift",
+                "DeepseekV41MPPIndexScoresFocusedTests.swift",
+                "DSV41TestBundle.swift",
+                "DeepseekV41DecodeFusionFocusedTests.swift",
+                "DeepseekV41VerifyRowKernelsTests.swift",
+                "DeepseekV41KVBytesFocusedTests.swift",
+                "DeepseekV41PrefillLookaheadFocusedTests.swift",
+                "DeepseekV41PoolLayoutAttentionTests.swift",
+                "DeepseekV41SplitAttentionFocusedTests.swift",
+                "DeepseekV41SuffixPruneFocusedTests.swift",
+                "DeepseekV41NearBoundaryCaptureTests.swift",
                 "TokenizerAddedTokenRegexFocusedTests.swift",
                 "LFM2ShortConvCacheRestoreFocusedTests.swift",
                 "LFM25ChatTemplateRenderFocusedTests.swift",
                 "LogitProcessorIndependentCopyTests.swift",
                 "TokenIteratorAdditionalProcessorTests.swift",
+                "DSparkSpeculationFocusedTests.swift",
+                "HybridPoolHiddenTailLifetimeTests.swift",
+                "RotatingSharedKVCacheLifetimeTests.swift",
+                "DeepseekV41DSparkFocusedTests.swift",
+                "DeepseekV41VisionFocusedTests.swift",
             ]
         ),
         .testTarget(
@@ -970,22 +1033,28 @@ let package = Package(
         // stack uses one MLX binary. Umbrella import: `import vMLXFlux`.
         .target(
             name: "vMLXFluxKit",
-            dependencies: ["MLX", "MLXNN", "MLXRandom", "MLXLMCommon"],
+            dependencies: ["MLX", "MLXNN", "MLXRandom", "MLXLMCommon", .product(name: "Crypto", package: "swift-crypto")],
             path: "Libraries/vMLXFluxKit"
         ),
         .target(
+            name: "vMLXSeedVR2",
+            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXFast", "MLXRandom"],
+            path: "Libraries/vMLXSeedVR2",
+            exclude: ["NOTICE.md"]
+        ),
+        .target(
             name: "vMLXFluxModels",
-            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
+            dependencies: ["vMLXFluxKit", "MLXLMCommon", "vMLXSeedVR2", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
             path: "Libraries/vMLXFluxModels"
         ),
         .target(
             name: "vMLXFluxVideo",
-            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom"],
+            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
             path: "Libraries/vMLXFluxVideo"
         ),
         .target(
             name: "vMLXFlux",
-            dependencies: ["vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
+            dependencies: ["vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo", "MLX"],
             path: "Libraries/vMLXFlux"
         ),
         .executableTarget(
@@ -995,8 +1064,9 @@ let package = Package(
         ),
         .testTarget(
             name: "vMLXFluxTests",
-            dependencies: ["vMLXFlux", "vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
-            path: "Tests/vMLXFluxTests"
+            dependencies: ["vMLXFlux", "vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo", "vMLXSeedVR2"],
+            path: "Tests/vMLXFluxTests",
+            resources: [.copy("Resources")]
         ),
 
         // ------
@@ -1050,7 +1120,7 @@ if Context.environment["MLX_SWIFT_BUILD_DOC"] == "1"
 package.targets.append(
     .testTarget(
         name: "VMLXLinuxTests",
-        dependencies: ["MLX", "MLXNN", "MLXLMCommon", "MLXEmbedders"],
+        dependencies: ["MLX", "MLXNN", "MLXLMCommon", "MLXEmbedders", "MLXVLM"],
         path: "Tests/VMLXLinuxTests"
     )
 )
@@ -1080,11 +1150,16 @@ package.targets.append(
             "CSQLite3Linux",
             .product(name: "Crypto", package: "swift-crypto"),
         ]
+        // MLXVLM's Qwen4Exp imports Crypto where CryptoKit is absent.
+        guard let vlm = package.targets.first(where: { $0.name == "MLXVLM" }) else {
+            fatalError("Linux profile: no target named MLXVLM")
+        }
+        vlm.dependencies += [.product(name: "Crypto", package: "swift-crypto")]
     }
     if Context.environment["VMLX_LINUX_PROFILE"] != "0" {
         let roots = [
-            "MLXEmbedders", "MLXLLM", "MLXHuggingFace", "VMLXTokenizers", "MLXFFT", "MLXLinalg",
-            "CSQLite3Linux", "VMLXLinuxTests",
+            "MLXEmbedders", "MLXLLM", "MLXVLM", "MLXHuggingFace", "VMLXTokenizers", "MLXFFT",
+            "MLXLinalg", "CSQLite3Linux", "VMLXLinuxTests",
         ]
         let targetsByName = Dictionary(
             package.targets.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })

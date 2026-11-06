@@ -1,83 +1,15 @@
 // Copyright © 2026 Jinho Jang. All rights reserved.
-//
-// LoadConfiguration — typed, Sendable surface for cold-tier (MLXPress)
-// + resident-cap policy. Designed so osaurus / JANG Studio / CLI tools
-// can pin behavior from settings without touching env vars.
-//
-// Env-var precedence is preserved as a fallback so headless CLI
-// invocations keep working: explicit value > env > .auto threshold.
-//
-// See docs/MLXPRESS.md for the current wiring guide. Older JANGPRESS docs
-// record historical design evidence and remain useful during migration.
+// Typed canonical loading, allocator and residency configuration.
 
 import Foundation
 import MLX
 
-/// Cold-weight (axis E, MLXPress) policy. The driver picks a concrete
-/// `MLXPressLoadOptions` from this at load-entry time.
-///
-/// Three states:
-///
-/// - ``disabled`` — never instantiate the MLXPress tier; the loader
-///   takes the legacy full-resident path. Use this when you want
-///   strict byte-compat with pre-iter-23 behavior, or when the host
-///   has plenty of RAM and cold-fault latency is not desired.
-///
-/// - ``enabled(coldFraction:)`` — always instantiate, with a fixed
-///   fraction of routed-MoE bytes treated as cold (`0.0 ... 0.95`).
-///   `0.70` is the production-recommended value for 128 GB hosts.
-///
-/// - ``auto(envFallback:)`` — pick at load time:
-///   1. If `envFallback == true`, honor `MLXPRESS` env var, with
-///      `JANGPRESS` accepted as a legacy fallback:
-///      `0`/`off`/`false` → disabled; integer `N` in `[0, 95]` →
-///      `.enabled(coldFraction: Double(N) / 100.0)`.
-///   2. Otherwise: enable with `coldFraction = 0.70` iff the bundle
-///      is detected as routed (MoE) AND raw bytes exceed 50% of
-///      physical memory. Otherwise disabled.
-public enum JangPressPolicy: Sendable, Equatable {
-    case disabled
-    case enabled(coldFraction: Double)
-    case auto(envFallback: Bool)
-
-    /// Production default — `.auto` with env fallback on. Behavior
-    /// adapts per host and respects an explicit `MLXPRESS=` override.
-    public static let `default`: JangPressPolicy = .auto(envFallback: true)
-
-    /// Equality treats `coldFraction` bit-exactly (intended; consumers
-    /// should pass canonical doubles like 0.70, not arithmetic that
-    /// might round).
-    public static func == (lhs: JangPressPolicy, rhs: JangPressPolicy) -> Bool {
-        switch (lhs, rhs) {
-        case (.disabled, .disabled): return true
-        case (.enabled(let a), .enabled(let b)): return a == b
-        case (.auto(let a), .auto(let b)): return a == b
-        default: return false
-        }
-    }
-}
-
-/// Hard cap on resident weight bytes during load. Independent of
-/// `MLXPressPolicy` — a caller may disable MLXPress and still want a
-/// fail-loud cap, or enable MLXPress without any cap.
-///
-/// - ``unlimited`` — no cap. Loader behaves as it always has;
-///   `MLX_set_wired_limit` and the `MLX.Memory.cacheLimit` are
-///   untouched. Current behavior pre-iter-25.
-///
-/// - ``fraction(_:)`` — cap at `fraction × ProcessInfo.physicalMemory`.
-///   `0.70` is the production-recommended value for 128 GB hosts.
-///
-/// - ``absolute(_:)`` — cap at exactly N bytes. Useful for CI / VMs
-///   with restricted memory limits independent of physical RAM.
 public enum ResidentCap: Sendable, Equatable {
     case unlimited
     case fraction(Double)
     case absolute(UInt64)
 
-    /// Production default — 70% of physical RAM. Matches the
-    /// `MLXPress=70` recommendation but is enforced even when
-    /// MLXPress is disabled.
+    /// Generic default; model-specific admission may resolve a different cap.
     public static let `default`: ResidentCap = .fraction(0.70)
 
     /// Resolve to a concrete byte cap given physical RAM. Returns
@@ -95,21 +27,10 @@ public enum ResidentCap: Sendable, Equatable {
     }
 }
 
-/// Top-level load-time configuration. Wraps the cold-tier policy and
-/// resident cap so osaurus can stash a single Sendable struct in its
-/// settings store and pass it through to `loadModel` / `loadContainer`.
-///
-/// **Source-compat**: this is purely additive. Existing callers that
-/// use `loadModel(from:using:)` (no MLXPress) or
-/// `loadModel(from:using:jangPress:)` (legacy explicit `JangPressLoadOptions`)
-/// keep working unchanged. The new
-/// `loadModel(from:using:loadConfiguration:)` overload (added in
-/// step 2) consumes this struct.
+/// Typed canonical model loading, memory limits and optional model features.
 public struct LoadConfiguration: Sendable, Equatable {
     /// Default-denied original-file repair. Does not replace the existing opt-in.
     public var alignmentRepairAuthorization: AlignmentRepairAuthorization = .disabled
-    /// Cold-weight (MLXPress) policy.
-    public var jangPress: JangPressPolicy
 
     /// Hard cap on resident weight bytes (deprecated semantics — use
     /// ``memoryLimit`` instead). Kept for backwards-source-compat.
@@ -134,19 +55,14 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// Default `.fraction(0.70)` — Python's tested-good production
     /// value, capped to whichever is smaller of physical RAM and the
     /// GPU's recommended max working set.
-    public var memoryLimit: ResidentCap
+    public var memoryLimit: ResidentCap {
+        didSet { memoryLimitWasExplicit = true }
+    }
+    /// Explicit initializer values and subsequent assignments are never auto-raised.
+    public private(set) var memoryLimitWasExplicit: Bool
 
-    /// Use MLX's mmap-backed safetensors loader when the pinned
-    /// `mlx-swift` build supports it. For MLXPress `.mmap` loads, the
-    /// Osaurus MLX fork maps safetensors tensors as page-aligned
-    /// no-copy Metal buffers and creates MLX tensor views into those
-    /// buffers, avoiding the stock `pread()` copy into anonymous
-    /// allocator storage. Older MLX pins ignore the environment knobs,
-    /// so this is source- and runtime-compatible during the pin rollout.
-    ///
-    /// Default `true` because this is the part that makes cold weights
-    /// file-backed and reclaimable under pressure. Set `false` for
-    /// strict pre-mmap loader parity.
+    /// Legacy source-compatibility field. Model weights always use owned storage;
+    /// true no longer enables file-backed mappings.
     public var useMmapSafetensors: Bool
 
     /// Load preserved native-MTP tensors and instantiate model-owned MTP
@@ -158,6 +74,10 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// if the model was loaded with the sidecar weights present; conversely,
     /// loading the sidecar does not force speculative decode for every request.
     public var nativeMTP: Bool
+
+    /// Request GPU residency while loaded, subject to the device ceiling and
+    /// physical-memory reserve. Separate from the host's idle-unload timer.
+    public var keepModelInMemory: Bool = true
 
     /// Explicit user-selected MTP depth (1–3) carried into the load so the
     /// activation gate can accept a tensor-complete head without a measured
@@ -176,42 +96,12 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// and reloading the model.
     public var deepseekV4ActivationQAT: Bool?
 
-    /// Production default — MLXPress `.disabled` (opt-in), 70% cache +
-    /// memory caps, mmap-backed safetensors enabled. Osaurus and other
-    /// host integrators get spike-survival memory caps and the patched
-    /// mmap loader without engaging the experimental routed-expert
-    /// cold-tier. Callers that have validated MLXPress for a specific
-    /// bundle family should pass an explicit `.enabled(coldFraction:)`
-    /// or `.auto(envFallback:)` policy.
+    /// Canonical owned-weight loading with the existing allocator and memory policies.
     public static let `default` = LoadConfiguration()
-
-    /// Opt-in MLXPress with auto-detection (`.auto(envFallback: true)`).
-    /// Use this when the host has validated MLXPress for the bundles it
-    /// serves AND wants the iter-26 routed-MoE cold-tier on bundles
-    /// whose total weight bytes exceed half of physical RAM.
-    /// `MLXPRESS=N` (0–95) and `MLXPRESS=off` env overrides honored;
-    /// legacy `JANGPRESS=*` remains accepted.
-    public static let experimentalJangPressAuto = LoadConfiguration(
-        jangPress: .auto(envFallback: true),
-        maxResidentBytes: .default,
-        memoryLimit: .default,
-        useMmapSafetensors: true,
-        nativeMTP: false)
-
-    /// Production host preset for Osaurus/vMLX server integrations.
-    ///
-    /// Keep the conservative load-time memory caps and mmap safetensors
-    /// path from ``default`` without automatically engaging the
-    /// experimental routed-expert cold tier. Hosts that have validated
-    /// MLXPress for a specific bundle family should pass
-    /// ``experimentalJangPressAuto`` or an explicit
-    /// ``JangPressPolicy/enabled(coldFraction:)`` policy from settings.
     public static let osaurusProduction = LoadConfiguration.default
 
-    /// Everything off — strict byte-compat with pre-iter-23 behavior.
-    /// MLXPress disabled, no caps, no mmap loader.
+    /// Explicit diagnostic preset without memory caps or mmap loading.
     public static let off = LoadConfiguration(
-        jangPress: .disabled,
         maxResidentBytes: .unlimited,
         memoryLimit: .unlimited,
         useMmapSafetensors: false,
@@ -219,19 +109,49 @@ public struct LoadConfiguration: Sendable, Equatable {
         deepseekV4ActivationQAT: false)
 
     public init(
-        jangPress: JangPressPolicy = .disabled,
         maxResidentBytes: ResidentCap = .default,
-        memoryLimit: ResidentCap = .default,
-        useMmapSafetensors: Bool = true,
+        memoryLimit: ResidentCap? = nil,
+        useMmapSafetensors: Bool = false,
         nativeMTP: Bool = false,
         deepseekV4ActivationQAT: Bool? = nil
     ) {
-        self.jangPress = jangPress
         self.maxResidentBytes = maxResidentBytes
-        self.memoryLimit = memoryLimit
+        self.memoryLimit = memoryLimit ?? .default
+        self.memoryLimitWasExplicit = memoryLimit != nil
         self.useMmapSafetensors = useMmapSafetensors
         self.nativeMTP = nativeMTP
         self.deepseekV4ActivationQAT = deepseekV4ActivationQAT
+    }
+
+    /// A scheduling budget, not a physical-footprint limit. Every family owns
+    /// its packed weights; an automatic allowance below them would repeatedly
+    /// drain GPU work and reusable buffers. Explicit limits and oversized or
+    /// unknown bundles remain admission decisions, never silently raised.
+    func resolvedSchedulingMemoryLimit(
+        facts: LoadBundleFacts, recommendedWorkingSetBytes: Int?
+    ) -> ResidentCap {
+        let ordinary = facts.resolveMLXMemoryLimit(requested: memoryLimit)
+        guard !memoryLimitWasExplicit, facts.gpuResidentWeightBytes > 0,
+            let recommendedWorkingSetBytes, recommendedWorkingSetBytes > 0,
+            let base = ordinary.resolve(physicalMemory: facts.physicalMemory)
+        else { return ordinary }
+        let headroom: UInt64 = 4 << 30
+        let desired = facts.gpuResidentWeightBytes.addingReportingOverflow(headroom)
+        // Keep at least 15% of physical RAM outside this scheduling allowance.
+        let physical85 = (facts.physicalMemory / 20) * 17
+            + ((facts.physicalMemory % 20) * 17) / 20
+        let ceiling = min(physical85, UInt64(recommendedWorkingSetBytes))
+        // A model that fits the ceiling must not fall back below its own
+        // weight size merely because the preferred 4 GiB scratch allowance
+        // does not fit. That fallback drains the allocator's reusable buffers
+        // on every step (Allosaurus on 48 GiB). A ceiling below the weights
+        // remains an admission concern; do not silently exceed it here.
+        guard !desired.overflow, facts.gpuResidentWeightBytes < ceiling else {
+            return ordinary
+        }
+        let target = min(desired.partialValue, ceiling)
+        guard target > base else { return ordinary }
+        return .absolute(target)
     }
 }
 
@@ -263,10 +183,18 @@ public enum DeepseekV4ActivationQAT {
 
 // MARK: - Resolution
 
-/// Snapshot of the bundle facts needed by `MLXPressPolicy.resolve` —
+/// Snapshot of bundle facts used for canonical loading and memory admission —
 /// pulled once at load entry so the resolver doesn't re-walk the
 /// directory or re-parse `config.json`.
 public struct LoadBundleFacts: Sendable, Equatable {
+    /// Metadata classification only, not tensor geometry or model-runtime proof.
+    public enum CustomRoutedFormat: Sendable, Equatable {
+        case none
+        case janghV2
+        case invalidJANGHDeclaration
+    }
+    public private(set) var customRoutedFormat: CustomRoutedFormat = .none
+
     /// Converted MiMo V2.6 packed banks are owned GPU inputs by default.
     public private(set) var isMiMoV26MixedQuantized: Bool = false
     /// Top-level or nested `model_type` from config metadata, when available.
@@ -301,6 +229,19 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// disabled in that case).
     public var totalSafetensorsBytes: UInt64
 
+    /// Bytes of tables that are read from SSD on demand and never become GPU-resident weights: the Qwen4Exp
+    /// (Flash-Next / Allosaurus) per-layer n-gram embedding shards (`*.ple.ngram_embedding.*`, 18-54 GB). They are
+    /// served by `pread` rows through the page cache, not MLX arrays.
+    public var ssdResidentTableBytes: UInt64 = 0
+
+    /// The weights that must be resident for decode: the bundle minus SSD-resident tables. Wiring, the
+    /// materialize-instead-of-mmap rule and the JANGH scheduling allowance size against this, not the whole
+    /// bundle (Allosaurus: 32.5 GB of weights in an 88 GB bundle).
+    public var gpuResidentWeightBytes: UInt64 {
+        totalSafetensorsBytes > ssdResidentTableBytes
+            ? totalSafetensorsBytes - ssdResidentTableBytes : totalSafetensorsBytes
+    }
+
     /// True iff `config.json` declares any of:
     /// `num_local_experts`, `num_experts`, `moe_intermediate_size`,
     /// `n_routed_experts`, or contains a non-empty `experts` mapping.
@@ -308,7 +249,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
     public var isRouted: Bool
 
     /// Best-effort routed-expert count sniffed from `config.json`.
-    /// Used by router-aware MLXPress advice to size each layer's hot
+    /// Describes the routed expert topology, including each layer's
     /// set. `nil` when the bundle does not expose the shape.
     public var numRoutedExperts: Int?
 
@@ -352,11 +293,19 @@ public struct LoadBundleFacts: Sendable, Equatable {
 
     /// Inspect the bundle directory at `url`. All probes are best-effort —
     /// failures degrade silently to safe defaults (zero bytes, dense).
-    public static func inspect(bundleURL url: URL) -> LoadBundleFacts {
+    public static func inspect(bundleURL: URL) -> LoadBundleFacts {
+        // A bundle reached through a symlinked directory (models kept on another volume and
+        // linked into the models folder) must report the same facts as its target.
+        // `contentsOfDirectory(at:)` throws ENOTDIR on a URL naming a symlink to a directory, so
+        // the unresolved URL listed nothing: zero weight bytes, so no Metal residency budget, so
+        // the whole model stayed reclaimable. DeepSeek-V4.1 JANG_2K (197 GiB) on a 256 GiB Mac
+        // then had 69-80 GiB of its weights compressed right after load, and the first command
+        // buffer that had to bring them back hit the GPU timeout.
+        let url = bundleURL.resolvingSymlinksInPath()
         let fm = FileManager.default
-        let physical = ProcessInfo.processInfo.physicalMemory
+        let physical = HostPhysicalMemory.bytes
 
-        // Walk top-level for *.safetensors. Don't recurse — MLXPress
+        // Walk top-level for *.safetensors. Do not recurse: the loader
         // bundles never nest weights under subdirs.
         var totalBytes: UInt64 = 0
         if let entries = try? fm.contentsOfDirectory(
@@ -365,7 +314,9 @@ public struct LoadBundleFacts: Sendable, Equatable {
             options: [.skipsHiddenFiles])
         {
             for entry in entries where entry.pathExtension == "safetensors" {
-                if let values = try? entry.resourceValues(forKeys: [.fileSizeKey]),
+                // Through the link: a Hugging Face cache stores every shard as a symlink into
+                // `blobs/`, and a link reports its own few dozen bytes, not the weights'.
+                if let values = try? entry.resolvingSymlinksInPath().resourceValues(forKeys: [.fileSizeKey]),
                     let size = values.fileSize
                 {
                     totalBytes &+= UInt64(size)
@@ -384,8 +335,16 @@ public struct LoadBundleFacts: Sendable, Equatable {
         var declaredComputeDType: String?
         var routedExpertLayout: String?
         var isMiMoV26MixedQuantized = false
-        let configURL = url.appendingPathComponent("config.json")
-        if let data = try? Data(contentsOf: configURL),
+        let rawConfiguration = try? Data(contentsOf: url.appendingPathComponent("config.json"))
+        let rawSidecar = try? Data(contentsOf: url.appendingPathComponent("jang_config.json"))
+        var customRoutedFormat: CustomRoutedFormat = .none
+        if let rawConfiguration,
+           JANGHModelPreparation.declaresCustomFormat(configuration: rawConfiguration, sidecar: rawSidecar) {
+            customRoutedFormat = (try? JANGHConfigurationPartition(
+                configuration: rawConfiguration, sidecar: rawSidecar)) == nil
+                ? .invalidJANGHDeclaration : .janghV2
+        }
+        if let data = rawConfiguration,
             let json = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any]
         {
@@ -488,7 +447,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
         let jangConfigURL = url.appendingPathComponent("jang_config.json")
         let hasJangConfig = fm.fileExists(atPath: jangConfigURL.path)
         if hasJangConfig,
-            let data = try? Data(contentsOf: jangConfigURL),
+            let data = rawSidecar,
             let json = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any]
         {
@@ -529,7 +488,36 @@ public struct LoadBundleFacts: Sendable, Equatable {
             topK: topK)
         facts.hasPrestackedAffineRoutedExperts = hasPrestackedAffineRoutedExperts
         facts.isMiMoV26MixedQuantized = isMiMoV26MixedQuantized
+        facts.customRoutedFormat = customRoutedFormat
+        facts.ssdResidentTableBytes = Self.ngramTableBytes(bundleURL: url)
         return facts
+    }
+
+    /// Inspect every shard through the shared catalog/runtime span contract. Any unreadable or
+    /// inconsistent header makes the bundle's SSD discount unknown, retaining all bytes as weights.
+    static func ngramTableBytes(bundleURL url: URL) -> UInt64 {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+        else { return 0 }
+        var total: UInt64 = 0
+        for entry in entries where entry.pathExtension == "safetensors" {
+            guard let handle = try? FileHandle(forReadingFrom: entry) else { return 0 }
+            defer { try? handle.close() }
+            guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else { return 0 }
+            let length = lengthData.enumerated().reduce(UInt64(0)) {
+                $0 | UInt64($1.element) << UInt64(8 * $1.offset)
+            }
+            guard length > 0, length <= 64 << 20,
+                let headerData = try? handle.read(upToCount: Int(length)), headerData.count == Int(length),
+                let fileSize = try? handle.seekToEnd(), fileSize >= 8 + length,
+                let bytes = SSDTableMetadata.validatedNGramBytes(
+                    inHeader: headerData, payloadLength: fileSize - 8 - length)
+            else { return 0 }
+            let sum = total.addingReportingOverflow(bytes)
+            guard !sum.overflow else { return 0 }
+            total = sum.partialValue
+        }
+        return total
     }
 
     private static let deepseekV4AffineLayerCount = 43
@@ -613,6 +601,21 @@ public struct LoadBundleFacts: Sendable, Equatable {
             && (numRoutedExperts ?? 0) >= 128
     }
 
+    /// DeepSeek-V4.1 affine JANG (prestacked routed experts, disk-resident
+    /// engram). Resident like plain DSV4 (the model requests it), so the MLX
+    /// memory/allocator caps must not throttle decode either.
+    public var isDeepseekV41AffineJANG: Bool {
+        let type = modelType?.lowercased() ?? ""
+        let format = weightFormat?.lowercased() ?? ""
+        let declaresAffine = format.isEmpty || format == "affine" || format == "jang"
+        return (type == "deepseek_v41" || type == "deepseek_v41_text")
+            && hasJangConfig
+            && !hasJangTQRuntime
+            && declaresAffine
+            && isRouted
+            && (numRoutedExperts ?? 0) >= 128
+    }
+
     /// Qwen3.8 Flash Next JANG keeps its large PLE/ngram table in a
     /// model-owned exact-row SSD reader. Match the bundle's explicit family,
     /// JANG format, and BF16 compute declaration; model names and directory
@@ -643,6 +646,10 @@ public struct LoadBundleFacts: Sendable, Equatable {
         let format = weightFormat?.lowercased() ?? ""
         let declaresAffine = format.isEmpty || format == "affine" || format == "jang"
         return (type == "glm5_next" || type == "glm5_next_text")
+            && customRoutedFormat == .none
+            // A format label alone cannot validate custom banks, but it must
+            // never opt a declared custom bundle into an affine resident policy.
+            && jangFormat?.lowercased() != "jangtq2"
             && !hasJangTQRuntime
             && declaresAffine
             && isRouted
@@ -660,7 +667,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
     }
 
     public func resolveMmapSafetensors(requested: Bool) -> Bool {
-        requested && !requiresResidentSafetensors
+        false // File-backed model-weight ownership is retired.
     }
 
     /// A resident affine DSV4 load cannot use `MLX.Memory.memoryLimit` as a
@@ -680,7 +687,18 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// One property for both caps deliberately: they are the same decision about the same bundle,
     /// and a family added to one list and not the other is exactly how this reached production.
     public var requiresUncappedResidentPools: Bool {
-        isPlainDeepseekV4AffineJANG || isGlm5NextAffineJANG
+        isPlainDeepseekV4AffineJANG || isGlm5NextAffineJANG || isDeepseekV41AffineJANG || isMiniMaxM3Routed
+    }
+
+    /// MiniMax-M3 / M3.1 (any routed format: JANGHT banks, affine, the MXFP8 source). Same mechanism as the families
+    /// above, reached through context instead of weight size: Safe Auto's scheduling allowance is the resident
+    /// weights + 4 GiB, and the sparse-attention KV grows 138,240 B per token, so from ~26k tokens of context (M3.1
+    /// JANGHT1.9 + its drafter on a 128 GB Mac: 100.9 GB weights, 104.5 GB limit) every MLX eval waits for the queue
+    /// to drain. Measured in the Osaurus GUI proof (m5-max, 2026-10-29): a 35k-token turn prefilled at 284 pp/s and
+    /// decoded at 5.9 tok/s (AR 150 ms / token) against 36 tok/s at 33k on the same runtime without the limit.
+    public var isMiniMaxM3Routed: Bool {
+        let type = modelType?.lowercased() ?? ""
+        return (type == "minimax_m3" || type == "minimax_m3_vl") && isRouted
     }
 
     public func resolveMLXMemoryLimit(requested: ResidentCap) -> ResidentCap {
@@ -695,159 +713,6 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// above, so RAM admission remains the owning safety gate for both caps.
     public func resolveMLXAllocatorCacheLimit(requested: ResidentCap) -> ResidentCap {
         requiresUncappedResidentPools ? .unlimited : requested
-    }
-}
-
-extension JangPressPolicy {
-    /// Resolve to a concrete `MLXPressLoadOptions` for the given
-    /// bundle. Precedence: explicit value > env (`MLXPRESS=...`, then
-    /// legacy `JANGPRESS=...`) >
-    /// `.auto` threshold (routed AND bundleBytes > 0.5 × physicalMemory).
-    ///
-    /// The default cold fraction for `.auto` is `0.70` (matches the
-    /// production tuning verified in iter 25 across 4 model families).
-    public func resolve(facts: LoadBundleFacts) -> JangPressLoadOptions {
-        switch self {
-        case .disabled:
-            return .disabled
-
-        case .enabled(let coldFraction):
-            let pct = Int((max(0.0, min(0.95, coldFraction)) * 100.0).rounded())
-            return JangPressLoadOptions(enabled: true, compressPct: pct)
-
-        case .auto(let envFallback):
-            if envFallback,
-                let raw = ProcessInfo.processInfo.environment["MLXPRESS"]
-                    ?? ProcessInfo.processInfo.environment["JANGPRESS"]
-            {
-                let lowered = raw.lowercased()
-                if lowered == "0" || lowered == "off" || lowered == "false" {
-                    return .disabled
-                }
-                if let n = Int(raw), (0...95).contains(n) {
-                    return JangPressLoadOptions(enabled: true, compressPct: n)
-                }
-                // Garbage env value — fall through to threshold.
-            }
-
-            // Threshold rule: enable iff routed AND bundle bytes
-            // exceed half of physical RAM. Conservative on dense
-            // models (no benefit) and tiny MoE (no pressure).
-            //
-            // Qwen3.8 Flash Next JANG is excluded from the threshold: its
-            // directory bytes include a 20-29 GiB PLE/ngram table that the
-            // model-owned exact-row SSD reader serves and that never becomes
-            // resident, so the whole-bundle size wildly overstates the
-            // resident need (96 GiB dir -> ~73 GiB resident on the 4-bit
-            // tier). The family's runtime contract requires every non-PLE
-            // compute weight resident — cold-compressing it only adds fault-in
-            // latency to a model that already fits.
-            if facts.isQwen4ExpBF16JANG {
-                return .disabled
-            }
-            let halfRAM = facts.physicalMemory / 2
-            if facts.isRouted && facts.totalSafetensorsBytes > halfRAM {
-                return JangPressLoadOptions(enabled: true, compressPct: 70)
-            }
-            return .disabled
-        }
-    }
-}
-
-// MARK: - Inspection
-
-/// Runtime status of the MLXPress runtime — used by osaurus / JANG
-/// Studio settings panels. **Drastically simplified in iter 26**: the
-/// controller state machine and routing counters were removed because
-/// nothing in production drove them. What remains is the mmap probe's
-/// tile-classification snapshot (used for UI bookkeeping like "how
-/// many routed-expert tiles did we identify in this bundle?").
-///
-/// For real memory metrics (heap budget, RSS, recommended working set)
-/// use ``MemoryStatus/snapshot()`` — that's the surface that reflects
-/// the actual cap that ships today via `LoadConfiguration.memoryLimit`.
-public struct JangPressStatus: Sendable, Equatable {
-    /// True iff at least one tier (mmap probe or embed cache) is
-    /// attached. Purely informational — nothing about cold-tier
-    /// reclaim or controller state is implied by this flag today.
-    public let enabled: Bool
-
-    /// Cold-fraction setting captured at activation time, expressed as
-    /// `0.0 ... 0.95`. Today this controls how aggressively the embed
-    /// tier shrinks its hot row count; the routed-expert tier no
-    /// longer drives any madvise calls. `nil` when disabled.
-    public let coldFraction: Double?
-
-    /// Routed-expert backend chosen at activation time. With `.mach`
-    /// removed in iter 26 the only meaningful values are `.mmap`
-    /// (probe attached) or `.none`.
-    public let backend: JangPressLoadOptions.Backend
-
-    /// Number of routed-expert tiles classified by the mmap probe.
-    /// `0` when no mmap probe is attached or when the lazy probe has
-    /// not yet been built (`snapshotIfBuilt()` returns zeros until
-    /// something forces it).
-    public let tilesUnderManagement: Int
-
-    /// Total bytes of routed-expert weights identified by the mmap
-    /// probe. `0` when the probe is not built / not attached.
-    public let totalRoutedBytes: UInt64
-
-    /// Empty-status sentinel — represents `JangPressRuntime.none`.
-    public static let disabled = JangPressStatus(
-        enabled: false,
-        coldFraction: nil,
-        backend: .none,
-        tilesUnderManagement: 0,
-        totalRoutedBytes: 0)
-
-    public init(
-        enabled: Bool,
-        coldFraction: Double?,
-        backend: JangPressLoadOptions.Backend,
-        tilesUnderManagement: Int,
-        totalRoutedBytes: UInt64
-    ) {
-        self.enabled = enabled
-        self.coldFraction = coldFraction
-        self.backend = backend
-        self.tilesUnderManagement = tilesUnderManagement
-        self.totalRoutedBytes = totalRoutedBytes
-    }
-}
-
-extension JangPressRuntime {
-    /// Snapshot the current state of the JangPress probes. Returns
-    /// ``JangPressStatus/disabled`` for ``JangPressRuntime/none``.
-    public func status() -> JangPressStatus {
-        guard isActive else { return .disabled }
-
-        let backend: JangPressLoadOptions.Backend
-        var totalRoutedBytes: UInt64 = 0
-        var tiles: Int = 0
-        if let mmap {
-            backend = .mmap
-            let s = mmap.snapshotIfBuilt()
-            totalRoutedBytes = s.totalRoutedBytes
-            tiles = s.expertCount
-        } else {
-            backend = .none
-        }
-
-        // Cold fraction is recovered from the appliedOptions stash
-        // (set by `JangPressActivation.activate`). compressPct is the
-        // % of routed mass open to compression; coldFraction is the
-        // same value as a 0..1 double for consumer ergonomics.
-        let coldFraction: Double? = appliedOptions.map {
-            Double($0.compressPct) / 100.0
-        }
-
-        return JangPressStatus(
-            enabled: true,
-            coldFraction: coldFraction,
-            backend: backend,
-            tilesUnderManagement: tiles,
-            totalRoutedBytes: totalRoutedBytes)
     }
 }
 
@@ -908,7 +773,7 @@ public struct MemoryStatus: Sendable, Equatable {
             memoryLimit: MLX.Memory.memoryLimit,
             cacheLimit: MLX.Memory.cacheLimit,
             recommendedWorkingSetBytes: MLX.GPU.maxRecommendedWorkingSetBytes(),
-            physicalMemory: ProcessInfo.processInfo.physicalMemory,
+            physicalMemory: HostPhysicalMemory.bytes,
             currentRSS: residentSetSizeBytes())
     }
 }

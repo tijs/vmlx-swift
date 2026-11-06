@@ -7,6 +7,52 @@ import Testing
 @Suite struct DiskCacheCapPolicyTests {
     private let gb: Int64 = 1_073_741_824
 
+    /// The reported 8 TB Mac: 18 GB strict free, 1.44 TB with purgeable space.
+    @Test func purgeableInclusiveFreeSpaceDecidesTheAdvisoryAndAutomatic() {
+        let total: Int64 = 8_000_000_000_000
+        let strict = DiskCacheCapPolicy.resolve(
+            percent: 10, legacyGB: nil, totalBytes: total, freeBytes: 18_000_000_000, ownBytes: 0)
+        #expect(strict.exceedsAvailableSpace)
+        let purgeable = DiskCacheCapPolicy.resolve(
+            percent: 10, legacyGB: nil, totalBytes: total, freeBytes: 1_440_000_000_000, ownBytes: 0
+        )
+        #expect(!purgeable.exceedsAvailableSpace)
+        let automatic = DiskCacheCapPolicy.resolve(
+            percent: nil, legacyGB: nil, totalBytes: total, freeBytes: 1_440_000_000_000,
+            ownBytes: 0)
+        #expect(automatic.capBytes == 432_000_000_000)
+    }
+
+    @Test func snapshotTakesTheLargerOfStrictAndPurgeableInclusiveFree() {
+        typealias S = DiskCacheVolumeSnapshot
+        #expect(
+            S.resolvedFreeBytes(strict: 18_000_000_000, purgeableInclusive: 1_440_000_000_000)
+                == 1_440_000_000_000)
+        #expect(S.resolvedFreeBytes(strict: 500, purgeableInclusive: 100) == 500)
+        #expect(
+            S.resolvedFreeBytes(strict: 18_000_000_000, purgeableInclusive: nil) == 18_000_000_000)
+        #expect(S.resolvedFreeBytes(strict: 0, purgeableInclusive: 6 * gb) == 6 * gb)
+        #expect(S.resolvedFreeBytes(strict: nil, purgeableInclusive: 0) == nil)
+    }
+
+    @Test func snapshotReadsTheHostsPurgeableInclusiveProvider() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let answered = root.standardizedFileURL.path
+        // Larger than any real volume, and only for this directory, so other
+        // suites reading snapshots concurrently are unaffected.
+        let huge: Int64 = 9_000_000_000_000_000
+        DiskCacheVolumeSnapshot.setPurgeableInclusiveFreeBytesProvider {
+            $0 == answered ? huge : nil
+        }
+        defer { DiskCacheVolumeSnapshot.setPurgeableInclusiveFreeBytesProvider(nil) }
+        #expect(DiskCacheVolumeSnapshot.read(directory: root).freeBytes == huge)
+        #expect(
+            DiskCacheVolumeSnapshot.read(directory: root.appendingPathComponent("not-yet-created"))
+                .freeBytes == huge)
+    }
+
     @Test func unreadableIndexPreservesAnotherModelsLiveRootCap() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -21,7 +67,7 @@ import Testing
         #expect(second.bytes == 42 * Int(gb))
     }
 
-    @Test(arguments: [Double?.none, 10.0, 0.005])
+    @Test(arguments: [Double?.none, 10.0, 60.0, 100.0, 0.005])
     func cacheGrowthDoesNotRatchetTheCap(percent: Double?) {
         let empty = DiskCacheCapPolicy.resolve(
             percent: percent, legacyGB: nil, totalBytes: 256 * gb,
@@ -51,13 +97,36 @@ import Testing
         #expect(!result.limitedByHost)
     }
 
-    @Test func explicitCeilingNamesTheRequestedAndEffectiveCap() {
+    @Test func explicitLimitIsHonoredEvenWhenDiskSpaceIsLower() {
         let result = DiskCacheCapPolicy.resolve(
             percent: 10, legacyGB: nil, totalBytes: 1000 * gb,
             freeBytes: 60 * gb, ownBytes: 20 * gb)
         #expect(result.requestedBytes == 100 * gb)
-        #expect(result.capBytes == 20 * gb)
-        #expect(result.limitedByHost)
+        #expect(result.capBytes == 100 * gb)
+        #expect(!result.limitedByHost)
+        #expect(result.exceedsAvailableSpace)
+    }
+
+    @Test(arguments: [30.0, 60, 80, 100])
+    func dedicatedVolumeHonorsLargeShares(percent: Double) {
+        let result = DiskCacheCapPolicy.resolve(
+            percent: percent, legacyGB: nil, totalBytes: 1000 * gb,
+            freeBytes: 700 * gb, ownBytes: 100 * gb)
+        #expect(result.capBytes == Int64(Double(1000 * gb) * percent / 100))
+        #expect(!result.limitedByHost)
+        #expect(result.exceedsAvailableSpace == (percent > 80))
+    }
+
+    @Test func legacySizeIsAlsoExplicitAndUnknownFreeSpaceDoesNotClampIt() {
+        for free: Int64? in [0, 10 * gb, nil] {
+            let result = DiskCacheCapPolicy.resolve(
+                percent: nil, legacyGB: 500, totalBytes: 1000 * gb,
+                freeBytes: free, ownBytes: 0)
+            #expect(result.capBytes == 500 * gb)
+            #expect(result.rule == .legacyGB)
+            #expect(!result.limitedByHost)
+            #expect(result.exceedsAvailableSpace == (free != nil))
+        }
     }
 
     @Test(arguments: [0, 1, 2 * 1_073_741_824] as [Int64])

@@ -32,6 +32,32 @@ public final class MLXArray {
         .init(mlx_array_new())
     }
 
+    /// `false` when this value wraps no `mlx::core::array`.
+    ///
+    /// Every `mlx-c` operation hands back an empty `mlx_array` (`ctx == nil`)
+    /// when the C++ layer throws. With the default error handler that throw is
+    /// fatal and such a value never exists; once a recovering handler is
+    /// installed (``withError(_:)-6g4wn``, ``withErrorHandler(_:_:)-9ht1c`` or a
+    /// process-wide ``setErrorHandler(_:data:dtor:)``) the empty array flows
+    /// onward. Reading `ndim`/`shape`/`dim` of it yields 0 / `[]`, so any
+    /// Swift-side shape logic must treat it as "a failed operation", not as a
+    /// scalar. The indexing subscripts and `split` propagate it instead of
+    /// trapping; see `reportInvalidArrayUse`.
+    public var isValid: Bool { ctx.ctx != nil }
+
+    /// Replace the backing context with the empty (invalid) array.
+    ///
+    /// Used by the subscript setters when either side of an in-place update is
+    /// already invalid: the destination becomes invalid too, so the failure
+    /// keeps propagating to the caller's error check instead of leaving stale
+    /// contents (for example an un-updated KV cache) behind.
+    func _invalidateInternal() {
+        evalLock.withLock {
+            mlx_array_free(ctx)
+            ctx = mlx_array_new()
+        }
+    }
+
     deinit {
         mlx_array_free(ctx)
     }
@@ -174,7 +200,12 @@ public final class MLXArray {
     /// specialized conversion between integer types -- see ``item(_:)``
     private func itemInt() -> Int {
         precondition(self.size == 1)
-        eval()
+        // A failed eval leaves no `array::Data`; the mlx-c item accessors would
+        // re-run the failing eval and the complex path dereferences null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("item")
+            return 0
+        }
 
         switch self.dtype {
         case .bool:
@@ -222,7 +253,12 @@ public final class MLXArray {
     /// specialized conversion between integer types -- see ``item(_:)``
     private func itemUInt() -> UInt {
         precondition(self.size == 1)
-        eval()
+        // A failed eval leaves no `array::Data`; the mlx-c item accessors would
+        // re-run the failing eval and the complex path dereferences null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("item")
+            return 0
+        }
 
         switch self.dtype {
         case .bool:
@@ -269,7 +305,12 @@ public final class MLXArray {
     /// specialized conversion between float types -- see ``item(_:)``
     private func itemFloat() -> Float {
         precondition(self.size == 1)
-        eval()
+        // A failed eval leaves no `array::Data`; the mlx-c item accessors would
+        // re-run the failing eval and the complex path dereferences null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("item")
+            return 0
+        }
 
         switch self.dtype {
         #if !arch(x86_64)
@@ -294,7 +335,12 @@ public final class MLXArray {
 
     private func itemDouble() -> Double {
         precondition(self.size == 1)
-        eval()
+        // A failed eval leaves no `array::Data`; the mlx-c item accessors would
+        // re-run the failing eval and the complex path dereferences null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("item")
+            return 0
+        }
 
         switch self.dtype {
         #if !arch(x86_64)
@@ -329,8 +375,23 @@ public final class MLXArray {
     /// let value = array[1].item(Float.self)
     /// ```
     public func item<T: HasDType>(_ type: T.Type) -> T {
+        // Hold `evalLock` from the first read of `self` to the last, as
+        // `asArray` does; the `item*` helpers below run under it. Resolve the
+        // stream for the conversion before taking it, as `asArray` does.
+        let stream = StreamOrDevice.default
+        evalLock.lock()
+        defer { evalLock.unlock() }
+        guard isValid else {
+            reportInvalidArrayUse("MLXArray.item")
+            return Self.zeroFilled(count: 1)[0]
+        }
         precondition(self.size == 1)
-        eval()
+        // A failed eval leaves no `array::Data`; the mlx-c item accessors would
+        // re-run the failing eval and the complex path dereferences null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("item")
+            return Self.zeroFilled(count: 1)[0]
+        }
 
         // special cases for reading integers and floats from (roughly)
         // same typed arrays -- this avoids doing a conversion which
@@ -386,7 +447,7 @@ public final class MLXArray {
 
         // default handling -- convert the type if needed
         if type.dtype != self.dtype {
-            return self.asType(type).item(type)
+            return self.asType(type, stream: stream).item(type)
         }
 
         switch type {
@@ -635,7 +696,11 @@ extension MLXArray: Updatable, Evaluatable {
 extension MLXArray: CustomStringConvertible {
     public var description: String {
         var s = mlx_string_new()
-        mlx_array_tostring(&s, ctx)
+        // Formatting realizes and reads the array: a host read like
+        // `asArray`, so it holds `evalLock` too.
+        evalLock.withLock {
+            _ = mlx_array_tostring(&s, ctx)
+        }
         defer { mlx_string_free(s) }
         return String(cString: mlx_string_data(s), encoding: .utf8)!
     }

@@ -85,6 +85,57 @@ public protocol DiskCacheStateProviding: KVCache {
     func restoreDiskCacheState(_ state: [MLXArray], metadata: [String], offset: Int) -> Bool
 }
 
+/// A cache whose rows below `offset` never change once written: it only appends and trims (no rotation, compaction or
+/// in-place requantization), and growth copies the old rows into a larger buffer unchanged. A view of its first `rows`
+/// rows therefore stays exact while the cache is not updated in place, so the end-of-turn prompt-boundary stores can
+/// write views of the finished cache instead of copies (`TokenIterator.storeCacheAfterGeneration`).
+public protocol AppendOnlyRowsCache: KVCache {
+    /// A cache holding views (not copies) of this cache's first `rows` rows; it shares this cache's buffers. Take it only
+    /// when this cache will not be updated in place again (after generation) or is itself such a view.
+    func prefixView(rows: Int) -> any KVCache
+    /// True for a cache made by ``prefixView(rows:)``: its state is views, nothing was materialized for it.
+    var isPrefixView: Bool { get }
+    /// Whether this instance really is append-only (a conforming base class can have subclasses that are not).
+    var supportsPrefixViews: Bool { get }
+}
+
+extension AppendOnlyRowsCache {
+    public var supportsPrefixViews: Bool { true }
+}
+
+/// Plain K/V caches append and trim only; subclasses that rotate, chunk or quantize are excluded by exact type, as in
+/// ``AppendOnlyPromptCheckpoint``.
+extension KVCacheSimple: AppendOnlyRowsCache {
+    public var supportsPrefixViews: Bool { AppendOnlyPromptCheckpoint.isAppendOnly(self) }
+
+    public func prefixView(rows: Int) -> any KVCache {
+        guard let view = appendOnlyPrefix(self, count: rows, owned: false) as? KVCacheSimple else {
+            preconditionFailure("KVCacheSimple prefix view of \(rows) rows, cache has \(offset)")
+        }
+        view.isPrefixView = true
+        return view
+    }
+}
+
+/// Every layer appends only (``AppendOnlyRowsCache``) and holds at least `rows` rows.
+public func cacheSupportsPrefixViews(_ cache: [KVCache], rows: Int) -> Bool {
+    !cache.isEmpty && cache.allSatisfy {
+        ($0 as? AppendOnlyRowsCache).map { $0.supportsPrefixViews && $0.offset >= rows } ?? false
+    }
+}
+
+/// Views of the first `rows` rows of every layer (``AppendOnlyRowsCache/prefixView(rows:)``), or nil when a layer does
+/// not support them.
+public func prefixViews(of cache: [KVCache], rows: Int) -> [KVCache]? {
+    guard rows > 0, cacheSupportsPrefixViews(cache, rows: rows) else { return nil }
+    return cache.map { ($0 as! AppendOnlyRowsCache).prefixView(rows: rows) }
+}
+
+/// Every layer is a ``AppendOnlyRowsCache/prefixView(rows:)`` view (storing it materializes nothing).
+public func cacheIsPrefixViews(_ cache: [KVCache]) -> Bool {
+    !cache.isEmpty && cache.allSatisfy { ($0 as? AppendOnlyRowsCache)?.isPrefixView == true }
+}
+
 /// Materialize an OWNED copy of a cache state array for `copy()`.
 ///
 /// The previous idiom, `x[.ellipsis]`, is a slice — and `Slice::eval` shares
@@ -164,6 +215,53 @@ public protocol HybridPoolCache: RotatingKVCacheWrapper {
     /// Per-branch incomplete-window buffer state.
     func hybridBuffers(branch: HybridPoolBranch) -> (kv: MLXArray?, gate: MLXArray?)
     func setHybridBuffers(branch: HybridPoolBranch, kv: MLXArray?, gate: MLXArray?)
+
+    /// Model-owned per-sequence token history that must travel with the
+    /// cache (DeepSeek-V4.1 Engram n-gram tail). `nil` for every other
+    /// family. Copies, trims and disk round-trips carry it so a restored
+    /// prefix hashes its suffix exactly like an uninterrupted run.
+    var auxiliaryTokenHistory: HybridPoolTokenHistory? { get set }
+
+    /// True when a restored layer is only valid together with
+    /// ``auxiliaryTokenHistory`` covering its offset. A disk record that
+    /// lacks it is refused (re-prefill) instead of guessing the history.
+    var requiresAuxiliaryTokenHistory: Bool { get }
+
+    /// Model-owned trailing hidden rows that travel with the cache (the
+    /// DeepSeek-V4.1 dSpark draft-window tail: the target-layer hidden of the
+    /// last committed positions). Optional and speed-only: a cache without it
+    /// is still exact, the drafter just starts with a shorter window. `nil`
+    /// for every other family.
+    var auxiliaryHiddenTail: HybridPoolHiddenTail? { get set }
+}
+
+/// Trailing token history for ``HybridPoolCache/auxiliaryTokenHistory``:
+/// `tokens[k]` belongs to absolute position `endPosition - tokens.count + k`.
+public struct HybridPoolTokenHistory: Sendable, Equatable {
+    public var endPosition: Int
+    public var tokens: [Int32]
+
+    public init(endPosition: Int, tokens: [Int32]) {
+        self.endPosition = endPosition
+        self.tokens = tokens
+    }
+
+    /// First absolute position covered.
+    public var startPosition: Int { endPosition - tokens.count }
+}
+
+public extension HybridPoolCache {
+    var auxiliaryTokenHistory: HybridPoolTokenHistory? {
+        get { nil }
+        set {}
+    }
+
+    var requiresAuxiliaryTokenHistory: Bool { false }
+
+    var auxiliaryHiddenTail: HybridPoolHiddenTail? {
+        get { nil }
+        set {}
+    }
 }
 
 /// One independently encoded row segment from a DSV4 compressor/indexer pool.
@@ -225,6 +323,29 @@ public protocol QuantizedHybridPoolCache: HybridPoolCache {
         segments: [HybridPoolQuantizedSegment]
     )
     func hybridPoolRetainedByteCount(branch: HybridPoolBranch) -> Int
+    /// Code width this cache encodes pool rows with (8 for DSV4-0731, 4 for
+    /// DeepSeek-V4.1). A restored record must carry the same width.
+    var hybridPoolQuantizationBits: Int { get }
+}
+
+public extension QuantizedHybridPoolCache {
+    var hybridPoolQuantizationBits: Int { 8 }
+}
+
+/// Code widths the DSV4 quantized-pool disk schema accepts. 4-bit codes are
+/// packed two per byte along the group axis.
+public enum HybridPoolQuantizedSchema {
+    public static let supportedBits: Set<Int> = [4, 8]
+
+    /// Largest row count of one on-disk pool segment. The reader refuses
+    /// anything longer, so the writer splits longer segments (the V4.1
+    /// contiguous slab is a single segment of every live row) at this size.
+    public static let maxSegmentRows = 16 * 1024
+
+    /// Packed code columns per affine group for `bits`.
+    public static func packedGroupWidth(groupSize: Int, bits: Int) -> Int {
+        bits == 4 ? groupSize / 2 : groupSize
+    }
 }
 
 /// Cache implementations whose retained representation is smaller than their
@@ -462,6 +583,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
+    /// Set on a cache made by ``prefixView(rows:)`` (``AppendOnlyRowsCache``).
+    public internal(set) var isPrefixView = false
+    /// A capacity hint (``reserveRows(until:)``): the next growth allocates room up to this row count at once instead
+    /// of the rows of the update that needs it; consumed by that growth. Capacity only: rows and readers are unchanged.
+    public private(set) var reservedRowsUntil: Int?
 
     public override init() {
         super.init()
@@ -469,6 +595,18 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     public override func innerState() -> [MLXArray] {
         [self.keys, self.values].compactMap { $0 }
+    }
+
+    /// Make the next capacity growth room for `until` rows in total (a prefill of known length: the lanes grow once,
+    /// not at every chunk). nil clears the hint. Nothing is allocated here.
+    public func reserveRows(until: Int?) {
+        reservedRowsUntil = until.flatMap { $0 > offset ? $0 : nil }
+    }
+
+    /// Bytes one more row costs on the K and V buffers (0 before the first update).
+    public var rowBytes: Int {
+        guard let keys, let values, keys.dim(2) > 0, values.dim(2) > 0 else { return 0 }
+        return keys.nbytes / keys.dim(2) + values.nbytes / values.dim(2)
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -486,7 +624,12 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let kHeadDim = keys.dim(3)
             let vHeadDim = values.dim(3)
 
-            let nSteps = (step + keys.dim(2) - 1) / step
+            var needed = keys.dim(2)
+            if let until = reservedRowsUntil {
+                needed = Swift.max(needed, until - previous)
+                reservedRowsUntil = nil
+            }
+            let nSteps = (step + needed - 1) / step
             let kShape = [B, kvHeads, nSteps * step, kHeadDim]
             let vShape = [B, kvHeads, nSteps * step, vHeadDim]
             let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
@@ -531,6 +674,27 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             )
         }
         return (keys, values)
+    }
+
+    /// DFlash 2 tree commit: the last `window` rows hold a draft tree; keep only `keptRows`
+    /// (window-relative, root first), written contiguously at the window start, and drop the
+    /// rest. A pure prefix (a chain accept) is just a trim. Returns false if the cache does not
+    /// end with that window.
+    public func compactTreeWindow(window: Int, keptRows: [Int]) -> Bool {
+        guard let keys = self.keys, let values = self.values, offset >= window,
+            keptRows.count <= window
+        else { return false }
+        let start = offset - window
+        let keep = keptRows.count
+        if keptRows != Array(0 ..< keep) {
+            let index = MLXArray(keptRows.map { Int32(start + $0) })
+            let movedKeys = take(keys[.ellipsis, ..<offset, 0...], index, axis: 2)
+            let movedValues = take(values[.ellipsis, ..<offset, 0...], index, axis: 2)
+            self.keys?[.ellipsis, start ..< (start + keep), 0...] = movedKeys
+            self.values?[.ellipsis, start ..< (start + keep), 0...] = movedValues
+        }
+        offset = start + keep
+        return true
     }
 
     public override var state: [MLXArray] {
@@ -612,6 +776,19 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 /// sync with `offset` across trim/rollback or block selection reads keys
 /// from the wrong positions.
 public class QSAKVCache: KVCacheSimple {
+    /// M-RoPE continuation offset belongs to the conversation cache, not the model.
+    /// Required caches reject old disk records that did not persist this value.
+    /// Keeping this scalar on the host avoids a GPU readback on each decode step.
+    public private(set) var requiresMediaPositionOffset = false
+    public var mediaPositionOffset: Int?
+
+    public init(requiringMediaPositionOffset: Bool) {
+        self.requiresMediaPositionOffset = requiringMediaPositionOffset
+        self.mediaPositionOffset = requiringMediaPositionOffset ? 0 : nil
+        useIndexerCapacity = RuntimeEnvironment.value("VMLX_QSA_RAW_CAPACITY") != "0"
+        super.init()
+    }
+
     private var indexerKeyStorage: MLXArray?
     private var indexerKeyCount = 0
     private let useIndexerCapacity: Bool
@@ -773,6 +950,8 @@ public class QSAKVCache: KVCacheSimple {
 
     public override func copy() -> any KVCache {
         let new = QSAKVCache(useIndexerCapacity: useIndexerCapacity)
+        new.requiresMediaPositionOffset = requiresMediaPositionOffset
+        new.mediaPositionOffset = mediaPositionOffset
         new.step = self.step
         new.offset = self.offset
         let s = self.state
@@ -974,6 +1153,49 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         let effective = grown ? min(capacity + step, maxCacheSize) : capacity
         let start = (idx >= effective) ? keep : idx
         return start + S <= effective
+    }
+
+    /// Release the rows a multi-token update kept beyond the window.
+    ///
+    /// After an `S`-token concat update the buffers hold `maxSize - 1 + S` rows
+    /// (every query of that update needed its full window). No later update reads
+    /// more than the newest `maxSize`: the next concat keeps `maxSize - 1` and the
+    /// next in-place write trims to `maxSize` first. Keeping exactly those rows (a
+    /// gather, so the large buffer is really freed) leaves every later update and
+    /// `state` identical while the retained window stops scaling with the prefill
+    /// chunk. Opt-in (DeepSeek-V4.1); a no-op unless the buffers are in temporal
+    /// order and longer than the window.
+    public func compactToWindow() {
+        guard keep == 0, let keys, let values else { return }
+        let rows = keys.dim(2)
+        guard rows > maxCacheSize, idx == rows, values.dim(2) == rows else { return }
+        let tail = MLXArray(Int32(rows - maxCacheSize) ..< Int32(rows))
+        self.keys = take(keys, tail, axis: 2)
+        self.values = take(values, tail, axis: 2)
+        idx = maxCacheSize
+    }
+
+    /// Drop every cached row and continue at absolute position `position` with an empty
+    /// window. The next update starts the window there (RoPE and mask positions follow
+    /// `offset`). DeepSeek-V4.1 prompt-suffix pruning: a late layer whose earlier prompt rows
+    /// nothing reads computes only a trailing range of a prefill chunk.
+    public func restartWindow(at position: Int) {
+        precondition(position >= offset, "restartWindow cannot move a window backwards")
+        keys = nil
+        values = nil
+        idx = 0
+        offset = position
+    }
+
+    /// Update a cache whose complete history uses the same latent for K and V.
+    /// The caller consumes K only. Retaining the independent, unevaluated V
+    /// updates would keep every old row's forward graph and completion event.
+    /// Keep V aligned with the updated K using a fresh handle, so later writes
+    /// cannot mutate both Swift objects through one shared MLXArray instance.
+    public func updateSharedKV(_ kv: MLXArray) -> MLXArray {
+        let result = update(keys: kv, values: kv).0
+        values = keys.map { $0.reshaped($0.shape) }
+        return result
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -1958,7 +2180,14 @@ public class MambaCache: ArraysCache {
     /// Required whenever the verify block length changes.
     public func clearVerifyStaging() {
         verifyStagingSlots = Array(repeating: nil, count: verifyStagingSlots.count)
+        verifyStagedRowStates = nil
     }
+
+    /// Row-exact staged verify only: the recurrent state after each verify row, so a partial
+    /// accept commits the state the AR step would have produced instead of re-scanning the
+    /// accepted rows with the multi-row kernel. Nil whenever the last staged verify was not
+    /// row-exact; layer-private like the staging slots.
+    public var verifyStagedRowStates: [MLXArray]? = nil
 
     public override func innerState() -> [MLXArray] {
         super.innerState() + verifyStagingSlots.compactMap { $0 }
@@ -2511,7 +2740,7 @@ public func maybeQuantizeKVCache(
             4 + TurboQuantKVCache.defaultResidualTokens
                 + TurboQuantKVCache.minimumCompressedTokens)
         let hasEligibleLayer = cache.contains { layer in
-            if let simple = layer as? KVCacheSimple {
+            if let simple = layer as? KVCacheSimple, !(layer is NonQuantizableKVCache) {
                 return simple.offset > tqMinStart
                     && TurboQuantKVCache.hasCompressibleMiddle(tokenCount: simple.offset)
             }
@@ -2525,12 +2754,13 @@ public func maybeQuantizeKVCache(
         guard hasEligibleLayer else { return }
 
         for i in 0..<cache.count {
+            if cache[i] is NonQuantizableKVCache { continue }
             if cache[i] is QSAKVCache {
                 // TurboQuant promotion would replace the QSAKVCache with a
                 // cache that has no indexer lane (and `fromSimpleCache`
                 // refuses 3-array state, yielding an EMPTY cache) — the
                 // qwen4_exp sparse selector then diverges (osaurus#2525).
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[kv quant] skipping QSA layer \(i): TurboQuant promotion would drop the indexer lane.\n".utf8))
                 continue
             }
@@ -2562,12 +2792,13 @@ public func maybeQuantizeKVCache(
         // no-op for the entire model family. MambaCache / CacheList /
         // TurboQuant layers are skipped by design (their state is not
         // ordinary KV).
-        let firstKV = cache.first { $0 is KVCacheSimple || $0 is RotatingKVCache }
+        let firstKV = cache.first { ($0 is KVCacheSimple || $0 is RotatingKVCache) && !($0 is NonQuantizableKVCache) }
         guard !cache.contains(where: { $0 is QuantizedKVCache || $0 is QuantizedRotatingKVCache }),
             let ref = firstKV, ref.offset > quantizedKVStart
         else { return }
 
         for i in 0..<cache.count {
+            if cache[i] is NonQuantizableKVCache { continue }
             if cache[i] is QSAKVCache { continue }  // osaurus#2525: keep the indexer lane
             if let simpleCache = cache[i] as? KVCacheSimple {
                 cache[i] = simpleCache.toQuantized(groupSize: groupSize, bits: bits)
@@ -2583,7 +2814,7 @@ public func maybeQuantizeKVCache(
     }
 
     // Legacy path: use kvBits if set
-    let firstKV = cache.first { $0 is KVCacheSimple || $0 is RotatingKVCache }
+    let firstKV = cache.first { ($0 is KVCacheSimple || $0 is RotatingKVCache) && !($0 is NonQuantizableKVCache) }
     guard let kvBits = kvBits,
         !cache.contains(where: { $0 is QuantizedKVCache || $0 is QuantizedRotatingKVCache }),
         let ref = firstKV, ref.offset > quantizedKVStart
@@ -2592,6 +2823,7 @@ public func maybeQuantizeKVCache(
     }
 
     for i in 0..<cache.count {
+            if cache[i] is NonQuantizableKVCache { continue }
         if cache[i] is QSAKVCache { continue }  // osaurus#2525: keep the indexer lane
         if let simpleCache = cache[i] as? KVCacheSimple {
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)

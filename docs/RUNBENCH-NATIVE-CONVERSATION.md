@@ -1,0 +1,11 @@
+# Native conversation diagnostics
+
+Set `BENCH_PERF=1` and `BENCH_PERF_CONVERSATION_JSON` to a local JSON array containing two or three user prompts. The conversation replaces repeated single-prompt warmups/runs. One BatchEngine persists across turns. Each new input is prepared through the loaded model processor from all preceding user and assistant messages, including separate reasoning content. The current engine exposes `generate`, not `generateChat`; this path uses processor preparation followed by parsed BatchEngine generation.
+
+Generation parameters come from bundle generation defaults. The mode refuses sampler, reasoning, speculation and compilation overrides; an explicit random seed and token safety budget remain supported. Missing generation defaults fail. Tool calls fail the text-only proof because this harness provides no tool executor. Empty visible output, non-natural stops, missing token/rate information, unclosed reasoning or detected protocol leakage/loops also fail. These are mechanical gates, not a semantic coherence judge.
+
+Each `PERF_CONVERSATION_TURN` JSON record contains the full user prompt, visible text and separate reasoning, actual prompt count, token count, generation time, token/s, TTFT and stop status. Existing prefill progress and cache snapshots are emitted after each turn. The coordinator is enabled for conversation diagnostics; paged RAM remains off unless explicitly requested. Existing explicit disk, hybrid-cache and directory controls remain available. Report actual cache counters: a zero hit count is not proof of reuse. This is an engine diagnostic, not Osaurus GUI proof.
+
+`PERF_POST_LOAD_POLICY` always reports MLX memory limit, active/cached bytes, recommended GPU working set and supplemental mapped-bank bytes. `BENCH_PERF_POST_LOAD_MEMORY_LIMIT_BYTES` is a separate explicit diagnostic override. Invalid, zero, negative, physical-memory-exceeding or recommended-working-set-exceeding values fail. The override prints old/new limits before any timed turn and does not change production defaults. An external physical-footprint/host-pressure guard remains required: allocator limits and mapped logical bytes are not physical footprint.
+
+Status: source prepared; compilation and native multi-turn runtime validation pending.

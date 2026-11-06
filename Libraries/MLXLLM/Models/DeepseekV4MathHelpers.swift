@@ -378,6 +378,32 @@ public enum DeepseekV4Math {
         ).asType(blockOut.dtype)
     }
 
+    /// DeepSeek-V4.1 verify rows: the same post contraction kernel as `hcPost` at one token, over every row of
+    /// (1, R, ...). Each row runs the statements its 1-row decode runs, so it equals that decode's expand; the
+    /// batched path in `hcPost` is a GEMM, which sums (and on M5 rounds) differently.
+    static func hcPostRows(
+        blockOut: MLXArray,
+        residual: MLXArray,
+        post: MLXArray,
+        comb: MLXArray
+    ) -> MLXArray {
+        let hcMult = comb.dim(-1)
+        let hiddenSize = blockOut.dim(-1)
+        let x = contiguous(blockOut)
+        return hcPostDecodeKernel(
+            [x, contiguous(residual), contiguous(post), contiguous(comb)],
+            template: [
+                ("HC", hcMult),
+                ("D", hiddenSize),
+                ("outT", x.dtype),
+            ],
+            grid: (x.size * hcMult, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [Array(x.shape.dropLast()) + [hcMult, hiddenSize]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
     /// Python `_DSV4_COMPILE_REGIONS` parity gate. Decode-only compiled
     /// regions collapse per-token host graph construction; prefill keeps the
     /// raw graph so trace count stays bounded.
@@ -448,6 +474,26 @@ public enum DeepseekV4Math {
         return max(0, v)
     }()
 
+    /// DeepSeek-V4.1 prompt-suffix pruning in chunked prefill (`DeepseekV4Model.prepare`):
+    /// the layers after the last kv-source / Engram / candidate-source layer run only the
+    /// prompt rows the end of the prompt still depends on. `VMLX_DSV41_SUFFIX_PRUNE=0` (or
+    /// false/off/no) runs every row through every layer. Default on.
+    public static let suffixPruneEnabled: Bool =
+        suffixPruneFlag(ProcessInfo.processInfo.environment["VMLX_DSV41_SUFFIX_PRUNE"])
+
+    /// DeepSeek-V4.1 KV-source trim inside prompt-suffix pruning: a pruned prefill forward whose rows the prompt end
+    /// does not read past the last kv-source layer runs only that layer's cache writes (window, compressor, index
+    /// keys) and stops, instead of its whole attention and MoE. Bit-identical caches and logits.
+    /// `VMLX_DSV41_KV_SOURCE_TRIM=0` (or false/off/no) runs that layer in full, as before. Default on.
+    public static let kvSourceTrimEnabled: Bool =
+        suffixPruneFlag(ProcessInfo.processInfo.environment["VMLX_DSV41_KV_SOURCE_TRIM"])
+
+    static func suffixPruneFlag(_ raw: String?) -> Bool {
+        guard let raw else { return true }
+        return !["0", "false", "off", "no"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }
+
     /// Python `_layerwise_prefill_materialization_enabled` parity: bound the
     /// lazy cross-layer graph during multi-token prefill once the final
     /// context exceeds the standalone-proven safe curve. Barriers cost
@@ -503,6 +549,29 @@ public enum DeepseekV4Math {
         let xReshape = xFlat.reshaped(B, L, hcMult, hiddenSize)
         let y = (pre.expandedDimensions(axis: -1) * xReshape).sum(axis: -2)
         return (x: y.asType(h.dtype), post: post, comb: comb)
+    }
+
+    /// DeepSeek-V4.1 STAGGERED mHC: `hc_mixes(x, fn, scale, base)` returns the (pre, post, comb)
+    /// coefficients WITHOUT collapsing. V4.1 threads these across sublayers — a sublayer's `pre` is
+    /// consumed by the NEXT sublayer's collapse, while its `post`/`comb` drive its own expand
+    /// (ref jang_tools/dsv41/model.py `Block.hc_mixes`). Same math as `hcPreGraph` up to the collapse.
+    public static func hcMixes(
+        _ h: MLXArray, fn: MLXArray, scale: MLXArray, base: MLXArray,
+        hcMult: Int, hiddenSize: Int, iters: Int, eps: Float, normEps: Float
+    ) -> (pre: MLXArray, post: MLXArray, comb: MLXArray) {
+        let B = h.dim(0)
+        let L = h.dim(1)
+        let xFlat = h.reshaped(B, L, hcMult * hiddenSize).asType(.float32)
+        let reciprocalRMS = rsqrt((xFlat * xFlat).mean(axis: -1, keepDims: true) + normEps)
+        let mixes = xFlat.matmul(fn.asType(.float32).transposed()) * reciprocalRMS
+        return hcSplitSinkhorn(mixes: mixes, scale: scale, base: base, hcMult: hcMult, iters: iters, eps: eps)
+    }
+
+    /// Collapse the hc copies of `h` [B,L,hcMult,hiddenSize] with an EXTERNALLY supplied `pre`
+    /// [B,L,hcMult] (ref `hc_pre`): `y = sum(pre[...,None] * h, axis=2)`.
+    public static func hcCollapse(_ h: MLXArray, pre: MLXArray) -> MLXArray {
+        let y = (pre.expandedDimensions(axis: -1) * h.asType(.float32)).sum(axis: -2)
+        return y.asType(h.dtype)
     }
 
     private static let hcPreCompiledLock = NSLock()
@@ -980,41 +1049,6 @@ public enum DeepseekV4Math {
     // it directly and handles the overflow branch for large x.
     public static func sqrtSoftplus(_ logits: MLXArray) -> MLXArray {
         sqrt(logAddExp(logits, MLXArray(0.0)))
-    }
-
-    // MARK: - Top-k over sqrtsoftplus with bias + norm
-    //
-    // Production gate path (for non-hash layers):
-    //   biased = scores + noauxBias
-    //   topKIdx = argpartition(-biased, k)[:k]
-    //   topKWeights = take_along_axis(scores, topKIdx)   — UNBIASED!
-    //   normalized = topKWeights / sum(topKWeights) * routedScalingFactor
-    //
-    // Critical: `noauxBias` is used ONLY to pick the indices — once
-    // picked, the UNBIASED score is what gets used as the expert
-    // weight. This was bug #6 in the DSV-EXHAUSTIVE-VARIABLES-GUIDE;
-    // using biased weights broke coherence.
-    public static func sqrtSoftplusSelect(
-        scores: MLXArray,
-        noauxBias: MLXArray?,
-        k: Int,
-        normalize: Bool,
-        scalingFactor: Float
-    ) -> (indices: MLXArray, weights: MLXArray) {
-        let biased = noauxBias != nil ? (scores + noauxBias!) : scores
-        // argpartition returns unordered top-k; sort indices for
-        // determinism (matters for cache-hit byte equivalence).
-        let topKIdx = argPartition(-biased, kth: k - 1, axis: -1)[.ellipsis, 0..<k]
-        // Gather the UNBIASED scores at those indices.
-        let gathered = takeAlong(scores, topKIdx, axis: -1)
-        var weights = gathered
-        if normalize {
-            let denom = weights.sum(axis: -1, keepDims: true) + 1e-20
-            weights = weights / denom * scalingFactor
-        } else {
-            weights = weights * scalingFactor
-        }
-        return (indices: topKIdx, weights: weights)
     }
 
     // MARK: - YaRN RoPE freq table
@@ -1952,7 +1986,7 @@ public enum DeepseekV4Math {
             heads16SelfTested = true
             if let err = heads16SelfTest() {
                 heads16Disabled = true
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         "DSV4 heads16 indexed-prefill kernel self-test FAILED (\(err)); using stock indexed prefill for this process\n"
                             .utf8))

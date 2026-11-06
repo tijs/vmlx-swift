@@ -29,15 +29,18 @@ public enum DFlash2Loader {
             throw DFlash2LoadError.malformedConfig(configURL)
         }
         let config = try DFlash2Configuration(json: root)
-        guard config.isDFlash2 else {
+        guard config.isRunnable else {
             throw DFlash2LoadError.notDFlash2(dir)
         }
 
+        if let reason = DFlash2ArtifactMetadata.rejectionReason(at: dir) {
+            throw DFlash2LoadError.targetMismatch(reason)
+        }
         var weights = [String: MLXArray]()
         if let enumerator = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil)
         {
             for case let url as URL in enumerator where url.pathExtension == "safetensors" {
-                let (w, _) = try loadArraysAndMetadata(url: url)
+                let (w, _) = try ResidentSafetensorsReader.loadWeights(url: url)
                 for (k, v) in w { weights[k] = v }
             }
         }
@@ -71,13 +74,14 @@ public enum DFlash2Loader {
 
         do {
             try model.update(
-                parameters: ModuleParameters.unflattened(weights), verify: [.noUnusedKeys])
+                parameters: ModuleParameters.unflattened(weights),
+                verify: [.noUnusedKeys, .allModelKeysSet, .shapeMismatch])
         } catch {
             throw DFlash2LoadError.weightUpdateFailed(error)
         }
 
         // The bf16 release runs quantized in the reference runtime: the
-        // oMLX recipe's "Draft quantization enabled" is `nn.quantize(draft,
+        // reference runtime recipe's "Draft quantization enabled" is `nn.quantize(draft,
         // group_size=64, bits=4)`, and the 60+ t/s contract was measured
         // with it (acceptance held ~88%). Quantize AFTER the weights land
         // so the bf16 tensors load into the still-bf16 modules first.
@@ -166,6 +170,7 @@ public enum DFlash2LoadError: Error, LocalizedError {
     case noWeights(URL)
     case weightUpdateFailed(Error)
     case targetMismatch(String)
+    case unsupportedMarkovHead(String)
 
     public var errorDescription: String? {
         switch self {
@@ -189,6 +194,8 @@ public enum DFlash2LoadError: Error, LocalizedError {
             return "DFlash 2 drafter weight update failed: \(err)"
         case .targetMismatch(let detail):
             return "DFlash 2 drafter does not match the loaded model: \(detail)"
+        case .unsupportedMarkovHead(let kind):
+            return "DSpark drafter declares markov_head_type \"\(kind)\"; only the vanilla head is supported"
         }
     }
 }

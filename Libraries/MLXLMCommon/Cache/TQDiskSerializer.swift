@@ -337,6 +337,9 @@ public enum TQDiskSerializer {
                     result["kv_\(i)_keys"] = state[0]
                     result["kv_\(i)_values"] = state[1]
                     result["kv_\(i)_indexer_keys"] = state[2]
+                    if let position = qsa.mediaPositionOffset {
+                        result["__qsa_\(i)_media_position_offset__"] = metaInt32(Int32(position))
+                    }
                     result[kindKey(for: i)] = kindArray(.qsaKV)
                 } else {
                     // A QSA layer whose indexer lane is missing cannot be
@@ -345,12 +348,17 @@ public enum TQDiskSerializer {
                     // `.kv` record. Also covers the empty pre-prefill case.
                     result[kindKey(for: i)] = kindArray(.skip)
                 }
-            } else if layer is KVCacheSimple || layer is TurboQuantKVCache {
+            } else if layer is KVCacheSimple || layer is CompilableKVCache
+                || layer is TurboQuantKVCache
+            {
                 // KVCacheSimple always, plus TurboQuantKVCache in fill phase.
                 // A compressed TQ layer restored from paged decoded KV also
                 // lands here because it has no native encoded payload. Store
                 // that decoded state as exact standard KV rather than writing
                 // a false TQ record or repeatedly re-quantizing it.
+                // CompilableKVCache also exports just its valid rows through
+                // `state`; its fixed-capacity buffer and device counter are
+                // execution details, not a different disk format.
                 // All variants expose `state` as [keys, values].
                 let state = layer.state
                 if state.count >= 2 {
@@ -683,7 +691,9 @@ public enum TQDiskSerializer {
                 continue
             }
 
-            if sub is KVCacheSimple || sub is TurboQuantKVCache {
+            if sub is KVCacheSimple || sub is CompilableKVCache
+                || sub is TurboQuantKVCache
+            {
                 let state = sub.state
                 if state.count >= 2 {
                     result["kv_\(i)_sub_\(j)_keys"] = state[0]
@@ -782,16 +792,57 @@ public enum TQDiskSerializer {
             return pool
         }
 
+        // The reader bounds a segment at `maxSegmentRows`. DeepSeek-V4.1 hands
+        // over its contiguous slab as ONE segment of every live row, and its
+        // compress-ratio-1 layers hold one row per token, so past 16K tokens
+        // that segment was written whole and every such record deserialized
+        // as a required miss: each long follow-up turn re-prefilled the whole
+        // prompt. Rows are encoded independently, so splitting is lossless;
+        // the contiguous restore joins the slabs back into one.
+        func boundedSegments(
+            _ segments: [HybridPoolQuantizedSegment]
+        ) -> [HybridPoolQuantizedSegment] {
+            let maxRows = HybridPoolQuantizedSchema.maxSegmentRows
+            return segments.flatMap { segment -> [HybridPoolQuantizedSegment] in
+                guard segment.originalShape.count == 3, segment.rowCount > maxRows else {
+                    return [segment]
+                }
+                return stride(from: 0, to: segment.rowCount, by: maxRows).map { start in
+                    let end = Swift.min(start + maxRows, segment.rowCount)
+                    var shape = segment.originalShape
+                    shape[1] = end - start
+                    return HybridPoolQuantizedSegment(
+                        codes: segment.codes[0..., start ..< end, 0..., 0...],
+                        scales: segment.scales[0..., start ..< end, 0..., 0...],
+                        biases: segment.biases[0..., start ..< end, 0..., 0...],
+                        originalShape: shape,
+                        groupSize: segment.groupSize,
+                        bits: segment.bits,
+                        originalDType: segment.originalDType)
+                }
+            }
+        }
+
         func putQuantizedPool(
             _ stem: String,
             _ segments: [HybridPoolQuantizedSegment]
         ) -> Bool {
+            let segments = boundedSegments(segments)
             result["__\(stem)_qcount__"] = metaInt32(Int32(segments.count))
             for (segmentIndex, segment) in segments.enumerated() {
                 guard segment.originalShape.count == 3,
                       segment.originalShape[1] > 0,
                       segment.groupSize > 0,
-                      segment.bits == 8,
+                      HybridPoolQuantizedSchema.supportedBits.contains(segment.bits),
+                      segment.bits != 4 || segment.groupSize % 2 == 0,
+                      segment.originalShape[2] % segment.groupSize == 0,
+                      segment.codes.dtype == .uint8,
+                      segment.codes.shape == [
+                          segment.originalShape[0], segment.originalShape[1],
+                          segment.originalShape[2] / segment.groupSize,
+                          HybridPoolQuantizedSchema.packedGroupWidth(
+                              groupSize: segment.groupSize, bits: segment.bits),
+                      ],
                       let dtypeCode = dsv4PoolDTypeCode(segment.originalDType)
                 else { return false }
                 let prefix = "\(stem)_q_\(segmentIndex)"
@@ -848,6 +899,21 @@ public enum TQDiskSerializer {
         putOptional("dsv4_\(i)_buf_idx_kv", idxBuf.kv)
         putOptional("dsv4_\(i)_buf_idx_gate", idxBuf.gate)
         result["__dsv4_\(i)_nilmask__"] = MLXArray(nilMask)
+        // DeepSeek-V4.1 only: the Engram n-gram tail that must accompany this
+        // prefix. Written only when present, so 0731 records are unchanged.
+        if let history = dsv4.auxiliaryTokenHistory {
+            result["__dsv4_\(i)_aux_hist_end__"] = metaInt32(Int32(history.endPosition))
+            result["dsv4_\(i)_aux_hist"] = MLXArray(
+                history.tokens.isEmpty ? [Int32(0)] : history.tokens)
+            result["__dsv4_\(i)_aux_hist_count__"] = metaInt32(Int32(history.tokens.count))
+        }
+        // DeepSeek-V4.1 dSpark draft-window tail (speed-only; absent records restore without it).
+        if let tail = dsv4.auxiliaryHiddenTail?.joined() {
+            result["dsv4_\(i)_dspark_tail"] = tail.rows
+            result["__dsv4_\(i)_dspark_tail_start__"] = metaInt32(Int32(tail.start))
+            result["__dsv4_\(i)_dspark_tail_cap__"] = metaInt32(
+                Int32(dsv4.auxiliaryHiddenTail?.capacity ?? tail.rows.dim(0)))
+        }
 
         result[kindKey(for: i)] = kindArray(.deepseekV4)
     }
@@ -957,6 +1023,15 @@ public enum TQDiskSerializer {
         public let keys: MLXArray
         public let values: MLXArray
         public let indexerKeys: MLXArray
+        public let mediaPositionOffset: Int?
+
+        public init(keys: MLXArray, values: MLXArray, indexerKeys: MLXArray,
+                    mediaPositionOffset: Int? = nil) {
+            self.keys = keys
+            self.values = values
+            self.indexerKeys = indexerKeys
+            self.mediaPositionOffset = mediaPositionOffset
+        }
     }
 
     /// Mamba SSM state for a single hybrid layer. `state1` is nil for
@@ -1024,6 +1099,11 @@ public enum TQDiskSerializer {
         public let bufCompGate: MLXArray?
         public let bufIdxKV: MLXArray?
         public let bufIdxGate: MLXArray?
+        /// DeepSeek-V4.1 Engram n-gram tail (``HybridPoolCache/auxiliaryTokenHistory``).
+        /// Absent for DSV4-0731 records, which never write it.
+        public var auxiliaryTokenHistory: HybridPoolTokenHistory? = nil
+        /// DeepSeek-V4.1 dSpark draft-window tail (``HybridPoolCache/auxiliaryHiddenTail``).
+        public var auxiliaryHiddenTail: HybridPoolHiddenTail? = nil
     }
 
     /// 2026-05-06 (ZAYA1 CCA-attention port):
@@ -1205,6 +1285,12 @@ public enum TQDiskSerializer {
                     index: i,
                     data: state.count == header.count ? .modelState(header, state) : .requiredMiss))
             case .qsaKV:
+                let positionArray = arrays["__qsa_\(i)_media_position_offset__"]
+                let position = positionArray.flatMap(readMetaInt32).map(Int.init)
+                if positionArray != nil && position == nil {
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
+                    continue
+                }
                 if let keys = arrays["kv_\(i)_keys"],
                    let values = arrays["kv_\(i)_values"],
                    let indexer = arrays["kv_\(i)_indexer_keys"]
@@ -1214,7 +1300,8 @@ public enum TQDiskSerializer {
                             index: i,
                             data: .qsaKV(
                                 QSAKVLayerComponents(
-                                    keys: keys, values: values, indexerKeys: indexer))
+                                    keys: keys, values: values, indexerKeys: indexer,
+                                    mediaPositionOffset: position))
                         )
                     )
                 } else {
@@ -1707,17 +1794,20 @@ public enum TQDiskSerializer {
                       // writers losslessly compact adjacent q8 rows into
                       // bounded 16K slabs so near-1M restore/decode does not
                       // traverse thousands of tiny tensors.
-                      shape[1] <= 16 * 1024,
+                      shape[1] <= HybridPoolQuantizedSchema.maxSegmentRows,
                       shape[2] > 0,
                       groupSize > 0,
                       shape[2] % groupSize == 0,
-                      bits == 8,
+                      HybridPoolQuantizedSchema.supportedBits.contains(bits),
+                      bits != 4 || groupSize % 2 == 0,
                       codes.dtype == .uint8,
                       scales.dtype == .float16,
                       biases.dtype == .float16
                 else { return [] }
                 let groups = shape[2] / groupSize
-                guard codes.shape == [shape[0], shape[1], groups, groupSize],
+                let packed = HybridPoolQuantizedSchema.packedGroupWidth(
+                    groupSize: groupSize, bits: bits)
+                guard codes.shape == [shape[0], shape[1], groups, packed],
                       scales.shape == [shape[0], shape[1], groups, 1],
                       biases.shape == scales.shape
                 else { return [] }
@@ -1743,7 +1833,22 @@ public enum TQDiskSerializer {
            quantizedIdx?.isEmpty == true
         { return nil }
 
-        return DeepseekV4LayerComponents(
+        var auxiliaryTokenHistory: HybridPoolTokenHistory? = nil
+        if let endArray = arrays["__dsv4_\(i)_aux_hist_end__"],
+           let end = readMetaInt32(endArray),
+           let countArray = arrays["__dsv4_\(i)_aux_hist_count__"],
+           let count = readMetaInt32(countArray),
+           let tokensArray = arrays["dsv4_\(i)_aux_hist"]
+        {
+            let tokens = tokensArray.asType(.int32).asArray(Int32.self)
+            guard count >= 0, Int(count) <= tokens.count, Int(count) <= Int(end) else {
+                return nil
+            }
+            auxiliaryTokenHistory = HybridPoolTokenHistory(
+                endPosition: Int(end), tokens: Array(tokens.prefix(Int(count))))
+        }
+
+        var components = DeepseekV4LayerComponents(
             keys: keys, values: values,
             keep: Int(m[0]), maxSize: Int(m[1]), step: Int(m[2]),
             offset: Int(m[3]), idx: Int(m[4]),
@@ -1757,6 +1862,16 @@ public enum TQDiskSerializer {
             bufCompGate: unsentinel("dsv4_\(i)_buf_comp_gate", slot: 3),
             bufIdxKV: unsentinel("dsv4_\(i)_buf_idx_kv", slot: 4),
             bufIdxGate: unsentinel("dsv4_\(i)_buf_idx_gate", slot: 5))
+        components.auxiliaryTokenHistory = auxiliaryTokenHistory
+        if let rows = arrays["dsv4_\(i)_dspark_tail"], rows.ndim == 2, rows.dim(0) > 0,
+           let startArray = arrays["__dsv4_\(i)_dspark_tail_start__"],
+           let start = readMetaInt32(startArray), start >= 0
+        {
+            let cap = arrays["__dsv4_\(i)_dspark_tail_cap__"].flatMap(readMetaInt32).map(Int.init)
+            components.auxiliaryHiddenTail = HybridPoolHiddenTail(
+                capacity: Swift.max(cap ?? rows.dim(0), rows.dim(0)), start: Int(start), rows: rows)
+        }
+        return components
     }
 
     /// 2026-05-06 (ZAYA1 CCA-attention port):

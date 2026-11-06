@@ -11,8 +11,19 @@ public struct ImageGenRequest: Sendable {
     public var guidance: Float
     public var seed: UInt64?
     public var numImages: Int
+    /// Explicit per-image seeds. Otherwise preserve seed + index (wrapping UInt64).
+    public var seeds: [UInt64]?
+    /// Requested parallel sampling width; implementations may lower this to fit.
+    public var batchSize: Int
+    public var interrupt: FluxInterrupt?
     public var outputDir: URL
     public var outputFormat: ImageFormat
+    public var sampler: String?
+    public var scheduler: String?
+    public var shift: Float?
+    public var previewInterval: Int?
+    public var previewMaxPixel: Int
+    public var adapters: [FluxAdapter]
 
     public init(
         prompt: String,
@@ -23,8 +34,13 @@ public struct ImageGenRequest: Sendable {
         guidance: Float = 3.5,
         seed: UInt64? = nil,
         numImages: Int = 1,
+        seeds: [UInt64]? = nil,
+        batchSize: Int = 1,
+        interrupt: FluxInterrupt? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = []
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -34,40 +50,59 @@ public struct ImageGenRequest: Sendable {
         self.guidance = guidance
         self.seed = seed
         self.numImages = numImages
+        self.seeds = seeds
+        self.batchSize = batchSize
+        self.interrupt = interrupt
         self.outputDir = outputDir
         self.outputFormat = outputFormat
+        self.sampler = sampler
+        self.scheduler = scheduler
+        self.shift = shift
+        self.previewInterval = previewInterval
+        self.previewMaxPixel = previewMaxPixel
+        self.adapters = adapters
     }
 }
 
 // MARK: - ImageEditRequest
 
 public struct ImageEditRequest: Sendable {
+    public var interrupt: FluxInterrupt?
     public var prompt: String
     public var sourceImage: URL
     public var sourceImages: [URL]
     public var mask: URL?          // optional PNG mask — white=edit, black=keep
-    public var strength: Float     // 0..1 — how much to deviate from source
-    public var width: Int?         // nil → match source
+    public var strength: Float?    // nil uses the backend's native editing behavior
+    public var width: Int?         // nil uses the backend's reference-aspect/resolution policy
     public var height: Int?
     public var steps: Int
     public var guidance: Float
     public var seed: UInt64?
     public var outputDir: URL
     public var outputFormat: ImageFormat
+    public var sampler: String?
+    public var scheduler: String?
+    public var shift: Float?
+    public var previewInterval: Int?
+    public var previewMaxPixel: Int
+    public var adapters: [FluxAdapter]
 
     public init(
         prompt: String,
         sourceImage: URL,
         mask: URL? = nil,
-        strength: Float = 0.75,
+        strength: Float? = nil,
         width: Int? = nil,
         height: Int? = nil,
         steps: Int = 20,
         guidance: Float = 3.5,
         seed: UInt64? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = [], interrupt: FluxInterrupt? = nil
     ) {
+        self.interrupt = interrupt
         self.prompt = prompt
         self.sourceImage = sourceImage
         self.sourceImages = [sourceImage]
@@ -80,24 +115,33 @@ public struct ImageEditRequest: Sendable {
         self.seed = seed
         self.outputDir = outputDir
         self.outputFormat = outputFormat
+        self.sampler = sampler
+        self.scheduler = scheduler
+        self.shift = shift
+        self.previewInterval = previewInterval
+        self.previewMaxPixel = previewMaxPixel
+        self.adapters = adapters
     }
 
     public init(
         prompt: String,
         sourceImages: [URL],
         mask: URL? = nil,
-        strength: Float = 0.75,
+        strength: Float? = nil,
         width: Int? = nil,
         height: Int? = nil,
         steps: Int = 20,
         guidance: Float = 3.5,
         seed: UInt64? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = [], interrupt: FluxInterrupt? = nil
     ) throws {
         guard let sourceImage = sourceImages.first else {
             throw FluxError.invalidRequest("ImageEditRequest requires at least one source image")
         }
+        self.interrupt = interrupt
         self.prompt = prompt
         self.sourceImage = sourceImage
         self.sourceImages = sourceImages
@@ -110,12 +154,19 @@ public struct ImageEditRequest: Sendable {
         self.seed = seed
         self.outputDir = outputDir
         self.outputFormat = outputFormat
+        self.sampler = sampler
+        self.scheduler = scheduler
+        self.shift = shift
+        self.previewInterval = previewInterval
+        self.previewMaxPixel = previewMaxPixel
+        self.adapters = adapters
     }
 }
 
 // MARK: - UpscaleRequest (SeedVR2)
 
 public struct UpscaleRequest: Sendable {
+    public var interrupt: FluxInterrupt?
     public var sourceImage: URL
     public var scale: Int          // 2, 4
     public var steps: Int
@@ -129,8 +180,10 @@ public struct UpscaleRequest: Sendable {
         steps: Int = 10,
         seed: UInt64? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        interrupt: FluxInterrupt? = nil
     ) {
+        self.interrupt = interrupt
         self.sourceImage = sourceImage
         self.scale = scale
         self.steps = steps
@@ -143,6 +196,8 @@ public struct UpscaleRequest: Sendable {
 // MARK: - VideoGenRequest (future)
 
 public struct VideoGenRequest: Sendable {
+    public var sourceImage: URL?
+    public var interrupt: FluxInterrupt?
     public var prompt: String
     public var negativePrompt: String?
     public var width: Int
@@ -164,8 +219,10 @@ public struct VideoGenRequest: Sendable {
         steps: Int = 50,
         guidance: Float = 5.0,
         seed: UInt64? = nil,
-        outputDir: URL
+        outputDir: URL, sourceImage: URL? = nil, interrupt: FluxInterrupt? = nil
     ) {
+        self.sourceImage = sourceImage
+        self.interrupt = interrupt
         self.prompt = prompt
         self.negativePrompt = negativePrompt
         self.width = width
@@ -190,7 +247,11 @@ public enum ImageGenEvent: Sendable {
     /// every N steps if the scheduler supports it.
     case preview(pngData: Data, step: Int)
     /// Generation finished. `url` points to the saved image on disk.
-    case completed(url: URL, seed: UInt64)
+    /// Metadata is nil for backends that have not implemented effective-parameter reporting.
+    /// Callers must not substitute the requested parameters for missing runtime metadata.
+    case completed(url: URL, seed: UInt64, effectiveParameters: EffectiveImageParameters? = nil)
+    /// One durable output of a multi-image job; stream termination ends the batch.
+    case imageCompleted(url: URL, seed: UInt64, index: Int, effectiveParameters: EffectiveImageParameters? = nil)
     /// Fatal error. `hfAuth=true` signals a HuggingFace 401/403 so the UI
     /// can show a "Add HF token" CTA instead of a generic error banner.
     case failed(message: String, hfAuth: Bool)
@@ -202,7 +263,7 @@ public enum ImageGenEvent: Sendable {
 public enum VideoGenEvent: Sendable {
     case step(step: Int, total: Int, etaSeconds: Double?)
     case preview(pngData: Data, frame: Int)
-    case completed(url: URL, seed: UInt64, fps: Int, frameCount: Int)
+    case completed(url: URL, seed: UInt64, fps: Int, frameCount: Int, effective: EffectiveImageParameters? = nil)
     case failed(message: String, hfAuth: Bool)
     case cancelled
 }

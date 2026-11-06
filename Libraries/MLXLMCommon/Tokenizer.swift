@@ -2,8 +2,42 @@
 
 import Foundation
 
+/// A lossless piece from a compatible plain ByteLevel tokenizer.
+public enum ByteLevelDecodingPiece: Sendable {
+    case bytes([UInt8])
+    case literal(String)
+    case ignored
+}
+
+/// Exact, ID-indexed vocabulary metadata for grammar compilation. These are
+/// tokenizer model pieces, not strings produced by decoding individual tokens.
+/// Providers must identify the decoder encoding from tokenizer configuration and
+/// include added tokens at their real IDs. Unsupported decoders return nil.
+public struct GrammarTokenVocabulary: Sendable {
+    public let vocabulary: [String]
+    public let vocabularyType: JSONSchemaVocabularyType
+    public let specialTokenIDs: Set<Int>
+
+    public init(
+        vocabulary: [String], vocabularyType: JSONSchemaVocabularyType,
+        specialTokenIDs: Set<Int>
+    ) {
+        self.vocabulary = vocabulary
+        self.vocabularyType = vocabularyType
+        self.specialTokenIDs = specialTokenIDs
+    }
+}
+
 /// A protocol for tokenizing text into token IDs and decoding token IDs into text.
 public protocol Tokenizer: Sendable {
+    /// Optional exact grammar vocabulary. Nil means constrained generation is
+    /// unsupported; callers must not infer bytes using decode([tokenID]).
+    var grammarTokenVocabulary: GrammarTokenVocabulary? { get }
+
+    /// Optional lossless ByteLevel decoding with cleanup disabled. Other
+    /// tokenizers retain the generic streaming decoder.
+    var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? { get }
+
     func encode(text: String, addSpecialTokens: Bool) -> [Int]
     func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String
     func convertTokenToId(_ token: String) -> Int?
@@ -349,7 +383,23 @@ public func canonicalChatCacheBoundaries(
         return rungs
     }
 
-    let historyTop = assistantContinuationStableBoundary()
+    /// The continuation probe proves a boundary only when it reaches past the previous message
+    /// boundary, i.e. it contains the newest message. A probe the template rejected or rewrote
+    /// diverges earlier and proves nothing: K2 Horizon's template requires a thinking field on every
+    /// assistant message, swift-jinja renders its `raise_exception` text instead of throwing, and the
+    /// probe shared exactly one token (BOS) with the prompt. That `1` outranked the exact
+    /// no-generation boundary, so every K2 follow-up at effort low/medium (generation rail
+    /// `<ifm|think_faster>…`, which history renders differently) missed its stored prompt and
+    /// re-prefilled the whole conversation: TTFT 1.2 → 5.6 s over five 2.5k-token turns.
+    func provenContinuationBoundary() -> Int? {
+        guard let boundary = assistantContinuationStableBoundary() else { return nil }
+        let previous = messages.count > 1
+            ? exactPrefixBoundary(messages: Array(messages.dropLast())) : nil
+        let floor = Swift.max(previous ?? 0, stable.last ?? 0, 1)
+        return boundary > floor ? boundary : nil
+    }
+
+    let historyTop = provenContinuationBoundary()
         ?? exactPrefixBoundary(messages: messages)
         ?? trailingContinuationBoundary()
     let history = historyTop.map { [$0] + historyLadder(below: $0) } ?? []
@@ -388,7 +438,7 @@ public func canonicalChatCacheBoundaries(
         // up to the history boundary, which is where the remaining `stored+2`
         // miss must originate.
         let historyDigest = all.last.map { digest(promptTokens.prefix($0)) } ?? "-"
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[vmlx][cache/boundaries] prompt=\(promptTokens.count) stable=\(stable) all=\(all)"
                 + " head=\(headDigest) stable0=\(stableDigest) hist=\(historyDigest)"
                 + " stableDigests=[\(stableDigests)]\n").utf8
@@ -398,6 +448,9 @@ public func canonicalChatCacheBoundaries(
 }
 
 extension Tokenizer {
+    public var grammarTokenVocabulary: GrammarTokenVocabulary? { nil }
+    public var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? { nil }
+
     public func encode(text: String) -> [Int] {
         encode(text: text, addSpecialTokens: true)
     }
@@ -451,12 +504,19 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
 
     var segmentTokens = [Int]()
     var segment = ""
+    private let byteDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)?
+    private var byteState = IncrementalByteLevelState()
 
     public init(tokenizer: any Tokenizer) {
         self.tokenizer = tokenizer
+        self.byteDecoder = tokenizer.incrementalByteLevelDecoder
     }
 
     public mutating func append(token: Int) {
+        if let byteDecoder {
+            byteState.append(byteDecoder(token))
+            return
+        }
         segmentTokens.append(token)
     }
 
@@ -472,11 +532,13 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
     }
 
     public mutating func next() -> String? {
-        emitDecodedSegment(segmentTokens, holdBackTail: true)
+        if byteDecoder != nil { return byteState.emit(holdBackTail: true) }
+        return emitDecodedSegment(segmentTokens, holdBackTail: true)
     }
 
     public mutating func flush() -> String? {
-        emitDecodedSegment(segmentTokens, holdBackTail: false)
+        if byteDecoder != nil { return byteState.emit(holdBackTail: false) }
+        return emitDecodedSegment(segmentTokens, holdBackTail: false)
     }
 
     private mutating func emitDecodedSegment(_ tokens: [Int], holdBackTail: Bool) -> String? {
@@ -563,5 +625,83 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
         }
 
         return String(new)
+    }
+}
+
+/// Only the un-emitted grapheme tail and an incomplete UTF8 scalar remain live.
+/// No newline compaction: it would discard the held tail. A grapheme can contain
+/// arbitrarily many combining scalars, so the tail is not capped in bytes.
+private struct IncrementalByteLevelState {
+    private var pendingBytes: [UInt8] = []
+    private var tail = ""
+
+    mutating func append(_ piece: ByteLevelDecodingPiece) {
+        switch piece {
+        case .ignored: break
+        case .literal(let text):
+            tail += String(decoding: pendingBytes, as: UTF8.self)
+            pendingBytes.removeAll(keepingCapacity: true)
+            tail += text
+        case .bytes(let bytes):
+            pendingBytes += bytes
+            let held = Self.incompleteSuffixLength(pendingBytes)
+            let complete = pendingBytes.count - held
+            if complete > 0 {
+                tail += String(decoding: pendingBytes.prefix(complete), as: UTF8.self)
+                pendingBytes = Array(pendingBytes.suffix(held))
+            }
+        }
+    }
+
+    mutating func emit(holdBackTail: Bool) -> String? {
+        let visible = holdBackTail ? tail : tail + String(decoding: pendingBytes, as: UTF8.self)
+        let boundary: String.Index
+        if holdBackTail {
+            guard visible.count > NaiveStreamingDetokenizer.trailingHoldbackCharacters else { return nil }
+            boundary = visible.index(visible.endIndex, offsetBy: -NaiveStreamingDetokenizer.trailingHoldbackCharacters)
+        } else {
+            boundary = visible.endIndex
+        }
+        let output = String(visible[..<boundary])
+        guard !output.isEmpty else { return nil }
+        // Preserve the generic decoder's terminal deferral contract. In
+        // particular, flush of an incomplete byte run must not seal a U+FFFD
+        // that a subsequent append can still complete.
+        if let last = output.last {
+            if last == "\u{fffd}" { return nil }
+            let scalars = Array(last.unicodeScalars)
+            if let value = scalars.last?.value,
+               (value == 0x200D || (scalars.count == 1 && (0x1F1E6...0x1F1FF).contains(value))
+                || (0xD800...0xDBFF).contains(value)) { return nil }
+        }
+        tail = String(visible[boundary...])
+        if !holdBackTail { pendingBytes.removeAll(keepingCapacity: true) }
+        return output
+    }
+
+    private static func incompleteSuffixLength(_ bytes: [UInt8]) -> Int {
+        guard !bytes.isEmpty else { return 0 }
+        for start in max(0, bytes.count - 3)..<bytes.count {
+            let lead = bytes[start]
+            let required: Int
+            switch lead {
+            case 0xC2...0xDF: required = 2
+            case 0xE0...0xEF: required = 3
+            case 0xF0...0xF4: required = 4
+            default: continue
+            }
+            let present = bytes.count - start
+            guard present < required,
+                  bytes[(start + 1)...].allSatisfy({ (0x80...0xBF).contains($0) }) else { continue }
+            if present >= 2 {
+                let second = bytes[start + 1]
+                if lead == 0xE0 && second < 0xA0 { continue }
+                if lead == 0xED && second > 0x9F { continue }
+                if lead == 0xF0 && second < 0x90 { continue }
+                if lead == 0xF4 && second > 0x8F { continue }
+            }
+            return present
+        }
+        return 0
     }
 }

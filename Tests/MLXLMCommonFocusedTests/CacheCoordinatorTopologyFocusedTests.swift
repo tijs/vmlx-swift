@@ -619,7 +619,8 @@ struct CacheCoordinatorTopologyFocusedTests {
     @Test("ZAYA CCA state is not duplicated into SSM companion cache")
     func zayaCCADoesNotUseSSMCompanionExtraction() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Cache/CacheHelpers.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/Cache/CacheHelpers.swift"),
             encoding: .utf8)
 
         #expect(source.contains("} else if layer is ZayaCCACache {"))
@@ -1045,6 +1046,54 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
+    /// Serving configuration (write-behind): a native-recurrent hybrid writes one file and links no
+    /// companion, so its store is deferred too. While in flight the entry is durable (it must not be
+    /// rederived) and a lookup is served from memory with its in-file recurrent state; after the
+    /// write a reopened coordinator restores it from disk.
+    @Test("native-recurrent hybrid writes behind and restores its in-file state")
+    func nativeHybridWritesBehind() {
+        FocusedMLXTestSupport.withLock {
+        let tmp = makeTempDir("mamba-write-behind")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        prepareMLXMetallibForCacheTopologyTests()
+        func coordinator() -> CacheCoordinator {
+            var config = CacheCoordinatorConfig(
+                usePagedCache: false, enableDiskCache: true, pagedBlockSize: 4, maxCacheBlocks: 40,
+                diskCacheMaxGB: 1.0, diskCacheDir: tmp, modelKey: "mamba-write-behind-focused")
+            config.diskWriteBehind = true
+            let c = CacheCoordinator(config: config)
+            c.setHybrid(true, requiresRecurrentSSMCompanion: true, requiresSeparateRecurrentPayload: false)
+            return c
+        }
+        let writer = coordinator()
+        writer.diskCache?.writeDelayForTesting = 0.3
+        let tokens = Array(601...612)
+        let cache = makeNemotronOmniCache(tokenCount: tokens.count, populated: true)
+        writer.storeAfterGeneration(
+            promptTokens: tokens, perLayerData: [], ssmStates: extractSSMStates(from: cache),
+            cache: cache)
+        #expect(writer.diskCache?.pendingWriteCount == 1, "native hybrid store must be deferred")
+        #expect(writer.hasDurableDiskEntry(tokens: tokens))
+        if case .hit(let matched, _, let detail, _, _, let arrays) = writer.fetch(tokens: tokens + [613]) {
+            // Still being written: served from the writer's payload, a disk-tier entry that is not
+            // resident (`diskPending`, never the RAM tier's `memory`).
+            #expect(matched == tokens.count && detail == .diskPending && detail.isDiskTierEntry)
+            #expect(arrays?.keys.contains { $0.hasPrefix("mamba_") } == true)
+        } else {
+            Issue.record("in-flight native hybrid entry must be served")
+        }
+        #expect(writer.waitForPendingDiskWrites())
+        let reopened = coordinator()
+        #expect(reopened.hasDurableDiskEntry(tokens: tokens))
+        if case .hit(let matched, _, _, _, _, let arrays) = reopened.fetch(tokens: tokens + [613]) {
+            #expect(matched == tokens.count)
+            #expect(arrays?.keys.contains { $0.hasPrefix("mamba_") } == true)
+        } else {
+            Issue.record("persisted native hybrid entry must restore after reopen")
+        }
+        }
+    }
+
     @Test("separate-payload topology still persists and requires the companion")
     func separatePayloadTopologyKeepsCompanion() {
         FocusedMLXTestSupport.withLock {
@@ -1195,10 +1244,11 @@ struct CacheCoordinatorTopologyFocusedTests {
     @Test("caller policy bypasses only disk-backed forced-tool restore")
     func callerPolicyBypassesOnlyDiskBackedForcedToolRestore() throws {
         let batchSource = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let evaluateSource = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         #expect(batchSource.contains("shouldSkipDiskBackedToolPromptSeedBoundary"))
@@ -1210,8 +1260,11 @@ struct CacheCoordinatorTopologyFocusedTests {
         #expect(batchSource.contains("!shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)"))
         #expect(!batchSource.contains("shouldDisableDiskBackedRequiredToolRestore"))
         #expect(batchSource.contains("disableDiskBackedRequiredToolRestore: deferredDisableRestore"))
-        #expect(batchSource.contains(
-            "slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection"))
+        // The policy is consulted through `requiredToolSelectionSkipsDiskBackedRestore`
+        // (PrefixCacheInvariants.swift), which keeps the skip for every model that
+        // does not declare `exactPrefixRestoreIsSuffixIndependent`.
+        #expect(batchSource.contains("requiredToolSelectionSkipsDiskBackedRestore("))
+        #expect(batchSource.contains("restorePolicy: slot.originalInput.cacheRestorePolicy)"))
         #expect(batchSource.contains(
             "skipped disk-backed required-tool cache restore; caller requested fresh tool selection"))
         #expect(batchSource.contains("Skipped disk-backed tool prompt seed boundary"))
@@ -1221,6 +1274,7 @@ struct CacheCoordinatorTopologyFocusedTests {
         #expect(evaluateSource.contains("TokenIterator: skipped disk-backed required-tool cache restore"))
         #expect(evaluateSource.contains(
             "requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore"))
+        #expect(evaluateSource.contains("&& !suffixIndependentRestore"))
     }
 
     @Test("KV policy changes dynamic cache salt")
@@ -1492,7 +1546,7 @@ struct Gemma4CacheTopologyFocusedTests {
     @Test("TokenIterator compiled decode promotes all-rotating SWA caches")
     func tokenIteratorCompiledDecodePromotesAllRotatingCaches() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         guard let start = source.range(of: "mutating func setupCompiledDecode("),
               let end = source.range(

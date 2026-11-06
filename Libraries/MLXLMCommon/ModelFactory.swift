@@ -81,27 +81,22 @@ public struct ModelContext: @unchecked Sendable {
     public var model: any LanguageModel
     public var processor: any UserInputProcessor
     public var tokenizer: Tokenizer
-    public var jangPressRuntime: JangPressRuntime
+    // Shared across context copies; released with the loaded context, including
+    // cancelled/failed load cleanup. Never keyed by a model name or directory.
+    var residencyLease: ModelResidency.Lease?
 
     /// Whether this model supports vision/image input (is a VLM).
     public var isVLM: Bool { model is VisionLanguageModelProtocol }
 
-    /// Public MLXPress spelling for the routed cold-tier runtime.
-    public var mlxPressRuntime: MLXPressRuntime {
-        get { jangPressRuntime }
-        set { jangPressRuntime = newValue }
-    }
-
     public init(
         configuration: ModelConfiguration, model: any LanguageModel,
-        processor: any UserInputProcessor, tokenizer: any Tokenizer,
-        jangPressRuntime: JangPressRuntime = .none
+        processor: any UserInputProcessor, tokenizer: any Tokenizer
     ) {
         self.configuration = configuration
         self.model = model
         self.processor = processor
         self.tokenizer = tokenizer
-        self.jangPressRuntime = jangPressRuntime
+        (model as? any AlignedPrefillTurnMarkerResolving)?.resolveAlignedPrefillTurnMarkers(tokenizer: tokenizer)
     }
 }
 
@@ -424,43 +419,6 @@ public func loadModel(
     }
 }
 
-/// Load a model from a local directory AND activate the JangPress
-/// cold-weight tier (axis E) per `jangPress`.
-///
-/// Returns the `ModelContext` paired with a `JangPressRuntime` that
-/// owns the JangPress tiers (mmap / mach / embed / controller). The
-/// runtime stays valid as long as the caller holds it; on drop the
-/// controller's deinit cancels its memory-pressure listener and
-/// quiesce timer.
-///
-/// When `jangPress.enabled == false` (the default — `.disabled`),
-/// the runtime is `.none` and behavior is identical to the plain
-/// `loadModel(from:using:)`.
-///
-/// **Caller contract**: hold the returned `JangPressRuntime` alive
-/// for the model session. Pair it with the `ModelContext` in the
-/// caller's session struct. To shut JangPress down before model
-/// unload, call `JangPressActivation.deactivate(runtime)`.
-///
-/// - Parameters:
-///   - directory: directory of configuration and weights
-///   - tokenizerLoader: the ``TokenizerLoader`` to use for loading the tokenizer
-///   - jangPress: optional JangPress activation options
-/// - Returns: tuple of (`ModelContext`, `JangPressRuntime`)
-public func loadModel(
-    from directory: URL,
-    using tokenizerLoader: any TokenizerLoader,
-    jangPress: JangPressLoadOptions
-) async throws -> (ModelContext, JangPressRuntime) {
-    var context = try await load {
-        try await $0.load(from: directory, using: tokenizerLoader)
-    }
-    let runtime = JangPressActivation.activate(
-        bundleURL: directory, options: jangPress)
-    context.jangPressRuntime = runtime
-    return (context, runtime)
-}
-
 /// Load a model from a local directory of configuration and weights.
 ///
 /// Returns a ``ModelContainer`` holding a ``ModelContext``
@@ -479,50 +437,18 @@ public func loadModelContainer(
     }
 }
 
-/// Load a model from a local directory using a typed ``LoadConfiguration``,
-/// returning a ``ModelContainer`` (the actor-isolated wrapper that
-/// osaurus uses).
-///
-/// This is the **recommended entry point for production hosts**. The
-/// returned `ModelContainer` already has the resulting
-/// ``JangPressRuntime`` stashed via `setJangPressRuntime` so callers
-/// can poll ``ModelContainer/jangPressStatus()`` from anywhere
-/// (settings panel, status bar, debug console).
-///
-/// Resolution order matches the `ModelContext`-returning sibling:
-///
-/// 1. ``LoadBundleFacts/inspect(bundleURL:)`` walks the bundle.
-/// 2. ``LoadConfiguration/jangPress`` resolves to a concrete
-///    ``JangPressLoadOptions``.
-/// 3. ``LoadConfiguration/maxResidentBytes`` is applied as
-///    `MLX.Memory.cacheLimit` for the duration of the load call.
-/// 4. ``LoadConfiguration/memoryLimit`` is applied as
-///    `MLX.Memory.memoryLimit` (clamped to
-///    `MLX.GPU.maxRecommendedWorkingSetBytes()` so the 847a8c7
-///    crash condition is impossible by construction).
-/// 5. The model is loaded normally and wrapped in `ModelContainer`.
-/// 6. JangPress tiers are activated per the resolved options.
-/// 7. The runtime is stashed on the container.
-///
-/// - Parameters:
-///   - directory: directory of configuration and weights
-///   - tokenizerLoader: the ``TokenizerLoader`` to use
-///   - loadConfiguration: typed JangPress + resident-cap policy.
-///     Defaults to ``LoadConfiguration/default`` (JangPress disabled,
-///     70%-of-physical-RAM cache/memory caps, mmap safetensors on).
-/// - Returns: a `ModelContainer` whose `jangPressRuntime` reflects
-///   the activation result.
+/// Load a model with explicit memory, residency and mmap settings.
+/// The container owns the context and its residency lease until unload.
 public func loadModelContainer(
     from directory: URL,
     using tokenizerLoader: any TokenizerLoader,
     loadConfiguration: LoadConfiguration
 ) async throws -> ModelContainer {
-    let (context, runtime) = try await loadModel(
+    let context = try await loadModel(
         from: directory,
         using: tokenizerLoader,
         loadConfiguration: loadConfiguration)
     let container = ModelContainer(context: context)
-    container.setJangPressRuntime(runtime)
     return container
 }
 
@@ -530,60 +456,29 @@ public func loadModelContainer(
 /// ``ModelConfiguration`` overrides and a typed ``LoadConfiguration``.
 ///
 /// Hosts use this when server-panel parser/tool overrides must coexist with
-/// MLXPress, mmap-safetensors, memory caps, and native-MTP activation.
+/// mmap safetensors, memory caps, and native-MTP activation.
 public func loadModelContainer(
     from directory: URL,
     using tokenizerLoader: any TokenizerLoader,
     configuration: ModelConfiguration,
     loadConfiguration: LoadConfiguration
 ) async throws -> ModelContainer {
-    let (context, runtime) = try await loadModel(
+    let context = try await loadModel(
         from: directory,
         using: tokenizerLoader,
         configuration: configuration,
         loadConfiguration: loadConfiguration)
     let container = ModelContainer(context: context)
-    container.setJangPressRuntime(runtime)
     return container
 }
 
-/// Load a model from a local directory using a typed ``LoadConfiguration``
-/// — the recommended entry point for hosts (osaurus, JANG Studio) that
-/// want to wire user-facing toggles to JangPress and resident-cap
-/// behavior without touching env vars.
-///
-/// Resolution order at entry:
-///
-/// 1. ``LoadBundleFacts/inspect(bundleURL:)`` walks the bundle for
-///    safetensors byte total + routed-MoE detection.
-/// 2. ``LoadConfiguration/jangPress`` is resolved to a concrete
-///    ``JangPressLoadOptions`` via ``JangPressPolicy/resolve(facts:)``.
-///    Precedence: explicit value > env (`JANGPRESS=...`) > `.auto`
-///    threshold (routed AND bundle > 0.5 × physical RAM).
-/// 3. ``LoadConfiguration/maxResidentBytes`` is applied as
-///    `MLX.Memory.cacheLimit` for the duration of the load call,
-///    restored on return.
-/// 4. The model is loaded normally.
-/// 5. JangPress tiers are activated per the resolved options (or
-///    skipped when the resolved options are ``JangPressLoadOptions/disabled``).
-///
-/// **Caller contract**: hold the returned `JangPressRuntime` alive for
-/// the model session. Pair it with the `ModelContext` in the caller's
-/// session struct. To shut JangPress down before model unload, call
-/// `JangPressActivation.deactivate(runtime)`.
-///
-/// - Parameters:
-///   - directory: directory of configuration and weights
-///   - tokenizerLoader: the ``TokenizerLoader`` to use for loading the tokenizer
-///   - loadConfiguration: typed JangPress + resident-cap policy.
-///     Defaults to ``LoadConfiguration/default`` (JangPress disabled,
-///     70%-of-physical-RAM cache/memory caps, mmap safetensors on).
-/// - Returns: tuple of (`ModelContext`, `JangPressRuntime`)
+/// Load a context with typed allocation, residency, parser and model settings.
+/// Safetensors remain canonical; no parallel cold-weight tier is created.
 public func loadModel(
     from directory: URL,
     using tokenizerLoader: any TokenizerLoader,
     loadConfiguration: LoadConfiguration
-) async throws -> (ModelContext, JangPressRuntime) {
+) async throws -> ModelContext {
     try await loadModel(
         from: directory,
         using: tokenizerLoader,
@@ -598,36 +493,26 @@ public func loadModel(
     using tokenizerLoader: any TokenizerLoader,
     configuration: ModelConfiguration,
     loadConfiguration: LoadConfiguration
-) async throws -> (ModelContext, JangPressRuntime) {
+) async throws -> ModelContext {
     // 1. Inspect bundle once.
+    var loadTiming = ModelLoadTiming(scope: "runtime")
     let facts = LoadBundleFacts.inspect(bundleURL: directory)
-    let useMmapSafetensors = facts.resolveMmapSafetensors(
-        requested: loadConfiguration.useMmapSafetensors)
-    let memoryLimit = facts.resolveMLXMemoryLimit(
-        requested: loadConfiguration.memoryLimit)
+    loadTiming.mark("bundle_inspection")
+    let memoryLimit = loadConfiguration.resolvedSchedulingMemoryLimit(
+        facts: facts, recommendedWorkingSetBytes: MLX.GPU.maxRecommendedWorkingSetBytes())
     let nativeResidentPoolCeiling =
         applyResidentPoolProcessMemoryLimitsIfNeeded(
             facts: facts,
             allocatorCacheLimit: loadConfiguration.maxResidentBytes
                 .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory))
-    if loadConfiguration.useMmapSafetensors && !useMmapSafetensors {
-        let reason = "Resident affine bundle selected materialized safetensors for production decode"
-        FileHandle.standardError.write(
-            Data(
-                "[Load] \(reason)\n".utf8))
-    }
     if loadConfiguration.memoryLimit != memoryLimit {
-        FileHandle.standardError.write(
+        LoadDiagnostics.write(
             Data(
-                "[Load] Resident affine bundle uses RAM admission instead of the decode-throttling MLX memory limit\n"
+                (facts.customRoutedFormat == .janghV2
+                    ? "[Load] Automatic JANGH scheduling budget includes mapped weights plus scratch headroom; explicit limits and physical-memory admission remain separate\n"
+                    : "[Load] Resident affine bundle uses RAM admission instead of the decode-throttling MLX memory limit\n")
                     .utf8))
     }
-
-    // 2. Resolve JangPress policy → concrete options.
-    let resolvedOptions: JangPressLoadOptions =
-        facts.requiresResidentSafetensors
-        ? .disabled
-        : loadConfiguration.jangPress.resolve(facts: facts)
 
     // 3. Apply resident cap (allocator pool) for the duration of load.
     //    Skipped when `.unlimited` so existing iter-25 in-loader cap
@@ -652,101 +537,46 @@ public func loadModel(
         }
     }
 
-    // 3b. Apply MLX memory budget cap. This bounds the total MLX
-    //     allocation pool — calls to malloc wait on scheduled tasks if
-    //     the cap is hit. Persists for the process lifetime (no defer
-    //     restore) since the cap is a sensible default, not a load-only
-    //     override. Last-writer-wins across multiple loads — a future
-    //     refinement could compose via WiredMemoryManager tickets.
-    //
-    //     SAFETY: every cap is clamped to recommendedMaxWorkingSetBytes
-    //     so we never trip Apple's "limit larger than max working set
-    //     size" rejection (the original 847a8c7 crash condition). See
-    //     docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md.
-    if nativeResidentPoolCeiling == nil,
-        let rawCap =
-            memoryLimit
-            .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory)
-    {
-        let workingSetCap = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
-        let safeCap = max(
-            1 * 1024 * 1024 * 1024,  // never below 1 GB
-            min(rawCap, workingSetCap))
-        MLX.Memory.memoryLimit = safeCap
+    // 3b. Apply the process-wide MLX allocator scheduling/reuse budget.
+    // This fork drains reusable buffers at the GC threshold; it is not a
+    // physical-footprint cap. Respect explicit limits and the device ceiling.
+    if nativeResidentPoolCeiling == nil {
+        applyLoadProcessMemoryLimit(memoryLimit, physicalMemory: facts.physicalMemory)
     }
 
-    // 3c. Raise the MLX WIRED limit to keep the model's weights GPU-resident.
-    //     MLX's default wired limit is ~75% of the recommended working set, so
-    //     a model larger than that has its pages SWAPPED on every eval — Metal
-    //     command-buffer stalls (observed live: a 95 GB bundle pinned memory
-    //     and thrashed ~15-20 GB of swap, warmup never finished, while the same
-    //     bundle multiturns fine on the Python engine, which does exactly this
-    //     at load). Mirror `_set_wired_limit_for_model`: wire the model plus
-    //     headroom (max(16 GB, 30% of weights) — routed-expert dequant + KV +
-    //     Metal scratch spike past a flat 8 GB on big MoE bundles), CLAMPED to
-    //     the OS working set so we never trip Apple's "limit larger than max
-    //     working set" rejection. Only ever ADVISES the allocator by RAISING a
-    //     limit — it never blocks or refuses a load, and a small model simply
-    //     gets a smaller (cheaper) residency set. The user can lift the OS cap
-    //     with `sudo sysctl iogpu.wired_limit_mb=<MB>`.
-    //     SAFETY: wired pages can't be reclaimed, so this only RAISES the limit
-    //     when the whole model fits inside a safe physical-RAM reserve. On a
-    //     constrained Mac where the model is a large fraction of RAM it leaves
-    //     the swappable default instead of wiring the machine into a
-    //     memory-pressure panic (osaurus#2612). See `modelResidencyWiredTarget`.
-    if facts.totalSafetensorsBytes > 0 {
-        let modelBytes = Int(clamping: facts.totalSafetensorsBytes)
-        let workingSet = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
-        let physical = Int(clamping: facts.physicalMemory)
-        if let target = modelResidencyWiredTarget(
-            modelBytes: modelBytes,
-            workingSet: workingSet,
-            physicalMemory: physical)
-        {
-            setModelResidencyWiredLimit(target)
-        }
-    }
+    // 3c. Apply the selected model-residency budget. Unlike the allocator
+    // reuse budget above, wiring makes pages non-reclaimable. The policy must
+    // leave an OS reserve and respect the reported Metal ceiling. SSD-only
+    // n-gram tables are excluded from weight accounting.
+    let modelBytes = Int(clamping: facts.gpuResidentWeightBytes)
+    let workingSet = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
+    let physical = Int(clamping: facts.physicalMemory)
+    // Keep other contexts' residency intact. This snapshot includes existing
+    // process wiring; the report describes headroom before this incoming load.
+    let wireBudget = SystemWireBudget.snapshot()
+    let residency = ModelResidency.shared.acquire(.init(
+        weightBytes: modelBytes, enabled: loadConfiguration.keepModelInMemory,
+        physicalMemory: physical, workingSet: workingSet,
+        systemWireLimit: wireBudget.userWireLimitBytes))
+    let residencyTarget = residency.target > 0 ? residency.target : nil
+    let residencyApplied = residency.applied
+    let wireReport = ModelWireBudgetReport(
+        modelBytes: modelBytes, budget: wireBudget, residencyTargetBytes: residencyTarget)
+    ModelWireBudgetReport.recordLastLoad(wireReport)
+    LoadDiagnostics.write(
+        Data(
+            "[Load] Model residency requested=\(loadConfiguration.keepModelInMemory) target_bytes=\(residencyTarget ?? 0) weight_bytes=\(modelBytes) working_set_bytes=\(workingSet) applied=\(residencyApplied)\n".utf8))
+    LoadDiagnostics.write(Data("\(wireReport.logLine)\n".utf8))
+    loadTiming.mark("memory_and_residency")
 
-    // 4. Optional disk-layout preparation. The permanent prestacked
-    //    safetensors overlay is now explicit opt-in via
-    //    MLXPRESS_PRESTACK=1 / JANGPRESS_PRESTACK=1. MLXPress's normal
-    //    low-RAM route is compression-first canonical mmap residency:
-    //    load routed tensors as regular model weights through the C++
-    //    whole-shard mmap loader, then use cold-page advice and OS
-    //    compression/reclaim instead of a large stacked cache overlay.
-    //    Active-expert pread streaming is an explicit fallback/diagnostic
-    //    path only. Before mmap, ordinary writable model directories are
-    //    healed only with direct-Send authorization AND explicit repair opt-in.
-    //    The older side-copy alignment overlay remains separately
-    //    gated by MLXPRESS_ALIGN_* / JANGPRESS_ALIGN_*.
-    let loadDirectory = try JangPressPrestacker.prepareBundleIfNeeded(
-        originalURL: directory,
-        enabled: useMmapSafetensors,
-        alignmentRepairAuthorization: loadConfiguration.alignmentRepairAuthorization)
+    // Load original packed bytes into owned allocations; alignment repair and
+    // mapped/prestacked overlays are no longer part of the production factory.
+    let loadDirectory = directory
+    loadTiming.mark("bundle_preparation")
 
-    // 5. Load the model normally. Patched osaurus mlx-swift pins honor
-    //    MLX_SAFETENSORS_MMAP=1 inside loadArraysAndMetadata(url:),
-    //    making the canonical weight storage mmap-backed instead of a
-    //    pread() copy. Older pins ignore the env knob.
-    // Tensor-buffer mmap is a diagnostics/future-offset-kernel knob, not a
-    // production default. Once the C++ loader began honoring it, MiniMax-Small
-    // proved that wrapping every tensor span as its own Metal buffer increases
-    // load time without lowering Activity Monitor footprint; the real blocker
-    // is model sanitize replacing routed mmap tensors with full stacked banks.
-    let tensorBuffersRaw =
-        ProcessInfo.processInfo.environment["MLXPRESS_MMAP_TENSOR_BUFFERS"]
-        ?? ProcessInfo.processInfo.environment["JANGPRESS_MMAP_TENSOR_BUFFERS"]
-        ?? ""
-    let useTensorMmapBuffers =
-        useMmapSafetensors
-        && resolvedOptions.enabled
-        && resolvedOptions.backend == .mmap
-        && ["1", "true", "on", "yes"].contains(tensorBuffersRaw.lowercased())
-    var context = try await withMmapSafetensorsEnv(
-        enabled: useMmapSafetensors,
-        tensorBuffers: useTensorMmapBuffers,
-        startColdPercent: useTensorMmapBuffers ? resolvedOptions.compressPct : nil
-    ) {
+    // Owned tensor storage is the single model-loading path. No process-wide
+    // mmap environment mutation around an async factory operation.
+    var context = try await {
         try await DeepseekV4ActivationQAT.withExplicitRequest(
             loadConfiguration.deepseekV4ActivationQAT
         ) {
@@ -763,37 +593,62 @@ public func loadModel(
                 }
             }
         }
-    }
-    _ = adviseCanonicalMmapRoutedExpertsIfAvailable(
-        options: resolvedOptions,
-        mmapEnabled: useMmapSafetensors)
-    JangPressCanonicalExpertAdvisor.shared.configure(
-        options: resolvedOptions,
-        mmapEnabled: useMmapSafetensors,
-        numRoutedExperts: facts.numRoutedExperts,
-        topK: facts.topK)
+    }()
+    loadTiming.mark("factory_load")
 
-    // 5. Activate JangPress per resolved options. `.disabled` short-
-    //    circuits inside `JangPressActivation.activate` and returns
-    //    `.none` so the caller still gets a uniform tuple shape.
-    let runtime = JangPressActivation.activate(
-        bundleURL: loadDirectory, options: resolvedOptions)
-    if JangPressPrestacker.cleanupEphemeralPrestackDirectory(loadDirectory) {
-        context.configuration.id = .directory(directory)
+    context.residencyLease = residency.lease
+    loadTiming.mark("runtime_activation")
+    return context
+}
+
+/// The existing Metal allocator's startup ceiling (allocator.cpp), also used
+/// when a host removes a previously applied load-profile limit. This is an
+/// engine default, separate from RAM admission and model residency wiring.
+private func nativeMLXAllocatorMemoryLimit(
+    physicalMemory: UInt64, recommendedWorkingSetBytes: Int?
+) -> Int {
+    let physical = Int(clamping: physicalMemory)
+    let physical95 = (physical / 20) * 19 + ((physical % 20) * 19) / 20
+    let recommended150: Int = {
+        guard let recommendedWorkingSetBytes else { return Int.max }
+        let half = recommendedWorkingSetBytes / 2
+        guard recommendedWorkingSetBytes <= Int.max - half else { return Int.max }
+        return recommendedWorkingSetBytes + half
+    }()
+    return max(1 << 30, min(physical95, recommended150))
+}
+
+/// Apply a load's process-wide total scheduling limit, which remains active
+/// during inference. Unlike a temporary cache-pool override, explicit
+/// `.unlimited` must remove the preceding model/profile's limit by restoring
+/// the native allocator ceiling. It must not retain stale process state.
+@discardableResult
+func applyLoadProcessMemoryLimit(
+    _ limit: ResidentCap,
+    physicalMemory: UInt64,
+    recommendedWorkingSetBytes: Int? = MLX.GPU.maxRecommendedWorkingSetBytes()
+) -> Int {
+    let applied: Int
+    if let raw = limit.applyAsCacheLimitInt(physicalMemory: physicalMemory) {
+        applied = max(1 << 30, min(raw, recommendedWorkingSetBytes ?? Int.max))
+    } else {
+        applied = nativeMLXAllocatorMemoryLimit(
+            physicalMemory: physicalMemory,
+            recommendedWorkingSetBytes: recommendedWorkingSetBytes)
     }
-    context.jangPressRuntime = runtime
-    return (context, runtime)
+    MLX.Memory.memoryLimit = applied
+    return applied
 }
 
 /// Apply the existing resident-pool policy to MLX's process-wide ceilings.
 ///
-/// An `.unlimited` resolved cap produces no integer assignment. Without an
-/// explicit reset, a preceding capped model leaves its limit active for the
-/// next model. Both the loader and policy resolver must use the same bundle
-/// property: selecting this application step by a separate architecture check
-/// left GLM's advertised unlimited policy running under the previous 70% cap.
-/// Pre-load RAM admission remains the host's gate; this restores the native
-/// MLX ceilings only for bundles already selected by that policy.
+/// These bundles keep both native total and reuse-pool ceilings for decode.
+/// Both the loader and policy resolver must use the same bundle property:
+/// selecting this step by a separate architecture check left GLM's advertised
+/// unlimited policy running under the previous 70% cap. Ordinary explicit
+/// unlimited loads reset only the total budget via `applyLoadProcessMemoryLimit`;
+/// their load-time pool and host-owned inference pool remain separate.
+/// Pre-load RAM admission remains the host's gate.
 @discardableResult
 func applyResidentPoolProcessMemoryLimitsIfNeeded(
     facts: LoadBundleFacts,
@@ -802,22 +657,17 @@ func applyResidentPoolProcessMemoryLimitsIfNeeded(
 ) -> Int? {
     guard facts.requiresUncappedResidentPools else { return nil }
 
-    let physical = Int(clamping: facts.physicalMemory)
-    let physical95 = (physical / 20) * 19 + ((physical % 20) * 19) / 20
-    let recommended150: Int = {
-        guard let recommendedWorkingSetBytes else { return Int.max }
-        let half = recommendedWorkingSetBytes / 2
-        guard recommendedWorkingSetBytes <= Int.max - half else { return Int.max }
-        return recommendedWorkingSetBytes + half
-    }()
-    let nativeCeiling = max(1 << 30, min(physical95, recommended150))
+    let nativeCeiling = nativeMLXAllocatorMemoryLimit(
+        physicalMemory: facts.physicalMemory,
+        recommendedWorkingSetBytes: recommendedWorkingSetBytes)
     let previousMemoryLimit = MLX.Memory.memoryLimit
     let previousCacheLimit = MLX.Memory.cacheLimit
     MLX.Memory.memoryLimit = nativeCeiling
     MLX.Memory.cacheLimit = min(nativeCeiling, max(0, allocatorCacheLimit ?? nativeCeiling))
     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] != nil {
-        FileHandle.standardError.write(Data(
-            ("[Load] resident-pool limits model_type=\(facts.modelType ?? "unknown") "
+        LoadDiagnostics.write(
+            Data(
+                ("[Load] resident-pool limits model_type=\(facts.modelType ?? "unknown") "
                 + "previous_memory=\(previousMemoryLimit) previous_cache=\(previousCacheLimit) "
                     + "native_ceiling=\(nativeCeiling) allocator_ceiling=\(MLX.Memory.cacheLimit)\n")
                     .utf8))
@@ -874,139 +724,7 @@ private func load<R>(loader: (ModelFactory) async throws -> sending R) async thr
     }
 }
 
-private func withMmapSafetensorsEnv<R>(
-    enabled: Bool,
-    tensorBuffers: Bool,
-    startColdPercent: Int?,
-    _ body: () async throws -> R
-) async throws -> R {
-    #if canImport(Darwin) || canImport(Glibc)
-        let mmapKey = "MLX_SAFETENSORS_MMAP"
-        let vmlxMmapKey = "VMLX_MMAP_SAFETENSORS"
-        // The consumer is `mmap_safetensors_enabled` in the MLX C++ submodule, which reads
-        // MLX_SAFETENSORS_MMAP or the LEGACY spelling — not this one. Writing only the new name
-        // made this a dead write; mmap kept working solely because MLX_SAFETENSORS_MMAP is set
-        // beside it. Write both until the submodule reads the new name too.
-        let legacyVmlxMmapKey = RuntimeEnvironment.legacyName(of: vmlxMmapKey)!
-        let tensorKey = "MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"
-        let startColdKey = "MLX_SAFETENSORS_MMAP_START_COLD"
-        let coldPctKey = "MLX_SAFETENSORS_MMAP_COLD_PCT"
-        let priorMmap = getenv(mmapKey).map { String(cString: $0) }
-        let priorVmlxMmap = getenv(vmlxMmapKey).map { String(cString: $0) }
-        let priorLegacyVmlxMmap = getenv(legacyVmlxMmapKey).map { String(cString: $0) }
-        let priorTensor = getenv(tensorKey).map { String(cString: $0) }
-        let priorStartCold = getenv(startColdKey).map { String(cString: $0) }
-        let priorColdPct = getenv(coldPctKey).map { String(cString: $0) }
-        if enabled {
-            setenv(mmapKey, "1", 1)
-            setenv(vmlxMmapKey, "1", 1)
-            setenv(legacyVmlxMmapKey, "1", 1)
-            if tensorBuffers {
-                setenv(tensorKey, "1", 1)
-            }
-            if let startColdPercent, startColdPercent > 0 {
-                setenv(startColdKey, "1", 1)
-                setenv(
-                    coldPctKey,
-                    String(max(0, min(100, startColdPercent))),
-                    1)
-            }
-        } else {
-            unsetenv(mmapKey)
-            unsetenv(vmlxMmapKey)
-            unsetenv(tensorKey)
-            unsetenv(startColdKey)
-            unsetenv(coldPctKey)
-        }
-        defer {
-            if let priorMmap {
-                setenv(mmapKey, priorMmap, 1)
-            } else {
-                unsetenv(mmapKey)
-            }
-            if let priorVmlxMmap {
-                setenv(vmlxMmapKey, priorVmlxMmap, 1)
-            } else {
-                unsetenv(vmlxMmapKey)
-            }
-            if let priorLegacyVmlxMmap {
-                setenv(legacyVmlxMmapKey, priorLegacyVmlxMmap, 1)
-            } else {
-                unsetenv(legacyVmlxMmapKey)
-            }
-            if let priorTensor {
-                setenv(tensorKey, priorTensor, 1)
-            } else {
-                unsetenv(tensorKey)
-            }
-            if let priorStartCold {
-                setenv(startColdKey, priorStartCold, 1)
-            } else {
-                unsetenv(startColdKey)
-            }
-            if let priorColdPct {
-                setenv(coldPctKey, priorColdPct, 1)
-            } else {
-                unsetenv(coldPctKey)
-            }
-        }
-    #endif
-    return try await body()
-}
 
-@discardableResult
-private func adviseCanonicalMmapRoutedExpertsIfAvailable(
-    options: JangPressLoadOptions,
-    mmapEnabled: Bool
-) -> Int64? {
-    guard mmapEnabled,
-        options.enabled,
-        options.backend == .mmap,
-        options.compressPct > 0
-    else { return nil }
-
-    #if canImport(Cmlx)
-        guard let adviseRouted = lookupSafetensorsMmapAdviseRouted() else {
-            return nil
-        }
-
-        let advised = adviseRouted(
-            0,  // 0 = cold advice; C++ defaults to MADV_DONTNEED and can be env-selected.
-            Int32(max(0, min(100, options.compressPct))))
-
-        let env = ProcessInfo.processInfo.environment
-        if advised > 0,
-            env["MLXPRESS_DEBUG"] == "1"
-                || env["JANGPRESS_DEBUG"] == "1"
-                || env["MLX_SAFETENSORS_MMAP_DEBUG"] == "1"
-        {
-            FileHandle.standardError.write(
-                Data(
-                    "[MLXPress] advised \(advised) canonical mmap routed bytes cold (pct=\(options.compressPct))\n"
-                        .utf8))
-        }
-        return advised
-    #else
-        return nil
-    #endif
-}
-
-#if canImport(Cmlx)
-    private typealias SafetensorsMmapAdviseRoutedFn =
-        @convention(c) (
-            Int32,
-            Int32
-        ) -> Int64
-
-    private func lookupSafetensorsMmapAdviseRouted() -> SafetensorsMmapAdviseRoutedFn? {
-        guard let handle = dlopen(nil, RTLD_NOW),
-            let symbol = dlsym(handle, "mlx_safetensors_mmap_advise_routed")
-        else {
-            return nil
-        }
-        return unsafeBitCast(symbol, to: SafetensorsMmapAdviseRoutedFn.self)
-    }
-#endif
 
 /// Protocol for types that can provide ModelFactory instances.
 ///

@@ -45,10 +45,58 @@ func makePromptBoundaryCacheSnapshot(from cache: [any KVCache]) -> [any KVCache]
 /// Standalone rotating/SWA caches retain their existing exact snapshot because
 /// their prompt/stable-boundary storage policy still consumes it.
 func makeRetainedExactPromptSnapshot(
-    from cache: [any KVCache]
+    from cache: [any KVCache],
+    storageEnabled: Bool = true
 ) -> [any KVCache]? {
+    // Auxiliary requests and coordinator-free batching never publish a prompt
+    // boundary. Do not allocate a sealed copy that only survives until cleanup.
+    guard storageEnabled else { return nil }
     guard !cacheRequiresPrefillCapturedDiskSeed(cache) else { return nil }
     return makePromptBoundaryCacheSnapshot(from: cache)
+}
+
+/// Hand an already-owned, evaluated prefill checkpoint to the disk writer.
+/// No model replay, live-cache mutation, or additional full snapshot is needed.
+/// A refusal leaves ownership with the iterator for its ordinary terminal store.
+/// The writer can still be in flight on return; it owns its arrays until completion.
+func storeCapturedHybridBoundary(
+    _ snapshot: [any KVCache],
+    tokens: [Int],
+    coordinator: CacheCoordinator,
+    mediaSalt: String?,
+    chainId: String?,
+    kvBits: Int? = nil,
+    kvMode: KVQuantizationMode,
+    kvGroupSize: Int,
+    quantizedKVStart: Int,
+    dflash2Context: DFlash2PrefixContext? = nil
+) -> Bool {
+    guard ProcessInfo.processInfo.environment["VMLX_STRIP_BOUNDARY_EARLY_SPILL"] != "0",
+          !Task.isCancelled,
+          coordinator.diskCache != nil,
+          coordinator.pagedCache == nil,
+          coordinator.isHybrid,
+          !tokens.isEmpty,
+          !snapshot.isEmpty,
+          !canTrimPromptCache(snapshot),
+          cacheBoundaryLeafOffsets(snapshot).allSatisfy({ $0 == tokens.count }),
+          CacheStoreBudget.canStore(snapshot)
+    else { return false }
+
+    // A paged hybrid may need intermediate recurrent seeds, not just this
+    // endpoint. Keep that existing path at turn end; this path is disk-only.
+    let states = exactBoundarySSMStatesFromSnapshotIfSufficient(
+        coordinator: coordinator, snapshot: snapshot, tokenCount: tokens.count)
+    guard !coordinator.requiresSeparateRecurrentPayload || states != nil else { return false }
+    let diskCache = makeDiskStoreCache(
+        fromPromptBoundary: snapshot, kvBits: kvBits,
+        kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart,
+        kvMode: kvMode)
+    coordinator.storeAfterGeneration(
+        promptTokens: tokens, perLayerData: [], ssmStates: states, cache: diskCache,
+        mediaSalt: mediaSalt, chainId: chainId, isResumeBoundary: true,
+        dflash2Context: dflash2Context)
+    return coordinator.hasValidatedDiskEntry(tokens: tokens, mediaSalt: mediaSalt)
 }
 
 /// Build the cache object list passed to ``TQDiskSerializer`` from a clean
@@ -136,6 +184,51 @@ func makeDiskStoreCache(
         kvMode: parameters.kvMode)
 }
 
+/// Materialize compiled rotating metadata once at the host storage boundary.
+/// Call while the request still owns the cache, before offset admission or copy().
+/// Never call inside a compiled forward: device counters remain the trace state.
+func synchronizeCompiledRotatingCacheMetadataForStorage(_ cache: [any KVCache]) {
+    var rotating: [CompilableRotatingKVCache] = []
+    var seen = Set<ObjectIdentifier>()
+    func visit(_ layer: any KVCache) {
+        if let compiled = layer as? CompilableRotatingKVCache {
+            if seen.insert(ObjectIdentifier(compiled)).inserted { rotating.append(compiled) }
+        } else if let list = layer as? CacheList {
+            for index in 0..<list.count { visit(list[index]) }
+        } else if let wrapper = layer as? RotatingKVCacheWrapper {
+            visit(wrapper.rotating)
+        }
+    }
+    cache.forEach(visit)
+    guard !rotating.isEmpty else { return }
+    MLX.eval(rotating.flatMap { [$0.idxArray, $0.offsetArray] })
+    // Read every counter before publishing metadata. Do not change device
+    // arrays or their wrappers, which may still belong to a reusable trace.
+    let counters = rotating.map { ($0.idxArray.item(Int.self), $0.offsetArray.item(Int.self)) }
+    for (layer, counters) in zip(rotating, counters) {
+        layer.idx = counters.0
+        layer.offset = counters.1
+    }
+}
+
+/// Composite caches carry their position in leaves, not the parent offset.
+/// The coordinator subsequently requires exact agreement for every leaf.
+func cacheCoversTokenCount(_ tokenCount: Int, cache: [any KVCache]) -> Bool {
+    (cacheBoundaryLeafOffsets(cache).max() ?? 0) >= tokenCount
+}
+
+/// Token boundaries belong to leaves, not CacheList's unused inherited offset.
+/// An empty composite contributes an invalid boundary rather than disappearing.
+func cacheBoundaryLeafOffsets(_ cache: [any KVCache]) -> [Int] {
+    cache.flatMap { layer -> [Int] in
+        if let list = layer as? CacheList {
+            guard list.count > 0 else { return [0] }
+            return cacheBoundaryLeafOffsets((0..<list.count).map { list[$0] })
+        }
+        return [layer.offset]
+    }
+}
+
 /// Fail-closed validation of a coordinator cache restore.
 ///
 /// A hit restores two independently derived lengths: attention layers take
@@ -159,10 +252,11 @@ public func validateRestoredCacheBoundary(
     restoredTokens: Int,
     detail: String = ""
 ) -> Bool {
-    let offsets = cache.map(\.offset)
+    let offsets = cacheBoundaryLeafOffsets(cache)
     let consistent =
         matchedTokens > 0
         && restoredTokens == matchedTokens
+        && !offsets.isEmpty
         && offsets.allSatisfy { $0 == matchedTokens }
     if !consistent {
         let unique = Array(Set(offsets)).sorted()
@@ -171,9 +265,9 @@ public func validateRestoredCacheBoundary(
             + "matched=\(matchedTokens) restored=\(restoredTokens) offsets=\(unique)"
         // Always visible: a refused restore is the difference between one
         // extra prefill and a whole corrupted continuation.
-        FileHandle.standardError.write(Data((message + "\n").utf8))
+        RuntimeDiagnostics.write(Data((message + "\n").utf8))
     } else if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] != nil {
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[vmlx][cache/restore] ACCEPTED detail=\(detail) boundary=\(matchedTokens) layers=\(cache.count)\n".utf8))
     }
     return consistent
@@ -207,12 +301,31 @@ public func cacheContainsPathDependentState(_ cache: [any KVCache]) -> Bool {
 /// This includes path-dependent recurrent caches plus sliding-window /
 /// hybrid-pool layers whose ring or pool metadata is not represented by
 /// plain paged KV blocks.
+/// A disk-backed cache whose state at a stored boundary is exactly the rows its forward produced for those tokens:
+/// no recurrent, pooled, rotated-ring or quantized state, so a restore followed by the suffix prefill differs from a
+/// cold prefill only by chunk rounding, exactly like a plain KV cache. Forced tool selection
+/// (`CacheRestorePolicy.freshRequiredToolSelection`) skips disk restore only for disk-backed topologies WITHOUT this
+/// property; plain KV keeps its normal reuse under the same policy.
+public protocol ExactPrefixRestoreCache {}
+
+/// True when every layer is either an ordinary (not disk-backed) cache or an ``ExactPrefixRestoreCache``.
+public func cacheRestoreIsExactPrefix(_ cache: [any KVCache]) -> Bool {
+    !cache.isEmpty && cache.allSatisfy { layer in
+        if let list = layer as? CacheList { return cacheRestoreIsExactPrefix((0 ..< list.count).map { list[$0] }) }
+        return layer is ExactPrefixRestoreCache || !cacheRequiresDiskBackedCoordinatorRestore([layer])
+    }
+}
+
 public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) -> Bool {
     if cacheContainsPathDependentState(cache) {
         return true
     }
     return cache.contains { layer in
-        layer is DiskCacheStateProviding ||
+        if let list = layer as? CacheList {
+            return cacheRequiresDiskBackedCoordinatorRestore(
+                (0..<list.count).map { list[$0] })
+        }
+        return layer is DiskCacheStateProviding ||
             layer is HybridPoolCache ||
             layer is RotatingKVCache ||
             layer is RotatingKVCacheWrapper ||
@@ -784,7 +897,8 @@ public func restoreSSMStates(
 ///   - arrays: The disk cache dictionary loaded via `DiskCache.fetch()`.
 ///   - cache: The model's per-layer KV cache array to restore into.
 /// - Returns: The total number of tokens restored, measured from the first
-///   attention layer's key tensor sequence dim, or `0` if nothing matched.
+///   attention layer's key tensor sequence dim or a typed recurrent offset,
+///   or `0` if nothing matched.
 @discardableResult
 public func restoreFromDiskArrays(
     _ arrays: [String: MLXArray], into cache: inout [any KVCache],
@@ -871,7 +985,17 @@ private func restoreFromV2Arrays(
             if case .qkv = entry.data { return 0 }
             continue
         }
+        if cache[entry.index] is NonQuantizableKVCache {
+            switch entry.data {
+            case .tq, .qkv: return 0
+            default: break
+            }
+        }
         switch entry.data {
+        case .qsaKV(let component):
+            guard let qsa = cache[entry.index] as? QSAKVCache,
+                  !qsa.requiresMediaPositionOffset || component.mediaPositionOffset != nil
+            else { return 0 }
         case .mamba, .cacheList:
             guard canRestoreMambaRecords(entry.data, into: cache[entry.index]) else { return 0 }
         case .qkv(let comp):
@@ -939,7 +1063,7 @@ private func restoreFromV2Arrays(
             // the caller re-prefills instead of fatal-trapping. Belt &
             // suspenders on top of v2 layer-kind tagging.
             guard keys.shape.count >= 3, values.shape.count >= 3 else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[disk cache] restore SKIPPED: layer \(i) has incompatible shape (k=\(keys.shape) v=\(values.shape)). Need >= 3D. Falling back to fresh prefill.\n".utf8))
                 return 0
             }
@@ -950,7 +1074,7 @@ private func restoreFromV2Arrays(
             // record predates the `.qsaKV` kind — refuse the whole entry
             // (one re-prefill) instead of diverging.
             guard !(cache[i] is QSAKVCache) else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[disk cache] restore SKIPPED: layer \(i) is a QSA layer but the stored record has no indexer lane (pre-qsaKV entry). Falling back to fresh prefill.\n".utf8))
                 return 0
             }
@@ -973,12 +1097,12 @@ private func restoreFromV2Arrays(
             guard keys.shape.count >= 3, values.shape.count >= 3,
                 indexer.shape.count >= 3
             else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[disk cache] restore SKIPPED: QSA layer \(i) has incompatible shape (k=\(keys.shape) v=\(values.shape) idx=\(indexer.shape)). Falling back to fresh prefill.\n".utf8))
                 return 0
             }
             guard let qsa = cache[i] as? QSAKVCache else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[disk cache] restore SKIPPED: stored QSA record for layer \(i) but the live cache is \(type(of: cache[i])). Falling back to fresh prefill.\n".utf8))
                 return 0
             }
@@ -986,11 +1110,12 @@ private func restoreFromV2Arrays(
             // `state`'s setter derives offset from keys, and a shorter lane
             // would recreate the divergence this record exists to prevent.
             guard indexer.dim(1) == keys.dim(2) else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[disk cache] restore SKIPPED: QSA layer \(i) indexer lane length \(indexer.dim(1)) != KV offset \(keys.dim(2)). Falling back to fresh prefill.\n".utf8))
                 return 0
             }
             qsa.state = [keys, values, indexer]
+            qsa.mediaPositionOffset = comp.mediaPositionOffset
             if totalTokens == 0 {
                 totalTokens = keys.dim(2)
             }
@@ -1003,10 +1128,11 @@ private func restoreFromV2Arrays(
             if totalTokens == 0 { totalTokens = header.offset }
 
         case .mamba(let comp):
-            // Mamba state arrays are cumulative — no sequence dim to
-            // measure, so they don't contribute to `totalTokens`. The
-            // attention side already provides that number.
+            // All-recurrent models have no attention tensor from which to
+            // recover a sequence length. The typed snapshot records the
+            // logical recurrent boundary explicitly.
             guard restoreMambaLayer(comp, into: cache[i]) else { return 0 }
+            if totalTokens == 0 { totalTokens = comp.offset }
 
         case .tq(let comp):
             // Restore the compressed prefix into the existing
@@ -1125,6 +1251,7 @@ private func restoreFromV2Arrays(
                 case .mamba(let comp):
                     guard restoreMambaLayer(comp, into: list[subIndex])
                     else { return 0 }
+                    if totalTokens == 0 { totalTokens = comp.offset }
 
                 case .rotating(let comp):
                     restoreRotatingLayer(comp, into: list[subIndex])
@@ -1273,7 +1400,7 @@ private func restoreKVLayer(
         // entries predate qwen4_exp and CacheList never wraps QSA, so this
         // is a defense-in-depth backstop for future call sites. Loud no-op:
         // the layer stays empty rather than becoming inconsistent.
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[disk cache] restoreKVLayer REFUSED: 2-array record for a QSAKVCache (would drop the indexer lane).\n".utf8))
         return
     }
@@ -1544,7 +1671,20 @@ private func canRestoreDeepseekV4Layer(
     guard validPool(comp.poolComp), validPool(comp.poolIdx) else { return false }
 
     if comp.quantizedPoolComp != nil || comp.quantizedPoolIdx != nil {
-        guard layer is QuantizedHybridPoolCache else { return false }
+        guard let quantized = layer as? QuantizedHybridPoolCache else { return false }
+        // A record encoded at another width (e.g. 8-bit DSV4-0731 pools into a
+        // 4-bit DeepSeek-V4.1 cache) is refused rather than mixed.
+        let bits = quantized.hybridPoolQuantizationBits
+        let segments = (comp.quantizedPoolComp ?? []) + (comp.quantizedPoolIdx ?? [])
+        guard segments.allSatisfy({ $0.bits == bits }) else { return false }
+    }
+    // DeepSeek-V4.1: a prefix is only reusable with the Engram n-gram tail
+    // that ends exactly at its offset. Refuse (re-prefill) rather than let
+    // the suffix hash against a guessed/padded history.
+    if hybrid.requiresAuxiliaryTokenHistory, comp.offset > 0 {
+        guard let history = comp.auxiliaryTokenHistory,
+              history.endPosition == comp.offset
+        else { return false }
     }
     return true
 }
@@ -1584,6 +1724,14 @@ private func restoreDeepseekV4Layer(
         hybrid.setHybridBuffers(
             branch: .indexer,
             kv: comp.bufIdxKV, gate: comp.bufIdxGate)
+        if hybrid.requiresAuxiliaryTokenHistory || comp.auxiliaryTokenHistory != nil {
+            var mutable = hybrid
+            mutable.auxiliaryTokenHistory = comp.auxiliaryTokenHistory
+        }
+        // dSpark draft-window tail: kept only when it ends exactly at the restored offset.
+        var mutable = hybrid
+        mutable.auxiliaryHiddenTail =
+            comp.auxiliaryHiddenTail?.endPosition == comp.offset ? comp.auxiliaryHiddenTail : nil
         return true
     }
     return apply(hybrid)
@@ -1716,7 +1864,10 @@ private func restoreMambaLayer(
     // Restore by index: compactMap would shift an occupied slot across a nil
     // hole. Also clear scratch left over from a previous verify request.
     for slot in 0..<mamba.slotCount {
-        mamba[slot] = comp.occupiedStates[slot]
+        // ArraysCache updates occupied wrappers in place. Adopting the disk
+        // dictionary's wrapper lets one continuation mutate the source and
+        // sibling restores. Own the recurrent state just as cache.copy() does.
+        mamba[slot] = comp.occupiedStates[slot].map(ownedStateCopy)
     }
     mamba.clearVerifyStaging()
     mamba.offset = comp.offset

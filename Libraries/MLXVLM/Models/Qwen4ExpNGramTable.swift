@@ -1,6 +1,10 @@
 // Copyright © 2026 Apple Inc.
 
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 import MLXLMCommon
 
@@ -54,8 +58,9 @@ private struct Qwen4ExpTensorDescriptor: Sendable {
 /// Minimal safetensors descriptor reader for Qwen PLE.
 ///
 /// This is deliberately independent of model residency tiers and never mmaps payloads.
-/// The header and requested rows are read with `pread` from an `F_NOCACHE`
-/// descriptor so the multi-gigabyte n-gram table remains an SSD lookup table.
+/// The header and requested rows are read with `pread` through the unified page cache (reclaimable;
+/// `Qwen4ExpNGramTable.warmPageCache` fills it once after load). `VMLX_QWEN4_PLE_NOCACHE=1` restores the
+/// previous `F_NOCACHE` descriptor (every lookup an SSD read).
 private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
     let url: URL
     let fileSize: UInt64
@@ -63,7 +68,11 @@ private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
     private let tensors: [String: Qwen4ExpTensorDescriptor]
 
     init(url: URL) throws {
+        #if canImport(Darwin)
         let opened = Darwin.open(url.path, O_RDONLY)
+        #else
+        let opened = Glibc.open(url.path, O_RDONLY)
+        #endif
         guard opened >= 0 else {
             throw Qwen4ExpNGramTableError.openFailed(url, errno)
         }
@@ -73,9 +82,13 @@ private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
                 throw Qwen4ExpNGramTableError.statFailed(url, errno)
             }
             let size = UInt64(status.st_size)
-            guard fcntl(opened, F_NOCACHE, 1) == 0 else {
-                throw Qwen4ExpNGramTableError.noCacheFailed(url, errno)
+            #if canImport(Darwin)
+            if Qwen4ExpNGramTable.uncachedReads {
+                guard fcntl(opened, F_NOCACHE, 1) == 0 else {
+                    throw Qwen4ExpNGramTableError.noCacheFailed(url, errno)
+                }
             }
+            #endif
             guard size >= 8 else {
                 throw Qwen4ExpNGramTableError.truncatedHeader(url)
             }
@@ -115,12 +128,20 @@ private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
             self.fd = opened
             self.tensors = parsed
         } catch {
+            #if canImport(Darwin)
             Darwin.close(opened)
+            #else
+            Glibc.close(opened)
+            #endif
             throw error
         }
     }
 
+    #if canImport(Darwin)
     deinit { Darwin.close(fd) }
+    #else
+    deinit { Glibc.close(fd) }
+    #endif
 
     func descriptor(for name: String) -> Qwen4ExpTensorDescriptor? {
         tensors[name]
@@ -145,9 +166,15 @@ private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
         while completed < count {
             let amount = data.withUnsafeMutableBytes { bytes -> Int in
                 guard let base = bytes.baseAddress else { return 0 }
+                #if canImport(Darwin)
                 return Darwin.pread(
                     fd, base.advanced(by: completed), count - completed,
                     off_t(range.lowerBound) + off_t(completed))
+                #else
+                return Glibc.pread(
+                    fd, base.advanced(by: completed), count - completed,
+                    off_t(range.lowerBound) + off_t(completed))
+                #endif
             }
             guard amount > 0 else {
                 throw Qwen4ExpNGramTableError.readFailed(
@@ -199,6 +226,133 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         }
     }
 
+    /// `VMLX_QWEN4_PLE_NOCACHE=1`: per-token row reads bypass the page cache (the previous default).
+    ///
+    /// WHY page-cached by default (2026-10-06, max2, external PCIe SSD, Flash-Next JANG_4S): with
+    /// F_NOCACHE every decode token issued ~48 synchronous 16 KB SSD reads (iostat: 1,000-1,800 IOPS on
+    /// the model volume during plain AR); decode became SSD-latency-bound, the GPU idled between layers and
+    /// its clock governor dropped (9 W, 735-1,100 MHz at "99 % active"): plain AR fell from 53.4 to 31.8
+    /// tok/s on identical code as the drive's latency drifted. vMLX Python (table_reader.py) and
+    /// The reference runtime read the table through the page cache and warmed it once after load; lookups are then RAM
+    /// hits. Page-cache pages are clean and reclaimable: under memory pressure macOS evicts them and
+    /// lookups fall back to drive reads — never an error, never a refusal.
+    #if canImport(Darwin)
+    static let uncachedReads: Bool = {
+        let raw = (ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_NOCACHE"] ?? "0")
+            .lowercased()
+        return ["1", "true", "yes", "on"].contains(raw)
+    }()
+    #else
+    // F_NOCACHE is Darwin-only: on Linux the n-gram rows are always read through the page cache.
+    static let uncachedReads = false
+    #endif
+
+    /// Warm policy. `VMLX_QWEN4_PLE_WARM=1` forces the warm, `=0` disables it; unset = automatic (below).
+    static let warmOverride: Bool? = {
+        guard let raw = ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_WARM"]?.lowercased()
+        else { return nil }
+        if ["0", "false", "no", "off"].contains(raw) { return false }
+        if ["1", "true", "yes", "on"].contains(raw) { return true }
+        return nil
+    }()
+    // SPEED + RAM CONTRACT (Eric, 2026-10-07/10-13): the 54-58 GB n-gram table STAYS ON SSD. Do not
+    // turn a whole-table page-cache warm or a resident copy on by default to "speed up" decode — it
+    // is the difference between Allosaurus fitting a 48 GB Mac or not, and decode rows are tiny
+    // pread()s (2.9 KB per token) that never limited tok/s in any measured run.
+
+    /// AUTOMATIC WARM = only when the whole bundle comfortably fits in RAM (bundle bytes <= 60 % of physical).
+    ///
+    /// WHY (measured 2026-10-06, max2 128 GB, Qwen3.8 Flash-Next JANG_6S = 107 GB bundle, 30 GB PLE table):
+    /// warming the full table during load made Adaptive MTP thrash at 0.34 tok/s (footprint 87 GB of Metal
+    /// buffers + 27 GB of warmed table pages: 1.6 GB free, page-ins in the hundreds of millions) while the
+    /// SAME run with page-cached reads and NO warm ran 45.0 prose / 90.3 easy prose (F_NOCACHE: 47.6 / 90.5).
+    /// The memory contract: what every token needs (the model weights) is resident; the n-gram table is a
+    /// sparse SSD lookup table and only the rows actually touched enter the page cache. The full warm only
+    /// buys faster COLD prefill (Python measured 3-6x on 1.8k-6.7k-token prompts), so it is spent only when
+    /// it cannot compete with the weights. This never refuses or delays a load — it only skips a speedup.
+    ///
+    /// DEFAULT OFF (Eric, 2026-10-07): the n-gram table stays on SSD for every bundle. A full warm pulls the
+    /// table's backing files (18-54 GB on Flash-Next / Allosaurus) into RAM for nothing but faster cold prefill,
+    /// which is exactly the "whole model size in RAM" the memory contract forbids. `VMLX_QWEN4_PLE_WARM=1`
+    /// forces it (and `=0` disables it). The size gate below is kept for an explicit `VMLX_QWEN4_PLE_WARM=auto`.
+    static func shouldWarm(modelDirectory: URL) -> Bool {
+        if let forced = warmOverride { return forced }
+        guard ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_WARM"]?.lowercased() == "auto" else {
+            log("page-cache warm off (default; n-gram rows are read from SSD on demand)")
+            return false
+        }
+        let fm = FileManager.default
+        var bundleBytes: UInt64 = 0
+        if let names = try? fm.contentsOfDirectory(atPath: modelDirectory.path) {
+            for name in names where name.hasSuffix(".safetensors") {
+                let attrs = try? fm.attributesOfItem(
+                    atPath: modelDirectory.appendingPathComponent(name).resolvingSymlinksInPath().path)
+                bundleBytes += (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+            }
+        }
+        let physical = ProcessInfo.processInfo.physicalMemory
+        let fits = Double(bundleBytes) <= 0.60 * Double(physical)
+        log(
+            String(
+                format: "page-cache warm %@: bundle %.1f GB vs 60%% of %.0f GB physical",
+                fits ? "on" : "off (rows are cached on demand only)",
+                Double(bundleBytes) / 1e9, Double(physical) / 1e9))
+        return fits
+    }
+
+    private static let warmLock = NSLock()
+    nonisolated(unsafe) private static var warmedFiles: Set<String> = []
+
+    /// One sequential pass over each backing file (32 MiB preads on a background thread) so later
+    /// per-token row lookups are page-cache hits. Port of Python `_start_page_cache_warm`.
+    static func warmPageCache(_ urls: [URL]) {
+        guard !uncachedReads else { return }
+        warmLock.lock()
+        let fresh = urls.filter { warmedFiles.insert($0.path).inserted }
+        warmLock.unlock()
+        guard !fresh.isEmpty else { return }
+        let thread = Thread {
+            let started = Date()
+            let chunk = 32 << 20
+            let buffer = UnsafeMutableRawPointer.allocate(byteCount: chunk, alignment: 16_384)
+            defer { buffer.deallocate() }
+            var done: UInt64 = 0
+            for url in fresh {
+                #if canImport(Darwin)
+                let fd = Darwin.open(url.path, O_RDONLY)
+                #else
+                let fd = Glibc.open(url.path, O_RDONLY)
+                #endif
+                guard fd >= 0 else { continue }
+                var offset: off_t = 0
+                while true {
+                    #if canImport(Darwin)
+                    let got = Darwin.pread(fd, buffer, chunk, offset)
+                    #else
+                    let got = Glibc.pread(fd, buffer, chunk, offset)
+                    #endif
+                    if got <= 0 { break }
+                    offset += off_t(got)
+                    done += UInt64(got)
+                }
+                #if canImport(Darwin)
+                Darwin.close(fd)
+                #else
+                Glibc.close(fd)
+                #endif
+            }
+            let seconds = Date().timeIntervalSince(started)
+            log(
+                String(
+                    format: "page-cache warm done: %.2f GB in %.1f s (%.2f GB/s, %d files)",
+                    Double(done) / 1e9, seconds, Double(done) / 1e9 / Swift.max(seconds, 1e-6),
+                    fresh.count))
+        }
+        thread.name = "vmlx-qwen4-ple-page-warm"
+        thread.qualityOfService = .utility
+        thread.start()
+    }
+
     private static let parallelRows: Bool = {
         let raw = ProcessInfo.processInfo.environment[
             "VMLX_QWEN4_PLE_PARALLEL_ROWS"] ?? "1"
@@ -236,6 +390,8 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         let spec: AffineSpec?
         let rows: Int
         let dimensions: Int
+        /// Affine scales/biases stored as BF16 (mixed 4/8-bit converter bundles) rather than F16 (JANG).
+        var bfloat16Metadata = false
     }
 
     private let shards: [RowShard]
@@ -256,13 +412,26 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         layerIndex: Int,
         shardCount: Int
     ) throws {
-        let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
-        guard let indexData = try? Data(contentsOf: indexURL) else {
-            throw Qwen4ExpNGramTableError.missingIndex(indexURL)
+        // A mixed 4/8-bit converter bundle declares the whole table as ONE safetensors file (`config.ngram_table`) that the
+        // index does not list, its tensors named plain `weight`/`scales`/`biases`. It is read as a
+        // single row shard; the JANG layout splits the same rows into `shardCount` indexed shards.
+        let declared = try Self.readDeclaredTable(modelDirectory: modelDirectory)
+        let index: IndexFile
+        let specs: [Int: AffineSpec]
+        if let declared {
+            index = IndexFile(weightMap: [
+                "weight": declared.file, "scales": declared.file, "biases": declared.file,
+            ])
+            specs = [0: declared.spec]
+        } else {
+            let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
+            guard let indexData = try? Data(contentsOf: indexURL) else {
+                throw Qwen4ExpNGramTableError.missingIndex(indexURL)
+            }
+            index = try JSONDecoder().decode(IndexFile.self, from: indexData)
+            specs = try Self.readAffineSpecs(
+                modelDirectory: modelDirectory, layerIndex: layerIndex)
         }
-        let index = try JSONDecoder().decode(IndexFile.self, from: indexData)
-        let specs = try Self.readAffineSpecs(
-            modelDirectory: modelDirectory, layerIndex: layerIndex)
 
         var openedFiles: [URL: Qwen4ExpSafetensorsReader] = [:]
         var built: [RowShard] = []
@@ -272,9 +441,10 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         var nextStart: Int64 = 0
         var commonDimensions: Int?
 
-        for shardIndex in 0 ..< shardCount {
+        for shardIndex in 0 ..< (declared == nil ? shardCount : 1) {
             let base = "language_model.layers.\(layerIndex).ple.ngram_embedding.shards.\(shardIndex)"
-            let weightName = base + ".weight"
+            func name(_ suffix: String) -> String { declared == nil ? base + "." + suffix : suffix }
+            let weightName = name("weight")
             guard let filename = index.weightMap[weightName] else {
                 throw Qwen4ExpNGramTableError.missingTensor(weightName)
             }
@@ -301,8 +471,8 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
                 guard let affine = specs[shardIndex] else {
                     throw Qwen4ExpNGramTableError.missingBitSpec(shardIndex)
                 }
-                let scaleName = base + ".scales"
-                let biasName = base + ".biases"
+                let scaleName = name("scales")
+                let biasName = name("biases")
                 guard let scaleFileName = index.weightMap[scaleName],
                     let biasFileName = index.weightMap[biasName]
                 else {
@@ -316,7 +486,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
                 dimensions = weight.shape[1] * 32 / affine.bits
                 guard dimensions * affine.bits == weight.shape[1] * 32,
                     dimensions % affine.groupSize == 0,
-                    scale.dtype == "F16", bias.dtype == "F16",
+                    scale.dtype == "F16" || scale.dtype == "BF16", bias.dtype == scale.dtype,
                     scale.shape == [rows, dimensions / affine.groupSize],
                     bias.shape == scale.shape
                 else {
@@ -350,7 +520,8 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
             built.append(RowShard(
                 weightFile: file, scaleFile: scaleFile, biasFile: biasFile,
                 weight: weight, scales: scales, biases: biases,
-                spec: spec, rows: rows, dimensions: dimensions))
+                spec: spec, rows: rows, dimensions: dimensions,
+                bfloat16Metadata: scales?.dtype == "BF16"))
         }
 
         self.shards = built
@@ -358,17 +529,26 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         self.sourceDirectory = modelDirectory
         self.backingFileCount = openedFiles.count
         self.backingFileBytes = openedFiles.values.reduce(0) { $0 + $1.fileSize }
-        self.noCacheFileCount = openedFiles.count
+        self.noCacheFileCount = Self.uncachedReads ? openedFiles.count : 0
         self.dimensions = commonDimensions ?? 0
         self.rowCount = nextStart
-        Self.log(String(format:
-            "ssd-row-reader ready backend=pread-fnocache cache=F_NOCACHE row_schedule=%@ files=%d backing_file_bytes=%.3f_GiB rows=%lld dimensions=%d source=%@",
-            Self.parallelRows ? "parallel" : "sequential-opt-out",
-            backingFileCount,
-            Double(backingFileBytes) / 1_073_741_824.0,
-            rowCount,
-            dimensions,
-            modelDirectory.path))
+        let warmRequested = Self.shouldWarm(modelDirectory: modelDirectory)
+        let warmEnabled = warmRequested && !Self.uncachedReads
+        if warmEnabled {
+            Self.warmPageCache(openedFiles.keys.sorted { $0.path < $1.path })
+        }
+        Self.log(
+            String(
+                format:
+                    "ssd-row-reader ready backend=%@ row_schedule=%@ files=%d backing_file_bytes=%.3f_GiB rows=%lld dimensions=%d source=%@",
+                Self.uncachedReads
+                    ? "pread-fnocache cache=F_NOCACHE warm=false" : "pread-pagecache warm=\(warmEnabled)",
+                Self.parallelRows ? "parallel" : "sequential-opt-out",
+                backingFileCount,
+                Double(backingFileBytes) / 1_073_741_824.0,
+                rowCount,
+                dimensions,
+                modelDirectory.path))
     }
 
     /// Returns row-major Float32 values. Only bytes belonging to selected rows
@@ -493,7 +673,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         telemetryLock.unlock()
         if calls == 1 || calls % 128 == 0 {
             Self.log(
-                "ssd-row-read backend=pread-fnocache cache=F_NOCACHE "
+                "ssd-row-read backend=\(Self.uncachedReads ? "pread-fnocache" : "pread-pagecache") "
                     + "call=\(calls) rows=\(rows) bytes=\(bytesRead) "
                     + "cumulative_rows=\(totalRows) cumulative_bytes=\(totalBytes) "
                     + "source=\(sourceDirectory.path)")
@@ -526,7 +706,8 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
                         dequantizeRow(
                             packedPointer: packedBytes.baseAddress!, packedWordCount: packedWords,
                             scalePointer: scaleBytes.baseAddress!, biasPointer: biasBytes.baseAddress!,
-                            dimensions: shard.dimensions, spec: spec)
+                            dimensions: shard.dimensions, spec: spec,
+                            bfloat16Metadata: shard.bfloat16Metadata)
                     }
                 }
             }
@@ -599,8 +780,12 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
     private static func dequantizeRow(
         packedPointer: UnsafeRawPointer, packedWordCount: Int,
         scalePointer: UnsafeRawPointer, biasPointer: UnsafeRawPointer,
-        dimensions: Int, spec: AffineSpec
+        dimensions: Int, spec: AffineSpec, bfloat16Metadata: Bool
     ) -> [Float] {
+        func metadata(_ bits: UInt16) -> Float {
+            bfloat16Metadata
+                ? Float(bitPattern: UInt32(bits) << 16) : Float(Float16(bitPattern: bits))
+        }
         let mask = UInt64((1 << spec.bits) - 1)
         var result = [Float](repeating: 0, count: dimensions)
         for column in 0 ..< dimensions {
@@ -619,8 +804,8 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
                 fromByteOffset: group * 2, as: UInt16.self)
             let biasBits = biasPointer.loadUnaligned(
                 fromByteOffset: group * 2, as: UInt16.self)
-            let scale = Float(Float16(bitPattern: UInt16(littleEndian: scaleBits)))
-            let bias = Float(Float16(bitPattern: UInt16(littleEndian: biasBits)))
+            let scale = metadata(UInt16(littleEndian: scaleBits))
+            let bias = metadata(UInt16(littleEndian: biasBits))
             result[column] = code * scale + bias
         }
         return result
@@ -634,6 +819,32 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
             if values[mid] <= needle { low = mid + 1 } else { high = mid }
         }
         return low
+    }
+
+    /// `config.ngram_table = {file, bits, group_size}`, a converter bundle's declaration of a table it keeps
+    /// outside the indexed safetensors; nil when the bundle declares none. The file names no layer,
+    /// so a model with several PLE layers cannot be served by it and is refused rather than guessed.
+    private static func readDeclaredTable(
+        modelDirectory: URL
+    ) throws -> (file: String, spec: AffineSpec)? {
+        let data = try Data(contentsOf: modelDirectory.appendingPathComponent("config.json"))
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let declared = root["ngram_table"]
+        else { return nil }
+        guard let table = declared as? [String: Any],
+            let file = table["file"] as? String, !file.isEmpty, !file.contains("/"),
+            let bits = (table["bits"] as? NSNumber)?.intValue,
+            let groupSize = (table["group_size"] as? NSNumber)?.intValue
+        else {
+            throw Qwen4ExpNGramTableError.invalidTensor(
+                "ngram_table", "needs a file name in the bundle, bits and group_size")
+        }
+        let text = root["text_config"] as? [String: Any]
+        if let layers = text?["ple_layer_ids"] as? [Any], layers.count != 1 {
+            throw Qwen4ExpNGramTableError.invalidTensor(
+                "ngram_table", "one file cannot hold the tables of \(layers.count) PLE layers")
+        }
+        return (file, AffineSpec(bits: bits, groupSize: groupSize))
     }
 
     private static func readAffineSpecs(
@@ -665,6 +876,6 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
     }
 
     private static func log(_ message: String) {
-        FileHandle.standardError.write(Data("[Qwen4ExpPLE] \(message)\n".utf8))
+        RuntimeDiagnostics.write(Data("[Qwen4ExpPLE] \(message)\n".utf8))
     }
 }

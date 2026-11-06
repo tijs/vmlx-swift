@@ -1,0 +1,116 @@
+// Copyright 2026 Osaurus AI. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+import Foundation
+import Cmlx
+import MLX
+import MLXNN
+
+#if canImport(Darwin)
+import Darwin
+#endif
+
+/// Where a weight's bytes live, and therefore whether a runtime re-layout of it costs memory.
+///
+/// The retired mmap loader made tensors windows into a shared shard mapping. Releasing
+/// a single tensor frees nothing while any other tensor from its shard is alive, so a runtime
+/// transform that builds a re-laid-out copy of mapped weights (fused decode projections, lane-tiled
+/// weights) ADDS the copy to resident memory for the life of the model — memory the host's RAM
+/// admission never saw, because it admitted the model by its bundle size. Measured 2026-10-11 on
+/// Qwen3.8-27B JANG_4D: +4.1 GB (GatedDeltaNet fused input projections), +12.9 GB (lane tiling).
+///
+/// A weight that was materialized as its own allocation (a non-mmap load, or a tensor the model's
+/// `sanitize` rebuilt) is different: a copy that REPLACES it frees the original, so the transform
+/// costs nothing at rest (Flash-Next's fused GDN projection: +0.6 GB with the rows shared, +5 % decode).
+///
+/// Rule for every runtime weight transform: build the copy only when it replaces the original.
+public enum WeightBacking {
+    /// True when `array`'s bytes lie inside a file mapping MUCH larger than the array itself — a
+    /// whole safetensors shard shared with other tensors — so releasing `array` cannot free them.
+    /// A tensor with its own allocation (anonymous memory) or its own small mapping returns false.
+    /// Evaluates `array`. False when it cannot tell (non-Darwin, empty array, region lookup failed).
+    public static func sharesMappedShard(_ array: MLXArray) -> Bool {
+        #if canImport(Darwin)
+        guard array.size > 0 else { return false }
+        // Foundation Data may inline small values even with bytesNoCopy. Query
+        // the actual MLX address, not temporary Data storage on the Swift stack.
+        guard let base = try? withError({
+            _ = mlx_array_eval(array.ctx)
+            return mlx_array_data_uint8(array.ctx)
+        }) else { return false }
+        return withExtendedLifetime(array) {
+            let pointer = UInt64(UInt(bitPattern: base))
+            var region = proc_regionwithpathinfo()
+            let expected = MemoryLayout<proc_regionwithpathinfo>.size
+            let count = proc_pidinfo(getpid(), PROC_PIDREGIONPATHINFO, pointer, &region, Int32(expected))
+            guard count == expected else { return false }
+            let start = region.prp_prinfo.pri_address
+            let length = region.prp_prinfo.pri_size
+            // The kernel can return the NEXT file-backed region. Its pathname
+            // is not evidence about this array unless that same region contains it.
+            guard pointer >= start, pointer - start < length else { return false }
+            let hasPath = withUnsafeBytes(of: region.prp_vip.vip_path) { $0.first != 0 }
+            guard hasPath else { return false }
+            return length > UInt64(array.nbytes) * 2 + UInt64(getpagesize())
+        }
+        #else
+        return false
+        #endif
+    }
+
+    /// Whether a runtime copy of `arrays` may be built: not when any of them shares a mapped shard (the
+    /// copy could not replace it). `VMLX_COPY_MAPPED_WEIGHTS=1` restores the old always-copy behavior (A/B only).
+    public static func copyWouldReplace(_ arrays: [MLXArray]) -> Bool {
+        if ProcessInfo.processInfo.environment["VMLX_COPY_MAPPED_WEIGHTS"] == "1" { return true }
+        return !arrays.contains(where: sharesMappedShard)
+    }
+
+    /// Make a fused copy the ONLY copy: point each member projection at its block of output rows in
+    /// the fused tensors. A row slice of a row-contiguous array is a no-copy view of the same buffer,
+    /// so the members' own path (prefill, exact-row verify) reads exactly the bytes it read before and
+    /// the members' original storage is released. Only meaningful when ``copyWouldReplace(_:)`` held
+    /// for the members; otherwise the originals stay alive in their shard regardless.
+    public static func rebindAsRows(
+        _ members: [QuantizedLinear], weight: MLXArray, scales: MLXArray, biases: MLXArray
+    ) {
+        guard ProcessInfo.processInfo.environment["VMLX_GDN_SHARE_FUSED_ROWS"] != "0" else { return }
+        var row = 0
+        for member in members {
+            let rows = member.weight.dim(0)
+            _ = member.update(
+                parameters: ModuleParameters.unflattened([
+                    "weight": weight[row ..< row + rows],
+                    "scales": scales[row ..< row + rows],
+                    "biases": biases[row ..< row + rows],
+                ]))
+            row += rows
+        }
+        MLX.eval(members.flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) })
+    }
+
+    /// The packed weights of `members` — the bulk of their bytes — for ``copyWouldReplace(_:)``.
+    ///
+    /// ┌─────────────────────────────────────────────────────────────────────────────────────────┐
+    /// │ SPEED-CRITICAL — DO NOT ADD `scales` / `biases` HERE. THIS REGRESSED FLASH-NEXT MTP.    │
+    /// └─────────────────────────────────────────────────────────────────────────────────────────┘
+    /// Scales and biases are deliberately NOT consulted. Flash-Next / Allosaurus (qwen4_exp)
+    /// materialize their GDN projection weights but keep the f16 affine metadata (~1/8 of the bytes
+    /// at 4-bit g64) as windows into the mapped shard. Counting that metadata here (dbf4459a7,
+    /// 2026-10-11) made this gate false for every qwen4_exp load, which silently disabled:
+    ///   1. the fused GDN decode input projection (one QMV instead of four per GDN layer), and
+    ///   2. the bit-exact multi-row `full4` verify kernel, reachable ONLY through that fused
+    ///      projection (`Qwen35.swift` `ensureFusedDecodeInputProjection(exactRowVerifier:)`).
+    /// Measured 2026-10-14, Allosaurus JANGH2, RunBench adaptive MTP at matched GPU clock
+    /// (1419-1451 MHz): fused 52-54 / 78 / 90-91 / 107 tok/s vs unfused 51-52 / 76-77 / 86-88 / 107
+    /// (prose / code / easy code / easy prose). Unfused verify rows are slower, so the AR-safety
+    /// resume probe loses more often (17 vs 8 lost probes per run) and long in-app replies fall back
+    /// to AR — Allosaurus dropped from ~100 to 27-35 tok/s in the app.
+    /// The metadata copy is ~0.6 GB on a 54 GB Flash-Next bundle; after `rebindAsRows` the mapped
+    /// originals are never touched again, so their pages are clean, reclaimable file cache, not
+    /// process footprint. Bundles whose WEIGHTS are mapped (Qwen3.8-27B dense: +4.1 GB) still skip.
+    /// If you want to change this rule, re-run the Allosaurus/Flash-Next adaptive RunBench AND an
+    /// in-app long code turn first, and record both numbers here. Do not trade this away silently.
+    public static func storage(of members: [QuantizedLinear]) -> [MLXArray] {
+        members.map(\.weight)
+    }
+}

@@ -29,6 +29,23 @@ let weightBytes = context.model
 You can optionally sanity check with `Memory.snapshot()` before/after load. In practice, the
 difference between the sum of `nbytes` and MLX active memory has been very small in our tests.
 
+### Opaque mapped expert banks
+
+Packed mapped experts may intentionally live outside `Module.parameters()` to avoid
+whole-bank evaluation or dtype conversion. Use `model.modelWeightAccounting()` for
+both reflected parameter bytes and `supplementalMappedBytes`. Their sum,
+`logicalWeightBytes`, describes stored weights, not resident physical memory.
+`numParameters()` includes represented weights from these opaque leaves once even
+when multiple module paths share a leaf.
+
+`WiredMemoryMeasurement.supplementalMappedWeightBytes` reports those logical bytes
+separately. They are deliberately excluded from `totalBytes`: mapping a large bank
+is not a request to wire all its pages. Measure process physical footprint and
+page activity independently; these counters neither change MLX memory limits nor
+prove the resident working set. Automatic `WiredMemoryUtils.tune` refuses models
+with opaque mapped banks until a physical-residency-aware budget is supplied;
+MLX allocator peaks cannot distinguish resident pages from logical mapped spans.
+
 ## Avoiding load: estimate from tensor files
 
 If you want a **no-load estimate**, sum the tensor file sizes on disk (for example, all

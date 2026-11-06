@@ -246,6 +246,7 @@ final class Qwen35GatedDeltaNet: Module {
     private var attemptedInputFusion = false
     private static let fusionDiagnosticLock = NSLock()
     private nonisolated(unsafe) static var didReportInputFusion = false
+    private nonisolated(unsafe) static var didReportInputFusionSkipped = false
 
     private func ensureFusedInputSegments() -> [FusedInputSegment]? {
         if attemptedInputFusion { return fusedInputSegments }
@@ -266,6 +267,19 @@ final class Qwen35GatedDeltaNet: Module {
         guard quantized.allSatisfy({ $0 != nil && $0?.bias == nil && $0?.biases != nil })
         else { return nil }
         let q = quantized.map { $0! }
+        // The fused copy must REPLACE the members (rebindAsRows below). Windows into a mapped
+        // safetensors shard (the shipped mmap loader) cannot be released, so the copy would be a
+        // permanent duplicate of every GDN input projection. Skip fusion then (see `WeightBacking`).
+        guard WeightBacking.copyWouldReplace(WeightBacking.storage(of: q)) else {
+            Self.fusionDiagnosticLock.lock()
+            if !Self.didReportInputFusionSkipped {
+                Self.didReportInputFusionSkipped = true
+                RuntimeDiagnostics.write(Data(
+                    "[Qwen35] fused_gdn_decode_input_projections=skipped reason=mapped_shard_weights\n".utf8))
+            }
+            Self.fusionDiagnosticLock.unlock()
+            return nil
+        }
 
         func scheme(_ m: QuantizedLinear) -> String {
             "\(m.groupSize)/\(m.bits)/\(m.mode)/\(m.scales.dtype)/\(m.biases!.dtype)"
@@ -284,6 +298,7 @@ final class Qwen35GatedDeltaNet: Module {
                 let scales = concatenated(mods.map(\.scales), axis: 0)
                 let biases = concatenated(mods.map { $0.biases! }, axis: 0)
                 MLX.eval(weight, scales, biases)
+                WeightBacking.rebindAsRows(mods, weight: weight, scales: scales, biases: biases)
                 var splits: [Int] = []
                 var offset = 0
                 for m in mods.dropLast() {
@@ -322,7 +337,7 @@ final class Qwen35GatedDeltaNet: Module {
                 }
                 return nil
             }
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[Qwen35] fused_gdn_decode_input_projections=active groups=\(fusedCounts)\n"
                     .utf8))
         }
@@ -693,7 +708,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
             let diff = abs(prefixState - chained!).max().item(Float.self)
             let scale = abs(chained!).max().item(Float.self)
-            FileHandle.standardError.write(Data(String(
+            RuntimeDiagnostics.write(Data(String(
                 format: "[rollback-audit] n=%d replay-vs-chained maxdiff=%.3e scale=%.3e\n",
                 n, diff, scale).utf8))
         }
@@ -903,7 +918,6 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         let k = topK
         let kth = gates.dim(-1) - k
         let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, (kth)...]
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         var scores = MLX.takeAlong(gates, inds, axis: -1)
         if normTopkProb {
             scores = scores / scores.sum(axis: -1, keepDims: true)
@@ -1704,4 +1718,15 @@ extension Qwen35Model: JangHadamardRuntimeModel {
                 "Hadamard Qwen3.5 requires an untied dense model without MTP")
         }
     }
+}
+
+extension Qwen35Model: PrefixCacheInvariantModel {
+    /// Text-only construction: there is no media, so no media prefix to reuse.
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { false }
+
+    /// Same contract and evidence as the VLM construction (`MLXVLM.Qwen35`): a restored
+    /// exact-prefix row holds the KV, conv and F32 GDN state of exactly those tokens, and
+    /// `Qwen35HadamardCacheTests` shows a reopened checkpoint continuing bitwise equal to the
+    /// cold cache. A required-tool selection therefore keeps the ordinary longest-prefix restore.
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
 }

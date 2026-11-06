@@ -180,8 +180,8 @@ These rows are now covered in this checkout with artifacts under
   reaches `prepared prompt=16318`, then `.err` terminates with Metal
   `kIOGPUCommandBufferCallbackErrorOutOfMemory`. The engine must fix this
   memory path before claiming B7-style long-context production readiness.
-- The ds4 official vector fixture used by the Python `dsv4_vector_probe.py`
-  was not present at `/tmp/ds4-read/tests/test-vectors/official.vec`; vector
+- The official DSV4 reference-vector fixture used by the Python `dsv4_vector_probe.py`
+  was not present at `tests/test-vectors/official.vec`; vector
   drift remains blocked, not inferred from the shorter recall rows.
 - Nemotron Omni video generation now follows the real source contract: the
   processor carries the post-EVS keep count through `LMInput.ProcessedVideo`,
@@ -454,11 +454,13 @@ regression beyond the agreed threshold.
 
 ### MTP Model Activation
 
+Current product defaults follow [Speculative decoding defaults](SPECULATIVE_DECODING_DEFAULTS.md): Flash-Next with a usable native head defaults to Adaptive; Qwen 27B discovers a compatible bundled DFlash2 drafter; explicit Off disables speculation. Reset restores that bundle-aware policy. Included evaluations and benchmarks inherit it unless explicitly overridden. The May 15 activation/tuning requirements below describe the historical implementation, not current defaults. Their measured evidence and correctness gates remain unchanged.
+
 Goal: support real MTP-capable models as an explicit activation path while
 keeping plain autoregressive decode as the baseline until MTP proves itself per
 family.
 
-Current package surface added on 2026-05-15:
+Historical package surface added on 2026-05-15:
 
 - `MTPBundleInspector`, `MTPBundleStatus`, and `MTPRuntimeMode` provide no-load
   detection from config metadata, JANG runtime metadata, safetensors indexes, and
@@ -472,11 +474,14 @@ Current package surface added on 2026-05-15:
 - Detailed Osaurus, cache, and VL wiring is in
   `docs/VMLX_SWIFT_MTP_OSAURUS_WIRING_2026_05_15.md`.
 
-Required gates:
+Historical activation policy (superseded by the current defaults above):
 
 - MTP must be off by default unless the model bundle explicitly declares a valid
   MTP head/path, has usable bundle-local tuning for its native-MTP depth, and
   the request or launch config enables it.
+
+Continuing correctness gates:
+
 - The runtime must expose `mtp_available`, `mtp_enabled`, draft depth, accepted
   token count, rejected token count, acceptance rate, fallback count, and speed
   delta in metrics/status.

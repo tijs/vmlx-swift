@@ -122,7 +122,7 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
         self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
         self.cacheInitParameters = parameters
         self.randomKey = parameters.randomSeed.map { MLX.key($0) }
-        self.mediaSalt = computeCacheSalt(for: input, parameters: parameters)
+        self.mediaSalt = computeCacheSalt(for: input, parameters: parameters, model: model)
         self.stopper = StableConfidentStopper(
             stabilityThreshold: options.stabilityThreshold,
             confidenceThreshold: options.confidenceThreshold)
@@ -186,7 +186,7 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                                 diskArrays, into: &self.cache, requirePromptBoundary: true) > 0
                     if restored {
                         MLX.eval(self.cache)
-                    } else if detail == .disk {
+                    } else if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: promptTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
@@ -225,7 +225,7 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                     // This path applies no recurrent companion state, so for
                     // a cache that has such layers the refusal may be this
                     // path's and not the entry's: said only when it has none.
-                    if detail == .disk, !cacheContainsPathDependentState(self.cache) {
+                    if detail.isDiskTierEntry, !cacheContainsPathDependentState(self.cache) {
                         coordinator.reportDiskRestoreRejected(
                             tokens: promptTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
@@ -401,36 +401,12 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                 tMin: options.tMin, tMax: options.tMax)
             let processed = logits.asType(.float32) / temperature
 
-            // No-empty-response guard. Block-diffusion collapses terse prompts (e.g. boolq's
-            // "Respond with one of: yes, no.") to an all-EOS first canvas → empty output, even
-            // though the model answers correctly whenever it emits anything. On the FIRST canvas,
-            // forbid EOS at position 0 so at least one content token is produced; later canvases
-            // end normally, so a genuinely complete reply can still stop. (-1e9, not -inf, keeps
-            // entropy finite.)
-            //
-            // The write is IN PLACE, and that is load-bearing rather than accidental. `MLXArray` is
-            // a `final class`, so `var sampled = processed` binds a second reference to the same
-            // object and `sampled[0, 0, eos] = …` rewrites `processed` too (`_updateInternal` →
-            // `mlx_array_set`). The suppression therefore also reaches `selfConditioning =
-            // processed` below, and persists across denoising steps.
-            //
-            // That persistence is what makes the guard work. Building the mask out-of-place — e.g.
-            // `sampled = processed + bias` — leaves self-conditioning unmasked, the model re-asserts
-            // its EOS preference on the next step, and the canvas collapses again: MEASURED at
-            // boolq gen-nothink 70.0% (35/50, in place) versus 0.0% with 8/8 extraction failures
-            // (out of place). An earlier version of this comment claimed self-conditioning kept the
-            // UNMASKED logits; that was false, and making it true broke the guard.
-            var sampled = processed
-            if canvasesEmitted == 0 {
-                for eos in options.eosTokenIds {
-                    sampled[0, 0, eos] = MLXArray(Float(-1e9))
-                }
-            }
-
+            // Preserve the model's distribution, including EOS at the first
+            // position. The same unmasked logits self-condition the next step.
             let denoiserKey = nextRandomKey()
-            let denoiserCanvas = MLX.categorical(sampled, key: denoiserKey).asType(.int32)
-            let argmaxCanvas = argMax(sampled, axis: -1).asType(.int32)
-            let entropy = canvasTokenEntropy(processedLogits: sampled)
+            let denoiserCanvas = MLX.categorical(processed, key: denoiserKey).asType(.int32)
+            let argmaxCanvas = argMax(processed, axis: -1).asType(.int32)
+            let entropy = canvasTokenEntropy(processedLogits: processed)
             let acceptMask = entropyBoundAcceptMask(
                 tokenEntropy: entropy, entropyBound: options.entropyBound)
 
@@ -595,6 +571,6 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             wall,
             options.maxDenoisingSteps,
             options.entropyBound)
-        FileHandle.standardError.write(Data(line.utf8))
+        RuntimeDiagnostics.write(Data(line.utf8))
     }
 }

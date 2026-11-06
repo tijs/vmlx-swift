@@ -2,7 +2,9 @@
 
 // port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/qwen3_vl
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -14,21 +16,37 @@ private enum Qwen3VLError: Error {
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct Qwen3VLProcessor: UserInputProcessor {
 
     private let config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
+    private let decisionMediaProcessing: Bool
 
-    public init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer) {
+    public init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer, decisionMediaProcessing: Bool = false) {
         self.config = config
         self.tokenizer = tokenizer
+        self.decisionMediaProcessing = decisionMediaProcessing
     }
 
+    /// Frames are rendered without colour management (`asMLXArrayUnmanaged`), so the stored,
+    /// already gamma-encoded values are resampled and normalized as the reference processor does;
+    /// no tone-curve conversion here (it compensated the managed linear working space).
     private func preprocess(image: CIImage, resizedSize: CGSize) -> CIImage {
         image
-            .toSRGB()
             .resampled(to: resizedSize, method: .bicubic)
             .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
+    }
+
+    private func decisionPixels(image: CIImage, resizedSize: CGSize) throws -> MLXArray {
+        let rgb = try MiniCPMV47ImageProcessing.rgb8(from: image)
+        let width = Int(resizedSize.width), height = Int(resizedSize.height)
+        let resized = MiniCPMV47ImageProcessing.resizeBicubicPIL(rgb, toWidth: width, height: height)
+        let mean = config.imageMean.map(Float.init), std = config.imageStd.map(Float.init)
+        var values = [Float](repeating: 0, count: resized.data.count)
+        for i in values.indices { values[i] = (Float(resized.data[i]) * (1 / 255) - mean[i % 3]) / std[i % 3] }
+        // Qwen patchification consumes NCHW, including the singleton frame axis.
+        return MLXArray(values, [1, height, width, 3]).transposed(0, 3, 1, 2)
     }
 
     static func videoTargetSize(
@@ -111,17 +129,15 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
         let targetSize = CGSize(width: resizedWidth, height: resizedHeight)
 
-        let resampled = processed.map { MediaProcessing.resampleBicubic($0, to: targetSize) }
-
-        let normalized =
-            resampled
-            .map {
-                MediaProcessing.normalize(
-                    $0,
-                    mean: config.imageMeanTuple,
-                    std: config.imageStdTuple)
-            }
-            .map { MediaProcessing.asMLXArray($0) }
+        let normalized: [MLXArray]
+        if decisionMediaProcessing {
+            normalized = try processed.map { try decisionPixels(image: $0, resizedSize: targetSize) }
+        } else {
+            let resampled = processed.map { MediaProcessing.resampleBicubic($0, to: targetSize) }
+            normalized = resampled.map {
+                MediaProcessing.normalize($0, mean: config.imageMeanTuple, std: config.imageStdTuple)
+            }.map { MediaProcessing.asMLXArrayUnmanaged($0) }
+        }
 
         return try QwenVL.patchify(
             images: normalized,
@@ -131,23 +147,29 @@ public struct Qwen3VLProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
+        try await prepare(input: input, assistantSuffix: "")
+    }
+
+    /// D3 Box marker suffix, appended to the vendor's rendered assistant rail before tokenization.
+    func prepare(input: UserInput, assistantSuffix: String) async throws -> LMInput {
         let messages = Qwen3VLMessageGenerator().generate(from: input)
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages,
             tools: input.tools,
             additionalContext: input.additionalContext
         )
+        if !assistantSuffix.isEmpty {
+            let rendered = tokenizer.decode(tokenIds: promptTokens, skipSpecialTokens: false)
+            promptTokens = tokenizer.encode(text: rendered + assistantSuffix, addSpecialTokens: false)
+        }
+        var cacheBoundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer, messages: messages, tools: input.tools,
+            additionalContext: input.additionalContext, promptTokens: promptTokens,
+            staticSystemPrefix: input.cacheStableSystemPrefix)
 
         if input.images.isEmpty, input.videos.isEmpty {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray).asType(.int8)
-            let cacheBoundaries = canonicalChatCacheBoundaries(
-                tokenizer: tokenizer,
-                messages: messages,
-                tools: input.tools,
-                additionalContext: input.additionalContext,
-                promptTokens: promptTokens,
-                staticSystemPrefix: input.cacheStableSystemPrefix)
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
@@ -158,28 +180,51 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
-            let imageFrames = try input.images.map {
-                try preprocess(images: [$0.asCIImage()], processing: input.processing)
+            let imageFrames = try input.images.enumerated().map { index, image in
+                let source = try image.asCIImage()
+                let result = try preprocess(images: [source], processing: input.processing)
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    // Per-image input and output identity: the media cache salt hashes these pixels.
+                    MLX.eval(result.0)
+                    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+                    for byte in result.0.asData(access: .copy).data { hash = (hash ^ UInt64(byte)) &* 0x100_0000_01b3 }
+                    RuntimeDiagnostics.write(Data(
+                        ("[vmlx][media/image] index=\(index) extent=\(source.extent) "
+                            + "colorSpace=\(source.colorSpace?.name.map { $0 as String } ?? "nil") "
+                            + "properties=\(source.properties.count) grid=\(result.1.t)x\(result.1.h)x\(result.1.w) "
+                            + "values=\(String(hash, radix: 16))\n").utf8))
+                }
+                return result
             }
             let concatenated = concatenated(imageFrames.map { $0.0 })
             processedImage = .init(pixels: concatenated, frames: imageFrames.map { $0.1 })
 
             if let frames = processedImage?.frames {
-                promptTokens = try QwenVL.replacePaddingTokens(
+                let expanded = try QwenVL.expandPaddingTokens(
                     in: promptTokens,
                     frames: frames,
                     paddingToken: "<|image_pad|>",
                     mergeSize: config.mergeSize,
-                    tokenizer: tokenizer)
+                    tokenizer: tokenizer, boundaries: cacheBoundaries)
+                promptTokens = expanded.tokens
+                cacheBoundaries = expanded.boundaries
             }
         }
 
         var processedVideo: LMInput.ProcessedVideo?
         if !input.videos.isEmpty {
             var accumulatedFrames: [[MLXArray]] = []
+            var videoTimes: [[Double]] = []
 
             for video in input.videos {
-                let sequence = try await MediaProcessing.asProcessedVideoFrames(
+                let sequence: ProcessedVideoFrames
+                if decisionMediaProcessing, case .frames(let frames) = video {
+                    let processed = frames.map { frame in
+                        VideoFrame(frame: MediaProcessing.apply(frame.frame, processing: input.processing), timeStamp: frame.timeStamp)
+                    }
+                    sequence = ProcessedVideoFrames(frames: processed, totalDuration: frames.last?.timeStamp ?? .zero)
+                } else {
+                sequence = try await MediaProcessing.asProcessedVideoFrames(
                     video,
                     targetFPS: { _ in config.videoFPS },
                     minFrames: config.videoMinFrames,
@@ -187,6 +232,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                 ) { frame in
                     let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
                     return VideoFrame(frame: processed, timeStamp: frame.timeStamp)
+                }
                 }
                 guard let firstFrame = sequence.frames.first else {
                     throw VLMError.imageProcessingFailure("No video frames were decoded")
@@ -199,11 +245,15 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                     temporalFactor: config.temporalPatchSize,
                     factor: config.patchSize * config.mergeSize,
                     minPixels: config.videoMinPixels,
-                    maxPixels: config.videoMaxPixels)
+                    maxPixels: decisionMediaProcessing
+                        ? min(config.videoMaxPixels, 200_704 * sequence.frames.count)
+                        : config.videoMaxPixels)
                 let resizedSize = CGSize(width: width, height: height)
+                videoTimes.append(sequence.frames.map { $0.timeStamp.seconds })
                 accumulatedFrames.append(
-                    sequence.frames.map {
-                        preprocess(image: $0.frame, resizedSize: resizedSize).asMLXArray()
+                    try sequence.frames.map {
+                        if decisionMediaProcessing { return try decisionPixels(image: $0.frame, resizedSize: resizedSize) }
+                        return MediaProcessing.asMLXArrayUnmanaged(preprocess(image: $0.frame, resizedSize: resizedSize))
                     })
             }
 
@@ -219,12 +269,41 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             processedVideo = .init(pixels: concatenated, frames: videoFrames.map { $0.1 })
 
             if let frames = processedVideo?.frames {
-                promptTokens = try QwenVL.replacePaddingTokens(
+                if decisionMediaProcessing {
+                    guard let pad = tokenizer.convertTokenToId("<|video_pad|>") else {
+                        throw VLMError.processing("Missing video padding token")
+                    }
+                    var cursor = 0
+                    for (videoIndex, grid) in frames.enumerated() {
+                        guard let at = promptTokens[cursor...].firstIndex(of: pad) else {
+                            throw VLMError.processing("Missing video placeholder")
+                        }
+                        var expanded: [Int] = []
+                        let times = videoTimes[videoIndex]
+                        for group in 0..<grid.t {
+                            let lo = min(group * config.temporalPatchSize, times.count - 1)
+                            let hi = min(lo + config.temporalPatchSize, times.count)
+                            let seconds = times[lo..<hi].reduce(0, +) / Double(hi - lo)
+                            let timestamp = String(format: "<%.1f seconds><|vision_start|>", locale: Locale(identifier: "en_US_POSIX"), seconds)
+                            expanded += tokenizer.encode(text: timestamp, addSpecialTokens: false)
+                            expanded += Array(repeating: pad, count: grid.h * grid.w / (config.mergeSize * config.mergeSize))
+                            expanded += tokenizer.encode(text: "<|vision_end|>", addSpecialTokens: false)
+                        }
+                        promptTokens.replaceSubrange(at...at, with: expanded)
+                        cursor = at + expanded.count
+                    }
+                    // Decision requests do not publish chat-cache boundaries.
+                    cacheBoundaries = CanonicalChatCacheBoundaries(all: [], stable: [])
+                } else {
+                let expanded = try QwenVL.expandPaddingTokens(
                     in: promptTokens,
                     frames: frames,
                     paddingToken: "<|video_pad|>",
                     mergeSize: config.mergeSize,
-                    tokenizer: tokenizer)
+                    tokenizer: tokenizer, boundaries: cacheBoundaries)
+                promptTokens = expanded.tokens
+                cacheBoundaries = expanded.boundaries
+                }
             }
         }
 
@@ -238,9 +317,12 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             mediaTokenIds: QwenVL.mediaTokenIds(
                 tokenizer: tokenizer, tokens: ["<|image_pad|>", "<|video_pad|>"]),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            cachePrefixTokenCounts: cacheBoundaries.all,
+            cacheStablePrefixTokenCounts: cacheBoundaries.stable,
             toolSchemas: input.tools)
     }
 }
+#endif
 
 public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
 
@@ -341,6 +423,41 @@ public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
         case patchSize = "patch_size"
         case temporalPatchSize = "temporal_patch_size"
         case imageProcessorType = "image_processor_type"
+    }
+}
+
+extension Qwen3VLProcessorConfiguration {
+    /// transformers v5 writes `processor_config.json` with the image settings
+    /// nested under `image_processor` and the video settings under
+    /// `video_processor`. unsloth's Qwen3.6 MLX conversions ship only that
+    /// file, so the flat decode failed on `image_mean`, the VLM load fell back
+    /// to the text-only factory, and the vision tower was dropped.
+    private enum NestedProcessorKeys: String, CodingKey {
+        case imageProcessor = "image_processor"
+        case videoProcessor = "video_processor"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let root = try decoder.container(keyedBy: CodingKeys.self)
+        let nested = try decoder.container(keyedBy: NestedProcessorKeys.self)
+        let image: KeyedDecodingContainer<CodingKeys>
+        if !root.contains(.imageMean), nested.contains(.imageProcessor) {
+            image = try nested.nestedContainer(keyedBy: CodingKeys.self, forKey: .imageProcessor)
+        } else {
+            image = root
+        }
+        imageMean = try image.decode([CGFloat].self, forKey: .imageMean)
+        imageStd = try image.decode([CGFloat].self, forKey: .imageStd)
+        _size = try image.decodeIfPresent(Size.self, forKey: ._size)
+        _minPixels = try image.decodeIfPresent(Int.self, forKey: ._minPixels)
+        _maxPixels = try image.decodeIfPresent(Int.self, forKey: ._maxPixels)
+        mergeSize = try image.decode(Int.self, forKey: .mergeSize)
+        patchSize = try image.decode(Int.self, forKey: .patchSize)
+        temporalPatchSize = try image.decode(Int.self, forKey: .temporalPatchSize)
+        imageProcessorType = try image.decode(String.self, forKey: .imageProcessorType)
+        _videoConfiguration =
+            try root.decodeIfPresent(VideoConfiguration.self, forKey: ._videoConfiguration)
+            ?? nested.decodeIfPresent(VideoConfiguration.self, forKey: .videoProcessor)
     }
 }
 
@@ -682,8 +799,11 @@ enum Qwen3VLVision {
             var mask = ones([1, sequenceLength, sequenceLength], dtype: queries.dtype)
             mask = mask * MLXArray(-1e9, dtype: queries.dtype)
 
+            // `1 ..< 0` traps: an empty cu_seqlens (no grid, or an invalid array
+            // after a failed upstream op) must leave the mask fully masked, not
+            // kill the process.
             let seqlens = cuSeqlens.asArray(Int.self)
-            for idx in 1 ..< seqlens.count {
+            for idx in stride(from: 1, to: seqlens.count, by: 1) {
                 let start = seqlens[idx - 1]
                 let end = seqlens[idx]
                 mask[0..., start ..< end, start ..< end] = MLXArray(0, dtype: queries.dtype)
@@ -708,10 +828,10 @@ enum Qwen3VLVision {
         @ModuleInfo(key: "linear_fc2") var linear2: Linear
         @ModuleInfo(key: "act") var activation: GELU
 
-        init(dim: Int, hiddenDim: Int) {
+        init(dim: Int, hiddenDim: Int, activation: GELU.Approximation = .fast) {
             _linear1.wrappedValue = Linear(dim, hiddenDim, bias: true)
             _linear2.wrappedValue = Linear(hiddenDim, dim, bias: true)
-            _activation.wrappedValue = GELU(approximation: .fast)
+            _activation.wrappedValue = GELU(approximation: activation)
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -725,11 +845,11 @@ enum Qwen3VLVision {
         @ModuleInfo(key: "attn") var attention: Attention
         @ModuleInfo(key: "mlp") var mlp: MLP
 
-        init(_ config: Qwen3VLConfiguration.VisionConfiguration) {
+        init(_ config: Qwen3VLConfiguration.VisionConfiguration, mlpActivation: GELU.Approximation = .fast) {
             _norm1.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-6)
             _norm2.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-6)
             _attention.wrappedValue = Attention(dim: config.hiddenSize, numHeads: config.numHeads)
-            _mlp.wrappedValue = MLP(dim: config.hiddenSize, hiddenDim: config.intermediateSize)
+            _mlp.wrappedValue = MLP(dim: config.hiddenSize, hiddenDim: config.intermediateSize, activation: mlpActivation)
         }
 
         func callAsFunction(
@@ -759,7 +879,7 @@ enum Qwen3VLVision {
         @ModuleInfo(key: "deepstack_merger_list") var deepstackMergers: [PatchMerger]
         let deepstackVisualIndexes: [Int]
 
-        init(_ config: Qwen3VLConfiguration.VisionConfiguration) {
+        init(_ config: Qwen3VLConfiguration.VisionConfiguration, mlpActivation: GELU.Approximation = .fast) {
             self.config = config
             self.spatialMergeSize = config.spatialMergeSize
             self.numGridPerSide = Int(sqrt(Double(config.numPositionEmbeddings)))
@@ -778,7 +898,7 @@ enum Qwen3VLVision {
                 embeddingCount: config.numPositionEmbeddings,
                 dimensions: config.hiddenSize)
 
-            _blocks.wrappedValue = (0 ..< config.depth).map { _ in VisionBlock(config) }
+            _blocks.wrappedValue = (0 ..< config.depth).map { _ in VisionBlock(config, mlpActivation: mlpActivation) }
             _merger.wrappedValue = PatchMerger(config: config, usePostShuffleNorm: false)
 
             _deepstackMergers.wrappedValue = config.deepstackVisualIndexes.map { _ in

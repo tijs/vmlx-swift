@@ -267,10 +267,57 @@ public final class ErrorBox: @unchecked Sendable {
 
     /// Throw the ``firstError`` if set, otherwise do nothing.
     public func check() throws {
-        if let _firstError {
-            throw _firstError
+        if let firstError {
+            throw firstError
         }
     }
+}
+
+/// Process-wide record of MLX runtime errors, kept regardless of which
+/// handler (task-local, global, or the `fatalError` default) consumed them.
+///
+/// Hosts such as osaurus install a non-fatal global handler so a C++ error
+/// inside a forward pass (`[metal::malloc] ...`, `[METAL] Command buffer
+/// execution failed ...`, a JIT compile failure) is logged instead of taking
+/// the process down. After such an error the arrays downstream of the failed
+/// primitive are never realized. The generation loops snapshot
+/// ``sequence()`` before a step and consult ``message(since:)`` afterwards so
+/// the request that owned the failed step is finished with a
+/// `GenerationFailure` instead of decoding zero-filled host reads.
+public enum MLXErrorMonitor {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var _sequence: UInt64 = 0
+    nonisolated(unsafe) private static var _lastMessage: String?
+
+    /// Monotonic count of MLX errors dispatched in this process.
+    public static func sequence() -> UInt64 {
+        lock.withLock { _sequence }
+    }
+
+    /// The most recent MLX error message, if any.
+    public static var lastMessage: String? {
+        lock.withLock { _lastMessage }
+    }
+
+    /// The most recent MLX error message if at least one error was dispatched
+    /// after `sequence` was captured, else `nil`.
+    public static func message(since sequence: UInt64) -> String? {
+        lock.withLock { _sequence > sequence ? _lastMessage : nil }
+    }
+
+    static func record(_ message: String) {
+        lock.withLock {
+            _sequence &+= 1
+            _lastMessage = message
+        }
+    }
+}
+
+/// Route a Swift-detected MLX failure through the same handler chain as a
+/// C++ `mlx_error`, so hosts see it exactly where they see every other MLX
+/// error (task-local handler, global handler, or `fatalError`).
+func reportMLXError(_ message: String) {
+    errorHandler.dispatch(message)
 }
 
 /// Internal hook for the MLX error handling -- this sets the `mlx_set_error_handler` once to the
@@ -285,6 +332,20 @@ private let errorHandler: ErrorHandler = {
 /// Ensure that the error handler is installed.
 func initError() {
     _ = errorHandler
+}
+
+/// Route "an invalid array reached Swift-side shape logic" through the same
+/// path as a C++ MLX error.
+///
+/// An invalid array (``MLXArray/isValid`` == `false`) is the value a failed
+/// `mlx-c` call returns when a recovering error handler is installed, so the
+/// originating error has already been dispatched. This reports the Swift-side
+/// use with a message naming the site, lets any scoped ``ErrorBox`` keep its
+/// first (originating) error, and under the default handler stays fatal like
+/// every other MLX error.
+func reportInvalidArrayUse(_ site: String) {
+    errorHandler.dispatch(
+        "\(site) applied to an invalid MLXArray: the MLX operation that produced it failed")
 }
 
 /// Forward the error to the `ErrorHandler` singleton.  See `errorHandler` (above) for how this is
@@ -333,6 +394,7 @@ private final class ErrorHandler: @unchecked Sendable {
 
     /// entry point when an error is encountered in the C++ MLX layer
     func dispatch(_ message: String) {
+        MLXErrorMonitor.record(message)
         if let handler = Self.errorHandler.last {
             handler(message)
         } else {

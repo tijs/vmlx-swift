@@ -13,10 +13,11 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("decode does not bias or force reasoning close tokens")
     func decodeDoesNotBiasOrForceReasoningCloseTokens() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
 
         #expect(!evaluate.contains("ReasoningCloseBiasConfig"))
@@ -34,7 +35,8 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         // These assertions are what keep `ReasoningBudget` on the right side
         // of the rule above: it may exist, but it may never arm itself.
         let budget = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/ReasoningBudget.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/ReasoningBudget.swift"),
             encoding: .utf8)
         #expect(evaluate.contains("public var reasoningBudgetTokens: Int? = nil"))
         #expect(evaluate.contains("public var reasoningBudgetCloseTokenID: Int? = nil"))
@@ -54,25 +56,181 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("sampling applies temperature before probability filters")
     func samplingAppliesTemperatureBeforeProbabilityFilters() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         #expect(evaluate.contains("Temperature is applied before probability filters"))
         #expect(evaluate.contains("var logprobs = logSoftmax(logits * (1 / temp))"))
-        #expect(evaluate.contains("return categorical(logprobs)"))
+        // The draw lives inside the request-owned RNG wrapper; a bare return
+        // spelling is not part of the temperature/filter-order contract.
+        #expect(evaluate.contains("categorical(logprobs)"))
         #expect(!evaluate.contains("return categorical(logprobs * (1 / temp))"))
         #expect(evaluate.contains("var logprobs = logSoftmax(logits * (1 / MLXArray(temperature)))"))
         #expect(evaluate.contains("return softmax(logprobs, axis: -1, precise: true)"))
         #expect(!evaluate.contains("return softmax(logprobs * (1 / MLXArray(temperature))"))
     }
 
+    @Test(
+        "ordinary and speculative sampling scale before nucleus filtering",
+        arguments: [[3], [1, 3], [1, 1, 3]], [0, 2])
+    func temperatureFilterDistributionsAndDraws(shape: [Int], topK: Int) throws {
+        try FocusedMLXTestSupport.withLock {
+            for dtype in [DType.float32, DType.bfloat16] {
+                let logits = MLX.log(MLXArray([Float(0.5), 0.3, 0.2]))
+                    .asType(dtype).reshaped(shape)
+                // Exercise the public speculative API with the same ranks as
+                // the ordinary sampler; retain singleton axes through filtering.
+                let nativeLogits = logits
+                let parameters = GenerateParameters(
+                    temperature: 0.5, topP: 0.6, topK: topK, randomSeed: 42)
+                let ordinary = parameters.sampler()
+                let speculative = SpeculativeSamplingController(parameters: parameters)
+                let oneHot = MLXArray([Float(1), 0, 0])
+                let filtered = TopPSampler(
+                    temperature: 0.5, topP: 0.6, topK: topK, randomSeed: 42
+                )
+                .filteredLogprobs(logits)
+                let ordinaryProbabilities = softmax(filtered, axis: -1, precise: true).reshaped(-1)
+                let speculativeProbabilities = speculative.probabilities(logits: nativeLogits)
+                    .reshaped(
+                        -1)
+                #expect(MLX.max(abs(ordinaryProbabilities - oneHot)).item(Float.self) < 0.00001)
+                #expect(MLX.max(abs(speculativeProbabilities - oneHot)).item(Float.self) < 0.00001)
+                for _ in 0 ..< 64 {
+                    #expect(ordinary.sample(logits: logits).item(Int.self) == 0)
+                    #expect(speculative.sample(logits: nativeLogits).token.item(Int.self) == 0)
+                }
+
+                // At T=1 the same nucleus retains two tokens. Filtering before
+                // scaling at T=0.5 would incorrectly retain these two as well.
+                let host = logits.asType(.float32).reshaped(-1).asArray(Float.self)
+                let first = Foundation.exp(Double(host[0]))
+                let second = Foundation.exp(Double(host[1]))
+                let neutralExpected = MLXArray([
+                    Float(first / (first + second)), Float(second / (first + second)), 0,
+                ])
+                let neutralParameters = GenerateParameters(
+                    temperature: 1, topP: 0.6, topK: topK, randomSeed: 42)
+                let neutral = neutralParameters.sampler()
+                let neutralSpeculative = SpeculativeSamplingController(
+                    parameters: neutralParameters)
+                let neutralProbabilities = neutralSpeculative.probabilities(logits: nativeLogits)
+                    .reshaped(-1)
+                #expect(
+                    MLX.max(abs(neutralProbabilities - neutralExpected)).item(Float.self) < 0.00001)
+                var neutralTokens = Set<Int>()
+                for _ in 0 ..< 64 {
+                    neutralTokens.insert(neutral.sample(logits: logits).item(Int.self))
+                }
+                #expect(neutralTokens == Set([0, 1]))
+
+                // Independent host calculation verifies the temperature itself
+                // without a nucleus or top-k filter to collapse the distribution.
+                let weights = host.map { Foundation.exp(Double($0) / 0.5) }
+                let total = weights.reduce(0, +)
+                let expected = MLXArray(weights.map { Float($0 / total) })
+                let unfiltered = SpeculativeSamplingController(
+                    parameters: GenerateParameters(
+                        temperature: 0.5, randomSeed: 42)
+                ).probabilities(logits: logits).reshaped(-1)
+                #expect(MLX.max(abs(unfiltered - expected)).item(Float.self) < 0.00001)
+            }
+        }
+    }
+
+    @Test(
+        "speculative filters preserve distinct rows and last-axis masks",
+        arguments: [[3, 5], [1, 3, 5], [3, 1, 5]])
+    func speculativeFiltersPreserveDistinctRows(shape: [Int]) {
+        FocusedMLXTestSupport.withLock {
+            let weights: [Float] = [
+                0.8, 0.15, 0.03, 0.01, 0.01,
+                0.1, 0.6, 0.2, 0.08, 0.02,
+                0.4, 0.35, 0.1, 0.09, 0.06,
+            ]
+            for dtype in [DType.float32, DType.bfloat16] {
+                let logits = MLX.log(MLXArray(weights)).asType(dtype).reshaped(shape)
+                let host = logits.asType(.float32).reshaped(-1).asArray(Float.self)
+                var expected: [Float] = []
+                for row in 0 ..< 3 {
+                    let scaled = host[(row * 5) ..< ((row + 1) * 5)].map { Double($0) / 0.75 }
+                    let maximum = scaled.max()!
+                    let mass = scaled.map { Foundation.exp($0 - maximum) }
+                    let total = mass.reduce(0, +)
+                    let probabilities = mass.map { $0 / total }
+                    let ordered = probabilities.indices.sorted {
+                        probabilities[$0] > probabilities[$1]
+                    }
+                    var kept = [Double](repeating: 0, count: 5)
+                    var prefixMass: Double = 0
+                    for (rank, id) in ordered.enumerated() {
+                        let inNucleus = prefixMass < 0.9
+                        prefixMass += probabilities[id]
+                        if inNucleus, rank < 2,
+                            probabilities[id] >= probabilities[ordered[0]] * 0.75
+                        {
+                            kept[id] = probabilities[id]
+                        }
+                    }
+                    let keptMass = kept.reduce(0, +)
+                    #expect(keptMass > 0)
+                    expected += kept.map { Float($0 / keptMass) }
+                }
+                let controller = SpeculativeSamplingController(
+                    parameters: GenerateParameters(
+                        temperature: 0.75, topP: 0.9, topK: 2, minP: 0.75, randomSeed: 7))
+                let actual = controller.probabilities(logits: logits)
+                #expect(actual.shape == shape)
+                #expect(
+                    MLX.max(abs(actual.reshaped(-1) - MLXArray(expected))).item(Float.self)
+                        < 0.00001)
+                let sampled = controller.sample(logits: logits).token
+                #expect(sampled.shape == Array(shape.dropLast()))
+                let ids = sampled.asType(.int32).reshaped(-1).asArray(Int32.self)
+                #expect(ids.count == 3)
+                for (row, id) in ids.enumerated() {
+                    #expect(id >= 0 && id < 5)
+                    if id >= 0, id < 5 { #expect(expected[row * 5 + Int(id)] > 0) }
+                }
+            }
+        }
+    }
+
+    @Test(
+        "speculative acceptance and residual correction accept singleton row ranks",
+        arguments: [[3], [1, 3], [1, 1, 3]])
+    func speculativeAcceptancePreservesSingletonRows(shape: [Int]) throws {
+        try FocusedMLXTestSupport.withLock {
+            let controller = SpeculativeSamplingController(
+                parameters: GenerateParameters(
+                    temperature: 1, randomSeed: 7))
+            let same = MLXArray([Float(0.1), 0.7, 0.2]).reshaped(shape)
+            let accepted = controller.acceptOrCorrect(
+                draftToken: MLXArray([Int32(1)]), targetProbabilities: same,
+                draftProbabilities: same, acceptanceRoll: { 0.99 })
+            #expect(accepted.accepted && accepted.acceptanceProbability == 1)
+            #expect(accepted.correction == nil)
+            let target = MLXArray([Float(0.1), 0.2, 0.7]).reshaped(shape)
+            let draft = MLXArray([Float(0.7), 0.2, 0.1]).reshaped(shape)
+            let rejected = controller.acceptOrCorrect(
+                draftToken: MLXArray([Int32(0)]), targetProbabilities: target,
+                draftProbabilities: draft, acceptanceRoll: { 0.99 })
+            #expect(!rejected.accepted)
+            #expect(abs(rejected.acceptanceProbability - Float(1.0 / 7.0)) < 0.000001)
+            let correction = try #require(rejected.correction)
+            #expect(correction.size == 1 && correction.item(Int.self) == 2)
+        }
+    }
+
     @Test("Nemotron Omni image preprocessing uses dynamic source grid")
     func nemotronOmniImagePreprocessingUsesDynamicSourceGrid() throws {
         let model = try String(
-            contentsOfFile: "Libraries/MLXVLM/Models/NemotronHOmni/NemotronHOmni.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXVLM/Models/NemotronHOmni/NemotronHOmni.swift"),
             encoding: .utf8)
         let preprocessors = try String(
-            contentsOfFile: "Libraries/MLXVLM/Models/NemotronHOmni/Preprocessors.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXVLM/Models/NemotronHOmni/Preprocessors.swift"),
             encoding: .utf8)
 
         #expect(model.contains("let gridH = pixelValues.dim(2) / config.visionPatchSize"))
@@ -110,15 +268,24 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
 
     @Test("RunBench gates do not count reasoning-only output as visible")
     func runBenchGatesDoNotCountReasoningOnlyOutputAsVisible() throws {
-        let files = [
-            "RunBench/Bench.swift",
-            "RunBench/StabilityBench.swift",
-            "RunBench/VLBench.swift",
-            "RunBench/OmniBench.swift",
-            "RunBench/JangPressRegressionBench.swift",
-        ]
+        // The retired cold-tier regression driver was removed with its APIs.
+        // RunBench now builds the directory's current Swift sources: inventory
+        // them all instead of pinning this guard to a deleted driver.
+        let root = FocusedMLXTestSupport.sourceURL("RunBench")
+        let enumerator = try #require(
+            FileManager.default.enumerator(
+                at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]))
+        let files = enumerator.compactMap { $0 as? URL }
+            .filter { $0.pathExtension == "swift" }
+            .sorted { $0.path < $1.path }
+        #expect(!files.isEmpty)
+        #expect(
+            Set(files.map(\.lastPathComponent)).isSuperset(of: [
+                "Bench.swift", "StabilityBench.swift", "VLBench.swift", "OmniBench.swift",
+            ]))
         for file in files {
-            let source = try String(contentsOfFile: file, encoding: .utf8)
+            let source = try String(contentsOf: file, encoding: .utf8)
+            #expect(!source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             #expect(!source.contains("text.isEmpty ? reasoning : text"))
             #expect(!source.contains("visible.isEmpty ? reasoning : visible"))
             #expect(!source.contains("visible.isEmpty ? r.reasoning : visible"))
@@ -132,23 +299,24 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
             #expect(!source.contains("let combined = text + reasoning"))
             #expect(!source.contains("(text + reasoning).count"))
             #expect(!source.contains("(text + reasoning).isEmpty"))
+            #expect(
+                !source.contains(
+                    "var p = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)"))
         }
 
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         #expect(bench.contains("Reasoning-only output is a"))
         let stability = try String(
-            contentsOfFile: "RunBench/StabilityBench.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/StabilityBench.swift"),
             encoding: .utf8)
         #expect(stability.contains("empty visible output"))
-        let jangPress = try String(
-            contentsOfFile: "RunBench/JangPressRegressionBench.swift",
-            encoding: .utf8)
-        #expect(!jangPress.contains("var p = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)"))
     }
 
     @Test("VL media-salt proof reports token rate and peak memory gate")
     func vlMediaSaltProofReportsTokenRateAndPeakMemoryGate() throws {
-        let source = try String(contentsOfFile: "RunBench/VLBench.swift", encoding: .utf8)
+        let source = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/VLBench.swift"), encoding: .utf8)
 
         #expect(source.contains("mediaSalt memory pre-load"))
         #expect(source.contains("mediaSalt memory post-load"))
@@ -161,7 +329,8 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
 
     @Test("VL batch chat reports peak memory gate")
     func vlBatchChatReportsPeakMemoryGate() throws {
-        let source = try String(contentsOfFile: "RunBench/VLBench.swift", encoding: .utf8)
+        let source = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/VLBench.swift"), encoding: .utf8)
 
         #expect(source.contains("VL batch memory pre-load"))
         #expect(source.contains("VL batch memory post-load"))
@@ -174,7 +343,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("live model matrix exits nonzero when rows fail")
     func liveModelMatrixExitsNonzeroWhenRowsFail() throws {
         let source = try String(
-            contentsOfFile: "scripts/vmlx-live-model-matrix.sh",
+            contentsOf: FocusedMLXTestSupport.sourceURL("scripts/vmlx-live-model-matrix.sh"),
             encoding: .utf8)
 
         #expect(source.contains("grep -q $'\\tfail:'"))
@@ -211,7 +380,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("terminal info snapshots unclosed reasoning between the two flushes")
     func terminalInfoSnapshotsUnclosedReasoningBetweenTheTwoFlushes() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         guard
@@ -254,22 +423,25 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("growing chat cache probe distinguishes unsafe template divergence")
     func growingChatCacheProbeDistinguishesUnsafeTemplateDivergence() throws {
         let bench = try String(
-            contentsOfFile: "RunBench/Bench.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"),
             encoding: .utf8)
         let tokenizer = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Tokenizer.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Tokenizer.swift"),
             encoding: .utf8)
         let input = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/LanguageModel.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/LanguageModel.swift"),
             encoding: .utf8)
         let processor = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/ModelContainer.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/ModelContainer.swift"),
             encoding: .utf8)
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         #expect(bench.contains("Native turn-2 common prefix"))
@@ -293,7 +465,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("growing chat verifier failures exit instead of crashing async main")
     func growingChatVerifierFailuresExitInsteadOfCrashingAsyncMain() throws {
         let bench = try String(
-            contentsOfFile: "RunBench/Bench.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"),
             encoding: .utf8)
         guard let envCheck = bench.range(
             of: "if (env[\"BENCH_GROWING_CHAT_CACHE\"] ?? \"0\") == \"1\""),
@@ -313,7 +485,8 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("history-boundary rederive feeds remaining tokens batch-first")
     func historyBoundaryRederiveUsesBatchFirstRemainingTokens() throws {
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         guard let start = engine.range(of: "func boundarySnapshot(tokens: [Int]"),
               let end = engine.range(
@@ -337,7 +510,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("TokenIterator history-boundary rederive feeds remaining tokens batch-first")
     func tokenIteratorHistoryBoundaryRederiveUsesBatchFirstRemainingTokens() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         guard let start = evaluate.range(of: "private func cacheSnapshotForBoundary("),
               let end = evaluate.range(
@@ -583,7 +756,8 @@ struct HarmonyParserFocusedTests {
 
     @Test("BatchEngine tool-call live probe supplies tools and rejects empty rows")
     func batchEngineToolCallProbeRequiresBehavioralEvidence() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let function = try #require(
             Self.extractFunction(named: "runBatchEngineToolCall", from: bench),
             "runBatchEngineToolCall not found"
@@ -609,7 +783,7 @@ struct HarmonyParserFocusedTests {
     @Test("Gemma4 VLM processor renders normalized tools and preserves raw schemas")
     func gemma4VLMProcessorRendersNormalizedToolsAndPreservesRawSchemas() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXVLM/Models/Gemma4.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXVLM/Models/Gemma4.swift"),
             encoding: .utf8)
 
         #expect(source.contains("normalizedToolsForChatTemplate(input.tools)"))
@@ -619,7 +793,8 @@ struct HarmonyParserFocusedTests {
 
     @Test("Harmony live reasoning probe honors generation defaults")
     func harmonyLiveReasoningProbeHonorsGenerationDefaults() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let function = try #require(
             Self.extractFunction(named: "runHarmonyReasoningCheck", from: bench),
             "runHarmonyReasoningCheck not found"
@@ -631,7 +806,8 @@ struct HarmonyParserFocusedTests {
 
     @Test("Qwen multi-turn tool probe honors generation defaults")
     func qwenMultiturnToolProbeHonorsGenerationDefaults() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let function = try #require(
             Self.extractFunction(named: "runQwenMultiturnToolCheck", from: bench),
             "runQwenMultiturnToolCheck not found"
@@ -650,7 +826,8 @@ struct HarmonyParserFocusedTests {
 
     @Test("Qwen multi-turn tool probe keeps prepared tool schemas")
     func qwenMultiturnToolProbeKeepsPreparedToolSchemas() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let function = try #require(
             Self.extractFunction(named: "runQwenMultiturnToolCheck", from: bench),
             "runQwenMultiturnToolCheck not found"
@@ -665,7 +842,7 @@ struct HarmonyParserFocusedTests {
     @Test("Qwen multi-turn tool matrix uses production token budget")
     func qwenMultiturnToolMatrixUsesProductionTokenBudget() throws {
         let script = try String(
-            contentsOfFile: "scripts/vmlx-live-model-matrix.sh",
+            contentsOf: FocusedMLXTestSupport.sourceURL("scripts/vmlx-live-model-matrix.sh"),
             encoding: .utf8)
         guard let row = script.range(of: "\"${name}.qwen_multiturn_tool\""),
               let nextRow = script.range(
@@ -684,7 +861,8 @@ struct HarmonyParserFocusedTests {
 
     @Test("DSV4 coherence gate honors bundle defaults")
     func dsv4CoherenceGateHonorsGenerationDefaults() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let function = try #require(
             Self.extractFunction(named: "runDSV4CoherenceGate", from: bench),
             "runDSV4CoherenceGate not found"
@@ -2062,12 +2240,12 @@ struct Gemma4VLMFocusedSourceContractsTests {
     }
 
     private func gemma4VLMSource() throws -> String {
-        let url = URL(fileURLWithPath: "Libraries/MLXVLM/Models/Gemma4.swift")
+        let url = FocusedMLXTestSupport.sourceURL("Libraries/MLXVLM/Models/Gemma4.swift")
         return try String(contentsOf: url, encoding: .utf8)
     }
 
     private func focusedRepositoryFile(_ relativePath: String) throws -> String {
-        let url = URL(fileURLWithPath: relativePath)
+        let url = FocusedMLXTestSupport.sourceURL(relativePath)
         return try String(contentsOf: url, encoding: .utf8)
     }
 }

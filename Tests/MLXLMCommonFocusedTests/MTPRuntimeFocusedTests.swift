@@ -1475,7 +1475,7 @@ struct MTPRuntimeFocusedTests {
 
     @Test("recursive MTP contract models D3 hidden-state draft verify")
     func recursiveMTPContractModelsD3HiddenStateDraftVerify() {
-        let contract = MTPRecursiveDraftContract.mtplxDepth3
+        let contract = MTPRecursiveDraftContract.recursiveDepth3
 
         #expect(contract.depth == 3)
         #expect(contract.draftStepReturnsHiddenState)
@@ -1831,6 +1831,123 @@ struct MTPRuntimeFocusedTests {
             "try Task.checkCancellation()\n        MLX.eval(lastLogits, retained)"))
     }
 
+    /// Final sweep 2026-10-07: a single `mtp.fc.weight`, index-only names (shard missing or not containing the
+    /// key) and a header without payload all reported a complete head and auto-launched native MTP. Completeness
+    /// now needs tensors physically present in shard headers AND a head topology (fusion projection + compute block).
+    @Test("native MTP completeness needs physically present tensors and a real head topology")
+    func nativeMTPCompletenessRejectsPartialAndPhantomHeads() throws {
+        func bundle(_ name: String, index: [String: String]?, shards: [String: [String: Int]]) throws -> MTPBundleStatus {
+            let root = try makeTemporaryBundle(name: name)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let config: [String: Any] = ["model_type": "qwen4_exp", "num_hidden_layers": 4, "mtp_num_hidden_layers": 1]
+            try JSONSerialization.data(withJSONObject: config).write(to: root.appendingPathComponent("config.json"))
+            if let index {
+                try JSONSerialization.data(withJSONObject: ["weight_map": index])
+                    .write(to: root.appendingPathComponent("model.safetensors.index.json"))
+            }
+            // shards: file -> tensor -> payload bytes actually written (2 = complete, 0 = header only).
+            for (file, tensors) in shards {
+                var header: [String: Any] = [:]
+                var written = 0
+                for (i, entry) in tensors.sorted(by: { $0.key < $1.key }).enumerated() {
+                    header[entry.key] = ["dtype": "F16", "shape": [1], "data_offsets": [i * 2, i * 2 + 2]]
+                    written += entry.value
+                }
+                let bytes = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+                var length = UInt64(bytes.count).littleEndian
+                var data = withUnsafeBytes(of: &length) { Data($0) }
+                data.append(bytes)
+                data.append(Data(count: written))
+                try data.write(to: root.appendingPathComponent(file))
+            }
+            return try MTPBundleInspector.inspect(modelDirectory: root)
+        }
+        let head = [
+            "mtp.fc_hidden.weight": 2, "mtp.fc_embedding.weight": 2,
+            "mtp.layers.0.self_attn.q_proj.weight": 2, "mtp.layers.0.mlp.shared_expert.down_proj.weight": 2,
+            "model.layers.0.self_attn.q_proj.weight": 2,
+        ]
+        let shard = "model-00001-of-00001.safetensors"
+        let indexFor = { (names: [String: Int]) in names.mapValues { _ in shard } }
+
+        let complete = try bundle("mtp-complete", index: indexFor(head), shards: [shard: head])
+        #expect(complete.hasCompleteMTPArtifact)
+        #expect(complete.tensorCount == 4)
+
+        // Both branches of split fusion are required; either alone leaves an initialized projection.
+        for missing in ["mtp.fc_hidden.weight", "mtp.fc_embedding.weight"] {
+            let partial = head.filter { $0.key != missing }
+            let status = try bundle("mtp-missing-" + missing, index: indexFor(partial), shards: [shard: partial])
+            #expect(status.bundleHasMTP)
+            #expect(!status.hasCompleteMTPArtifact)
+            #expect(!status.speculativeDecodeEnabled)
+            #expect(status.incompleteTopologyReason == "no fusion projection")
+        }
+
+        // Complete head physically in the indexed shard but omitted from the index: still discovered.
+        var partialIndex = indexFor(head)
+        partialIndex = partialIndex.filter { !$0.key.hasPrefix("mtp.") }
+        partialIndex["model.layers.0.self_attn.q_proj.weight"] = shard
+        let headerDiscovered = try bundle("mtp-header-discovered", index: partialIndex, shards: [shard: head])
+        #expect(headerDiscovered.hasCompleteMTPArtifact)
+
+        let fcOnly = try bundle(
+            "mtp-fc-only", index: nil,
+            shards: [shard: ["mtp.fc.weight": 2, "model.layers.0.self_attn.q_proj.weight": 2]])
+        #expect(fcOnly.bundleHasMTP)
+        #expect(!fcOnly.hasCompleteMTPArtifact)
+        #expect(fcOnly.incompleteTopologyReason == "no attention, mixer or MLP block")
+        #expect(!fcOnly.speculativeDecodeEnabled)
+
+        let missingShard = try bundle(
+            "mtp-index-missing-shard",
+            index: ["mtp.fc.weight": "model-00002-of-00002.safetensors", "model.layers.0.self_attn.q_proj.weight": shard],
+            shards: [shard: ["model.layers.0.self_attn.q_proj.weight": 2]])
+        #expect(!missingShard.bundleHasMTP)
+        #expect(!missingShard.hasCompleteMTPArtifact)
+
+        let notInShard = try bundle(
+            "mtp-index-not-in-shard",
+            index: ["mtp.fc.weight": shard, "mtp.layers.0.self_attn.q_proj.weight": shard],
+            shards: [shard: ["model.layers.0.self_attn.q_proj.weight": 2]])
+        #expect(!notInShard.bundleHasMTP)
+
+        var truncated = head
+        for key in truncated.keys where key.hasPrefix("mtp.") { truncated[key] = 0 }
+        truncated["model.layers.0.self_attn.q_proj.weight"] = 0
+        let headerOnly = try bundle("mtp-header-only", index: indexFor(head), shards: [shard: truncated])
+        #expect(!headerOnly.bundleHasMTP)
+        #expect(!headerOnly.hasCompleteMTPArtifact)
+
+        // A stray head file outside the index is not inspected.
+        let stray = try bundle(
+            "mtp-stray-file",
+            index: ["model.layers.0.self_attn.q_proj.weight": shard],
+            shards: [shard: ["model.layers.0.self_attn.q_proj.weight": 2], "mtp-extra.safetensors": head])
+        #expect(!stray.hasCompleteMTPArtifact)
+    }
+
+    @Test("MTP topology accepts every installed family layout")
+    func mtpTopologyAcceptsInstalledFamilyLayouts() {
+        // Flash-Next / Allosaurus (qwen4_exp), Qwen3.8-27B source, Ling, Nemotron Lightning.
+        #expect(MTPBundleInspector.mtpTopologyGap([
+            "mtp.fc_hidden.weight", "mtp.fc_embedding.weight", "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.mlp.experts.gate_up_proj.weight",
+        ]) == nil)
+        #expect(MTPBundleInspector.mtpTopologyGap([
+            "mtp.fc.weight", "mtp.layers.0.self_attn.q_proj.weight", "mtp.layers.0.mlp.down_proj.weight",
+        ]) == nil)
+        #expect(MTPBundleInspector.mtpTopologyGap([
+            "model.layers.20.eh_proj.weight", "model.layers.20.attention.query_key_value.weight",
+            "model.layers.20.mlp.experts.0.down_proj.weight",
+        ]) == nil)
+        #expect(MTPBundleInspector.mtpTopologyGap([
+            "mtp.layers.0.eh_proj.weight", "mtp.layers.0.enorm.weight", "mtp.layers.1.mixer.gate.weight",
+        ]) == nil)
+        #expect(MTPBundleInspector.mtpTopologyGap(["mtp.fc.weight"]) != nil)
+        #expect(MTPBundleInspector.mtpTopologyGap(["mtp.layers.0.self_attn.q_proj.weight"]) != nil)
+    }
+
     @Test("native MTP prefill has cancellation checkpoints around GPU materialization")
     func nativeMTPInitChecksCancellationBeforeGPUStages() throws {
         let testFile = URL(fileURLWithPath: #filePath)
@@ -1843,12 +1960,49 @@ struct MTPRuntimeFocusedTests {
                 "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift"),
             encoding: .utf8)
 
+        let prefillStart = try #require(source.range(of: "let start = NativeMTPClock.now()"))
+        let prepareCall = try #require(
+            source.range(of: "let prepared = try NativeMTPPromptPrimer.$current.withValue(primer)"))
+        #expect(prefillStart.lowerBound < prepareCall.lowerBound)
+        #expect(
+            source[prefillStart.lowerBound ..< prepareCall.lowerBound].contains(
+                "try Task.checkCancellation()"))
+        #expect(source.contains("try prepareCapturingCacheBoundaries("))
+        // The boundary-capturing prefill checks between every chunk and before the tail.
         #expect(source.contains(
-            "try Task.checkCancellation()\n        let prepared = try model.prepare("))
+            "for boundary in wanted.sorted() {\n            try Task.checkCancellation()"))
+        #expect(source.contains(
+                "try Task.checkCancellation()\n        return try prepareReporting(segment(consumed, size)"
+            ))
         #expect(source.contains(
             "try Task.checkCancellation()\n        let bridge = model.nativeBackboneForward"))
         #expect(source.contains(
             "try Task.checkCancellation()\n        let draftBatch = Self.makeDrafts("))
+    }
+
+    @Test("already-cancelled native MTP initialization performs no model work")
+    func nativeMTPAlreadyCancelledInitializationDoesNotPrepare() async throws {
+        try await FocusedMLXTestSupport.withLock {
+            let model = FocusedNativeMTPProbeTarget()
+            let input = LMInput(tokens: MLXArray([3, 5, 7]))
+            let task = Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                do {
+                    _ = try NativeMTPTokenIterator(
+                        input: input, model: model,
+                        parameters: GenerateParameters(maxTokens: 4, temperature: 0), depth: 3)
+                    Issue.record("Cancelled initialization unexpectedly succeeded")
+                } catch is CancellationError {
+                    // The cancellation must escape before prepare or either forward path.
+                } catch {
+                    Issue.record("Expected CancellationError, received \(error)")
+                }
+            }
+            await task.value
+            #expect(model.prepareCalls == 0)
+            #expect(model.backboneCalls == 0)
+            #expect(model.draftCalls == 0)
+        }
     }
 
     @Test("BatchEngine.submit rejects native MTP instead of silently batching AR")
@@ -1941,7 +2095,9 @@ struct MTPRuntimeFocusedTests {
             let model = FocusedNativeMTPProbeTarget()
             let context = Self.nativeMTPDispatchContext(model: model)
             let engine = BatchEngine(context: context, maxBatchSize: 2)
-            var params = GenerateParameters(maxTokens: 4, temperature: 0)
+            // Allow seed and AR timing-calibration tokens before requiring an
+            // actual verify cycle. Four tokens stop before verification starts.
+            var params = GenerateParameters(maxTokens: 12, temperature: 0)
             params.draftStrategy = .nativeMTP(depth: 3)
 
             let stream = await engine.generate(
@@ -2183,6 +2339,54 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("JANG semantic metadata loads a nonzero three-bit projection")
+    func jangSemanticMetadataLoadsNonzeroThreeBitProjection() throws {
+        try FocusedMLXTestSupport.withLock {
+            let base = "model.layers.0.self_attn.q_proj"
+            let source = MLXArray((0 ..< 16 * 3_072).map { Float(($0 % 37) - 18) / 19 })
+                .reshaped(16, 3_072)
+            let (weight, scales, optionalBiases) = MLX.quantized(source, groupSize: 128, bits: 3)
+            let biases = try #require(optionalBiases)
+            eval(weight, scales, biases)
+            let stale = BaseConfiguration.Quantization(groupSize: 64, bits: 6, mode: .affine)
+            let inferred = JangLoader.inferPerLayerQuantization(
+                weights: [
+                    "\(base).weight": weight, "\(base).scales": scales, "\(base).biases": biases,
+                ],
+                jangConfig: JangConfig(
+                    quantization: JangQuantization(
+                        blockSize: 128, bitWidthsUsed: [3, 6])),
+                hiddenSizeHint: 3_072,
+                validInDims: [1_536, 3_072],
+                declaredDefaultQuantization: stale,
+                declaredPerLayerQuantization: .init(
+                    quantization: stale, perLayerQuantization: [base: .quantize(stale)]))
+            guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                Issue.record("Expected a realizable language projection")
+                return
+            }
+            #expect(actual.bits == 3)
+            #expect(actual.groupSize == 128)
+            // A wrong pair has the wrong input width; preserve the assertion
+            // failure instead of invoking a backend shape precondition.
+            guard actual.bits == 3, actual.groupSize == 128 else { return }
+            let input = MLXArray((0 ..< 3_072).map { Float(($0 % 11) - 5) / 7 }).reshaped(1, 3_072)
+            let loaded = QuantizedLinear(
+                weight: weight, scales: scales, biases: biases,
+                groupSize: actual.groupSize, bits: actual.bits)
+            let result = loaded(input)
+            let dense = MLX.dequantized(
+                weight, scales: scales, biases: biases, groupSize: 128, bits: 3)
+            let reference = matmul(input, dense.T)
+            eval(result, reference)
+            #expect(result.shape == [1, 16])
+            let magnitude = MLX.max(abs(reference)).item(Float.self)
+            #expect(magnitude > 0.001)
+            #expect(
+                MLX.max(abs(result - reference)).item(Float.self) < max(0.001, magnitude * 0.0001))
+        }
+    }
+
     @Test("JANG vision position embedding does not inherit language hidden width")
     func jangVisionPositionEmbeddingDoesNotInheritLanguageHiddenWidth() {
         FocusedMLXTestSupport.withLock {
@@ -2211,6 +2415,44 @@ struct MTPRuntimeFocusedTests {
             }
             #expect(actual.bits == 8)
             #expect(actual.groupSize == 64)
+        }
+    }
+
+    @Test(
+        arguments: [
+            "visual", "vision_tower", "model.vision_model", "audio_tower", "model.audio_encoder",
+            "speech_encoder",
+        ], [false, true])
+    func jangNonLanguageTowerKeepsConsistentDeclaration(prefix: String, skipAlias: Bool) {
+        FocusedMLXTestSupport.withLock {
+            for suffix in ["embed_tokens", "layers.0.self_attn.q_proj"] {
+                let alias = "\(prefix).\(suffix)"
+                let base = skipAlias ? "language_model.\(alias)" : alias
+                let weights: [String: MLXArray] = [
+                    "\(base).weight": MLXArray.zeros([16, 384], dtype: .uint32),
+                    "\(base).scales": MLXArray.zeros([16, 24], dtype: .float16),
+                ]
+                let declared = BaseConfiguration.Quantization(groupSize: 64, bits: 8, mode: .affine)
+                var declarations: [String: BaseConfiguration.QuantizationOption] = [
+                    base: .quantize(declared)
+                ]
+                if skipAlias { declarations[alias] = .skip }
+                let inferred = JangLoader.inferPerLayerQuantization(
+                    weights: weights,
+                    jangConfig: JangConfig(
+                        quantization: JangQuantization(
+                            blockSize: 128, bitWidthsUsed: [4, 8])),
+                    hiddenSizeHint: 3_072,
+                    validInDims: [1_536, 3_072],
+                    declaredDefaultQuantization: declared,
+                    declaredPerLayerQuantization: .init(
+                        quantization: declared, perLayerQuantization: declarations))
+                guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                    Issue.record("Expected declared non-language quantization for \(base)")
+                    continue
+                }
+                #expect(actual == declared)
+            }
         }
     }
 
@@ -3073,10 +3315,34 @@ struct MTPRuntimeFocusedTests {
             withJSONObject: object,
             options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url)
+        // The inspector counts only tensors physically present in shard headers (an index entry alone is not
+        // loadable), so an index fixture also writes header-only shards holding exactly its mapped tensors.
+        if url.lastPathComponent == "model.safetensors.index.json",
+            let weightMap = object["weight_map"] as? [String: Any]
+        {
+            try Self.writeHeaderOnlyShards(
+                weightMap.compactMapValues { $0 as? String }, in: url.deletingLastPathComponent())
+        }
+    }
+
+    /// One tiny F16 tensor per name; header byte ranges match the payload so the entries are physically valid.
+    static func writeHeaderOnlyShards(_ weightMap: [String: String], in directory: URL) throws {
+        for (file, names) in Dictionary(grouping: weightMap.keys, by: { weightMap[$0]! }) {
+            var header: [String: Any] = [:]
+            for (i, name) in names.sorted().enumerated() {
+                header[name] = ["dtype": "F16", "shape": [1], "data_offsets": [i * 2, i * 2 + 2]]
+            }
+            let bytes = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+            var length = UInt64(bytes.count).littleEndian
+            var data = withUnsafeBytes(of: &length) { Data($0) }
+            data.append(bytes)
+            data.append(Data(count: names.count * 2))
+            try data.write(to: directory.appendingPathComponent(file))
+        }
     }
 
     private static func source(_ relativePath: String) throws -> String {
-        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let root = FocusedMLXTestSupport.sourceURL("")
         let url = root.appendingPathComponent(relativePath)
         return try String(contentsOf: url, encoding: .utf8)
     }
@@ -3170,9 +3436,13 @@ private final class FocusedNativeMTPProbeTarget: Module, LanguageModel, NativeMT
 {
     var kvHeads: [Int] { [1] }
     var nativeMTPAvailable: Bool { true }
+    private(set) var prepareCalls = 0
+    private(set) var backboneCalls = 0
+    private(set) var draftCalls = 0
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
-        .tokens(input.text)
+        prepareCalls += 1
+        return .tokens(input.text)
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -3184,7 +3454,8 @@ private final class FocusedNativeMTPProbeTarget: Module, LanguageModel, NativeMT
     }
 
     func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
-        NativeMTPForwardResult(
+        backboneCalls += 1
+        return NativeMTPForwardResult(
             logits: logits(for: inputs),
             hiddenStates: hiddenStates(for: inputs))
     }
@@ -3194,7 +3465,8 @@ private final class FocusedNativeMTPProbeTarget: Module, LanguageModel, NativeMT
         nextTokenIds: MLXArray,
         cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        NativeMTPForwardResult(
+        draftCalls += 1
+        return NativeMTPForwardResult(
             logits: logits(for: nextTokenIds),
             hiddenStates: self.hiddenStates(for: nextTokenIds))
     }

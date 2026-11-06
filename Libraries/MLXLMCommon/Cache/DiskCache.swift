@@ -95,6 +95,14 @@ public struct DiskCacheStats: Sendable {
     /// boundary payload can be hundreds of megabytes, and a store → restore
     /// round trip that fails once fails every turn.
     public let rejectedRewritesSuppressed: Int
+    /// Tensor bytes of the payload the most recent fetch served (what its
+    /// restore reads from disk); 0 until a fetch has served one.
+    public let lastFetchPayloadBytes: Int64
+    /// Wall time of that fetch's read: from the loader's open to every
+    /// tensor materialized on the CPU stream. 0 until there has been one.
+    /// A host attaches it to a failure report so a slow restore (a cold page
+    /// cache, a contended volume) is told apart from slow prefill compute.
+    public let lastFetchMs: Double
 
     init(
         hits: Int, misses: Int, stores: Int, storeSkips: Int,
@@ -105,7 +113,8 @@ public struct DiskCacheStats: Sendable {
         lastQuotaPassTick: UInt64 = 0, lastPressureEventTick: UInt64 = 0,
         unreadablePayloadFetches: Int = 0, opaqueBytes: Int64 = 0,
         rejectedDiskRestores: Int = 0, rejectedRewritesSuppressed: Int = 0,
-        capacityPressureByChain: [String: DiskCachePressureRecord] = [:]
+        capacityPressureByChain: [String: DiskCachePressureRecord] = [:],
+        lastFetchPayloadBytes: Int64 = 0, lastFetchMs: Double = 0
     ) {
         self.hits = hits
         self.misses = misses
@@ -128,6 +137,8 @@ public struct DiskCacheStats: Sendable {
         self.opaqueBytes = opaqueBytes
         self.rejectedDiskRestores = rejectedDiskRestores
         self.rejectedRewritesSuppressed = rejectedRewritesSuppressed
+        self.lastFetchPayloadBytes = lastFetchPayloadBytes
+        self.lastFetchMs = lastFetchMs
     }
 
     /// The same counters over a different usage figure (the coordinator's
@@ -144,7 +155,8 @@ public struct DiskCacheStats: Sendable {
             unreadablePayloadFetches: unreadablePayloadFetches, opaqueBytes: opaqueBytes,
             rejectedDiskRestores: rejectedDiskRestores,
             rejectedRewritesSuppressed: rejectedRewritesSuppressed,
-            capacityPressureByChain: capacityPressureByChain)
+            capacityPressureByChain: capacityPressureByChain,
+            lastFetchPayloadBytes: lastFetchPayloadBytes, lastFetchMs: lastFetchMs)
     }
 }
 
@@ -174,6 +186,8 @@ struct DiskCacheQuotaEntry: Sendable {
     var isPostAnswer: Bool = false
     var isCanonicalCheckpoint: Bool = false
     var chainId: String? = nil
+    /// The model/quantization cache namespace stored with this row.
+    var modelKey: String? = nil
 }
 
 /// A recurrent companion the v2 index counts but cannot attach to a KV row:
@@ -463,6 +477,9 @@ public final class DiskCache: @unchecked Sendable {
     public private(set) var refusedOccupiedStores: Int = 0
     /// See ``DiskCacheStats/unreadablePayloadFetches``.
     public private(set) var unreadablePayloadFetches: Int = 0
+    /// See ``DiskCacheStats/lastFetchPayloadBytes`` / ``DiskCacheStats/lastFetchMs``.
+    private var lastFetchPayloadBytes: Int64 = 0
+    private var lastFetchMs: Double = 0
     /// See ``DiskCacheStats/rejectedDiskRestores``.
     public private(set) var rejectedDiskRestores: Int = 0
     /// See ``DiskCacheStats/rejectedRewritesSuppressed``.
@@ -499,14 +516,28 @@ public final class DiskCache: @unchecked Sendable {
     /// skipped. Used on both sides of the disk boundary: a record is neither
     /// written nor restored when it is not entirely finite.
     static func nonFiniteTensorNames(in arrays: [String: MLXArray], limit: Int = 4) -> [String] {
+        // Screen: one plain sum per tensor, one evaluation, one host read. A sum is non-finite
+        // exactly when an element is NaN or ±inf (NaN propagates, inf + -inf is NaN), so a payload
+        // that passes needs nothing more. This is one read of the payload; the exact count below
+        // (isFinite, int32 cast, subtract, sum) makes several full-size passes plus temporaries and
+        // cost 160-240 ms per K2 boundary at 23k tokens, on every store of every turn.
+        // A flagged sum (a real non-finite element, or a finite overflow of a half-precision sum)
+        // is recounted exactly, so a false alarm costs time but never refuses a good payload.
+        let keys = arrays.keys.sorted().filter { key in
+            guard let array = arrays[key] else { return false }
+            return array.dtype.isFloatingPoint && array.size > 0
+        }
+        guard !keys.isEmpty else { return [] }
+        let finite = MLX.isFinite(MLX.stacked(keys.map { arrays[$0]!.sum() })).asArray(Bool.self)
+        let suspects = zip(keys, finite).filter { !$0.1 }.map(\.0)
+        guard !suspects.isEmpty else { return [] }
+        let counts = MLX.stacked(
+            suspects.map { (1 - MLX.isFinite(arrays[$0]!).asType(.int32)).sum() })
+        let host = counts.asArray(Int32.self)
         var names: [String] = []
-        for key in arrays.keys.sorted() {
-            guard let array = arrays[key], array.dtype.isFloatingPoint, array.size > 0 else { continue }
-            let nonFinite = (1 - MLX.isFinite(array).asType(.int32)).sum().item(Int32.self)
-            if nonFinite > 0 {
-                names.append("\(key)(\(nonFinite))")
-                if names.count >= limit { break }
-            }
+        for (key, nonFinite) in zip(suspects, host) where nonFinite > 0 {
+            names.append("\(key)(\(nonFinite))")
+            if names.count >= limit { break }
         }
         return names
     }
@@ -539,6 +570,484 @@ public final class DiskCache: @unchecked Sendable {
     /// prompt boundary after a cache hit, while a fresh process still validates
     /// an inherited file before it can take the fast path.
     private var validatedFiles: [String: ValidatedRecord] = [:]
+
+    // MARK: Write-behind (publish the store, persist in the background)
+    //
+    // A store used to write its file synchronously: the producer task (and so the next turn, which
+    // waits for the model lease the producer holds) waited for the bytes to reach the SSD. K2 Horizon
+    // at 9.4k context writes two ~1.4 GB boundaries per turn: ~110 ms each on an M5 Max internal SSD,
+    // seconds on a slower SSD, on every tool call and every turn. Now the MLX-owning part (validation,
+    // materialization) still runs here under the IO lock, the evaluated arrays' bytes are handed
+    // (zero-copy) to a serial writer that does plain file I/O (`SafetensorsByteWriter`), rename and
+    // index row, and the entry is served from memory while in flight: a lookup of it never waits for
+    // the write and never re-reads it. `VMLX_DISK_WRITE_BEHIND=0` restores the synchronous write.
+
+    /// Test/A-B tool: pace cache writes to this many MB/s (`VMLX_DISK_SIMULATE_WRITE_MBPS`), in both
+    /// the synchronous and the write-behind path, to reproduce a slower SSD on a fast machine.
+    static let simulatedWriteBytesPerSecond: Double? = ProcessInfo.processInfo
+        .environment["VMLX_DISK_SIMULATE_WRITE_MBPS"].flatMap(Double.init).map { $0 * 1_000_000 }
+
+    static func paceSimulatedWrite(bytes: Int, since start: Date) {
+        guard let rate = simulatedWriteBytesPerSecond, rate > 0 else { return }
+        let remaining = Double(bytes) / rate - Date().timeIntervalSince(start)
+        if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
+    }
+
+    static let writeBehindEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DISK_WRITE_BEHIND"] != "0"
+
+    /// Whether this instance writes behind. The cache coordinator (the serving path) turns it on;
+    /// a directly constructed cache stays synchronous unless a caller opts in.
+    var writeBehind = false
+    /// Test hook: extra delay before a write-behind file write starts.
+    var writeDelayForTesting: TimeInterval?
+
+    private var writesBehind: Bool { writeBehind && Self.writeBehindEnabled }
+
+    private final class InflightWrite: @unchecked Sendable {
+        let arrays: [String: MLXArray]
+        // Immutable CPU views travel with their evaluated backing-array owners.
+        let tensors: [SafetensorsByteWriter.Tensor]
+        let tokenCount: Int
+        let bytes: Int
+        let geometry: RecurrentGeometry
+        let payloadReservation: DiskWriterPayloadBudget.Reservation?
+        // Read and written under the owning DiskCache lock.
+        var invalidated = false
+        var chainId: String?
+        var rowKind: Int64
+        init(arrays: [String: MLXArray], tensors: [SafetensorsByteWriter.Tensor], tokenCount: Int, bytes: Int, geometry: RecurrentGeometry, chainId: String?, rowKind: Int64,
+             payloadReservation: DiskWriterPayloadBudget.Reservation? = nil) {
+            self.arrays = arrays
+            self.tensors = tensors
+            self.tokenCount = tokenCount
+            self.bytes = bytes
+            self.geometry = geometry
+            self.payloadReservation = payloadReservation
+            self.chainId = chainId
+            self.rowKind = rowKind
+        }
+
+        /// Host-side NaN/Inf screen of `tensors` (``SafetensorsByteWriter/nonFiniteTensorNames(_:)``),
+        /// started at enqueue on a concurrent queue so it overlaps the writer's queue wait. Nothing
+        /// that needs the payload's verdict proceeds without it: the writer and an in-flight fetch
+        /// both call ``awaitScreen()``. The screen takes no lock, so waiting under one is safe.
+        private let screenDone = DispatchGroup()
+        private var screenResult: [String] = []
+
+        func startScreen() {
+            screenDone.enter()
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                screenResult = SafetensorsByteWriter.nonFiniteTensorNames(tensors)
+                screenDone.leave()
+            }
+        }
+
+        /// Names of non-finite tensors (empty when the payload is clean). Blocks until the screen ends.
+        func awaitScreen() -> [String] {
+            screenDone.wait()
+            return screenResult
+        }
+
+        /// What `hasValidatedEntry`/`hasDurableEntry` answer for it: the payload passed the store's
+        /// non-finite check and is materialized; it is on its way to disk, so it never needs producing
+        /// again (asking otherwise would rederive a boundary that is being written).
+        func satisfies(tokenCount: Int, requireNativeRecurrent: Bool) -> Bool {
+            self.tokenCount == tokenCount && geometry != .incomplete
+                && (!requireNativeRecurrent || geometry == .native)
+        }
+    }
+
+    private final class WeakCache: @unchecked Sendable {
+        weak var value: DiskCache?
+        init(_ value: DiskCache) { self.value = value }
+    }
+    private static let activeCaches = OSAllocatedUnfairLock(initialState: [WeakCache]())
+
+    /// Invalidate queued publications before an external purge of this root. The caller must hold
+    /// MLXCacheIOLock so stores and writer publication cannot race the purge. Includes caches whose
+    /// model has unloaded but whose writer still owns pending buffers. No disk wait or buffer copy.
+    public static func invalidatePendingWrites(in directory: URL) {
+        let root = directory.standardizedFileURL.resolvingSymlinksInPath().path
+        let caches = activeCaches.withLock { entries in
+            entries = entries.filter { $0.value != nil }
+            return entries.compactMap(\.value)
+        }
+        for cache in caches
+        where cache.cacheDir.standardizedFileURL.resolvingSymlinksInPath().path == root {
+            cache.lock.lock()
+            for entry in cache.inflight.values { entry.invalidated = true }
+            cache.lock.unlock()
+        }
+    }
+
+    /// Entries whose file is still being written, by content hash (under `lock`).
+    private var inflight: [String: InflightWrite] = [:]
+    private var inflightBytes = 0
+    private var inflightStoreCount = 0
+    private let writerQueue = DispatchQueue(label: "vmlx.disk-cache.writer", qos: .userInitiated)
+    private let pendingWrites = DispatchGroup()
+    private let inflightChanged = NSCondition()
+    private(set) var writeBehindStores = 0
+    private(set) var inflightFetches = 0
+    private(set) var lastWriteBehindMs: Double = 0
+
+    /// Bytes allowed in flight before a store waits for older writes (back-pressure: the old
+    /// synchronous behavior, never a refusal). One eighth of physical memory.
+    static var inflightByteBudget: Int {
+        inflightByteBudgetOverrideForTesting ?? Int(ProcessInfo.processInfo.physicalMemory / 8)
+    }
+    nonisolated(unsafe) static var inflightByteBudgetOverrideForTesting: Int?
+
+    // MARK: Resident entries (the RAM tier of whole-snapshot entries)
+    //
+    // A store's evaluated payload used to be dropped the moment its file landed, so the next turn
+    // of a chat, and the request after every tool call, read its prefix back from the SSD: open,
+    // `pread` every tensor, materialize on the CPU stream and screen the floating-point tensors
+    // for NaN/Inf, each time. Caches the paged tier cannot hold (DeepSeek-V4 pools, MiniMax-M3
+    // sparse lanes, every disk-backed topology) had no RAM tier at all, and with the paged tier
+    // off (the default serving settings) no model had one.
+    //
+    // Now a stored or read payload stays here, by content hash, within `residentByteBudget`
+    // (least recently used first out; the entry just stored or served is never the one evicted to
+    // make room for itself). A fetch serves it with no file read and no screen: it is the same
+    // evaluated arrays the store screened and wrote. An entry is served only while its index row
+    // exists and its file is the one written or read (size and modification time), so every way
+    // a payload leaves the disk tier (quota, clear, rejection, replacement by another process)
+    // also takes it out of RAM. The arrays are never mutated: a restore seats views of them and
+    // the next update writes new buffers.
+
+    private final class ResidentEntry {
+        let arrays: [String: MLXArray]
+        let tokenCount: Int
+        let bytes: Int
+        let file: ValidatedFileFingerprint
+        var lastUse: UInt64
+        init(arrays: [String: MLXArray], tokenCount: Int, bytes: Int, file: ValidatedFileFingerprint,
+             lastUse: UInt64) {
+            self.arrays = arrays
+            self.tokenCount = tokenCount
+            self.bytes = bytes
+            self.file = file
+            self.lastUse = lastUse
+        }
+    }
+
+    /// Resident payloads by content hash (under `lock`).
+    private var resident: [String: ResidentEntry] = [:]
+    private var residentBytes = 0
+    private var residentClock: UInt64 = 0
+    private(set) var residentHits = 0
+
+    /// Bytes of payload kept resident after a store or a read. 0 keeps none (the old behavior:
+    /// drop the payload once its file is on disk). The coordinator sets it from
+    /// ``CacheCoordinatorConfig/residentEntryBytes``.
+    public var residentByteBudget: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _residentByteBudget }
+        set {
+            lock.lock()
+            _residentByteBudget = max(0, newValue)
+            _trimResidentLocked(protecting: nil)
+            lock.unlock()
+        }
+    }
+    private var _residentByteBudget = 0
+
+    /// Entries, bytes and hits of the resident set.
+    public var residentStats: (entries: Int, bytes: Int, hits: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (resident.count, residentBytes, residentHits)
+    }
+
+    /// Fraction of MLX's memory limit above which a payload is not kept resident (advisory only:
+    /// the payload is then dropped once written, as before, and served from the SSD next time).
+    static let residentMemoryLimitFraction = 0.92
+
+    /// Keep `arrays` resident for `hash`. Caller holds `lock`.
+    private func _retainResidentLocked(
+        hash: String, arrays: [String: MLXArray], tokenCount: Int, file: ValidatedFileFingerprint
+    ) {
+        guard _residentByteBudget > 0 else { return }
+        let bytes = arrays.values.reduce(0) { partial, array in
+            let (sum, overflow) = partial.addingReportingOverflow(array.nbytes)
+            return overflow ? Int.max : sum
+        }
+        if let existing = resident.removeValue(forKey: hash) { residentBytes -= existing.bytes }
+        guard bytes <= _residentByteBudget else { return }
+        let limit = Memory.memoryLimit
+        if limit > 0, Double(Memory.activeMemory) > Self.residentMemoryLimitFraction * Double(limit) {
+            // Under memory pressure the RAM copy would be the first thing to cost the next prefill.
+            _trimResidentLocked(protecting: nil, toBytes: 0)
+            return
+        }
+        residentClock &+= 1
+        resident[hash] = ResidentEntry(
+            arrays: arrays, tokenCount: tokenCount, bytes: bytes, file: file, lastUse: residentClock)
+        residentBytes += bytes
+        _trimResidentLocked(protecting: hash)
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            RuntimeDiagnostics.write(Data(
+                ("[vmlx][cache/resident] keep count=\(tokenCount) hash=\(hash.prefix(12)) bytes=\(bytes) "
+                    + "entries=\(resident.count) residentBytes=\(residentBytes) budget=\(_residentByteBudget)\n").utf8))
+        }
+    }
+
+    /// Evict least recently used entries until the set fits `toBytes` (default: the budget),
+    /// never `protecting`. Caller holds `lock`.
+    private func _trimResidentLocked(protecting: String?, toBytes: Int? = nil) {
+        let target = toBytes ?? _residentByteBudget
+        while residentBytes > target {
+            guard let victim = resident
+                .filter({ $0.key != protecting })
+                .min(by: { $0.value.lastUse < $1.value.lastUse })
+            else { break }
+            resident.removeValue(forKey: victim.key)
+            residentBytes -= victim.value.bytes
+        }
+    }
+
+    /// Drop the resident copy of `hash`. Caller holds `lock`.
+    private func _dropResidentLocked(_ hash: String) {
+        if let entry = resident.removeValue(forKey: hash) { residentBytes -= entry.bytes }
+    }
+
+    /// The resident payload of `hash` when it may still be served. Caller holds `lock`.
+    private func _residentPayloadLocked(hash: String, url: URL, tokenCount: Int) -> [String: MLXArray]? {
+        guard let entry = resident[hash] else { return nil }
+        guard entry.tokenCount == tokenCount, validatedFiles[hash]?.file == entry.file,
+              _fileFingerprint(url: url) == entry.file,
+              db == nil || _entryMetadataLocked(hash: hash) != nil
+        else {
+            _dropResidentLocked(hash)
+            return nil
+        }
+        residentClock &+= 1
+        entry.lastUse = residentClock
+        return entry.arrays
+    }
+
+    /// Release every resident payload (memory pressure, unload).
+    public func releaseResidentEntries() {
+        lock.lock()
+        resident.removeAll()
+        residentBytes = 0
+        lock.unlock()
+    }
+
+    /// Number of stores whose file is still being written.
+    public var pendingWriteCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return inflightStoreCount
+    }
+
+    /// Wait until every write-behind store has reached disk and its index row. Shutdown, unload,
+    /// clear and tests call this; a timeout only logs. Returns whether everything settled.
+    @discardableResult
+    public func waitForPendingWrites(timeout: TimeInterval = 30) -> Bool {
+        let settled = pendingWrites.wait(timeout: .now() + timeout) == .success
+        if !settled {
+            RuntimeDiagnostics.write(Data(
+                "[vmlx][cache/disk-write-behind] pending writes did not settle within \(Int(timeout)) s\n".utf8))
+        }
+        return settled
+    }
+
+
+    /// Called off the generation owner. The group leaves inside the writer
+    /// closure; a serial queue barrier additionally proves its captured payload
+    /// owners have returned before the idle allocator purge is requested.
+    func waitForPendingPayloadRelease() -> Bool {
+        guard waitForPendingWrites() else { return false }
+        writerQueue.sync {}
+        return true
+    }
+
+    /// OFF by default; `VMLX_CACHE_READAHEAD=1` enables it (A/B only).
+    ///
+    /// Measured 2026-10-11 (RunBench `K2MT_IOBENCH=1`, files proven cold with `mincore` = 0 % resident,
+    /// alternating arms): K2-sized 4.1 GB / 145 tensors, plain 325 ms vs read-ahead 405 ms (5/5 rounds
+    /// slower); 0.79 GB / 257 tensors, 62 vs 87 ms. MLX's `ParallelFileReader` already reads a cold
+    /// cache file at ~12.7 GB/s; the extra kernel read-ahead only competes with it. Python's R2 helps
+    /// there because its tier is hundreds of tiny block files read one by one; Swift restores one large
+    /// file. Do not enable by default without a measurement that beats these.
+    static let readAheadEnabled = ProcessInfo.processInfo.environment["VMLX_CACHE_READAHEAD"] == "1"
+
+    /// Ask the kernel to start reading the whole payload file before MLX loads it.
+    ///
+    /// `loadArraysAndMetadata` maps nothing: each tensor is a lazy load that `pread`s its own byte range
+    /// when the restore evaluates it, one tensor after another. When the file is not in the page cache
+    /// (after an app restart, or after macOS dropped file pages under memory pressure next to a large
+    /// model), every tensor then waits for its own SSD read. `F_RDADVISE` queues asynchronous read-ahead
+    /// for the whole file up front (Python R2's idea, `F_RDADVISE` / `POSIX_FADV_WILLNEED`), so the reads
+    /// overlap. A hint only: no data is loaded into the process, nothing is retained, and a file already
+    /// in the page cache costs one `fcntl` per GiB.
+    static func adviseReadAhead(url: URL, force: Bool = false) {
+        guard readAheadEnabled || force else { return }
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_size > 0 else { return }
+        let size = Int(info.st_size)
+        var offset = 0
+        while offset < size {
+            let count = min(size - offset, 1 << 30)
+            #if canImport(Darwin)
+                var advice = radvisory(ra_offset: off_t(offset), ra_count: Int32(count))
+                _ = fcntl(fd, F_RDADVISE, &advice)
+            #else
+                _ = posix_fadvise(fd, off_t(offset), off_t(count), POSIX_FADV_WILLNEED)
+            #endif
+            offset += count
+        }
+    }
+
+    /// Whether queued write-behind bytes are within ``inflightByteBudget``.
+    var hasWriteBehindRoom: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return inflightBytes <= Self.inflightByteBudget
+    }
+
+    /// Stores that found the budget full and wrote synchronously instead of queueing.
+    public private(set) var writeBehindBudgetFallbacks = 0
+
+    /// Block until queued write-behind bytes fit the budget. Call ONLY while holding no lock the
+    /// writer needs (`CombinedDiskCacheQuotaLock`, this cache's lock): the writer must be able to
+    /// finish and publish what is queued.
+    public func waitForWriteBehindRoom() {
+        guard writesBehind else { return }
+        waitForInflightBudget()
+    }
+
+    private func waitForInflightBudget() {
+        let budget = Self.inflightByteBudget
+        inflightChanged.lock()
+        defer { inflightChanged.unlock() }
+        while true {
+            lock.lock()
+            let pending = inflightBytes
+            lock.unlock()
+            if pending <= budget { return }
+            _ = inflightChanged.wait(until: Date().addingTimeInterval(0.25))
+        }
+    }
+
+    /// Writer-queue half of a write-behind store: file I/O, publish, index row. No MLX calls.
+    private func completeWriteBehind(
+        hash: String, finalURL: URL, tensors: [SafetensorsByteWriter.Tensor], tokenCount: Int,
+        replayChunkSize: Int?, enforceQuota: Bool,
+        layout: [String], geometry: RecurrentGeometry, enqueued: Date, entry: InflightWrite
+    ) -> String? {
+        if let delay = writeDelayForTesting { Thread.sleep(forTimeInterval: delay) }
+        let start = Date()
+        var outcome = "stored"
+        let nonFinite = entry.awaitScreen()
+        if !nonFinite.isEmpty {
+            outcome = "refused-non-finite"
+            lock.lock()
+            entry.invalidated = true
+            refusedNonFiniteStores += 1
+            stores -= 1
+            lock.unlock()
+            RuntimeDiagnostics.write(Data(
+                ("[vmlx][cache/disk-store] REFUSED non-finite payload count=\(tokenCount) "
+                    + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") tensors=\(nonFinite)\n").utf8))
+        } else { do {
+            let tmp = temporaryURLForTesting?(finalURL) ?? Self.temporaryURL(for: finalURL)
+            switch Self.removeRegularFile(at: tmp) {
+            case .removed, .missing: break
+            case .notRegularFile, .failed:
+                throw DiskCacheIntegrityError.occupiedTemporaryName(tmp.lastPathComponent)
+            }
+            let written = try SafetensorsByteWriter.write(tensors, metadata: ["format": "mlx"], to: tmp)
+            Self.paceSimulatedWrite(bytes: written, since: start)
+            guard Self.isCompleteSafetensors(url: tmp) else {
+                _ = Self.removeRegularFile(at: tmp)
+                throw DiskCacheIntegrityError.incompleteWrite(finalURL.lastPathComponent)
+            }
+            MLXDiskCacheIOLock.shared.lock()
+            defer { MLXDiskCacheIOLock.shared.unlock() }
+            lock.lock()
+            defer { lock.unlock() }
+            if entry.invalidated {
+                _ = Self.removeRegularFile(at: tmp)
+                outcome = "cleared"
+            } else if _refuseOccupiedStoreLocked(finalURL: finalURL, hash: hash, tokenCount: tokenCount) {
+                _ = Self.removeRegularFile(at: tmp)
+                outcome = "refused-occupied"
+            } else {
+                try publishFaultForTesting?()
+                let code = Self.renameFile(from: tmp, to: finalURL)
+                if code == EISDIR || code == ENOTDIR {
+                    _ = Self.removeRegularFile(at: tmp)
+                    _recordRefusedOccupiedStoreLocked(
+                        finalURL: finalURL, hash: hash, tokenCount: tokenCount)
+                    outcome = "refused-occupied"
+                } else if code != 0 {
+                    _ = Self.removeRegularFile(at: tmp)
+                    throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+                } else {
+                    let fileSize =
+                        (try? FileManager.default.attributesOfItem(atPath: finalURL.path))?[.size]
+                        as? Int ?? 0
+                    let insertResult = _insertEntryLocked(
+                        hash: hash, tokenCount: tokenCount, fileSize: fileSize,
+                        chainId: entry.chainId, kind: entry.rowKind, replayChunkSize: replayChunkSize)
+                    if insertResult != SQLITE_DONE {
+                        _ = Self.removeRegularFile(at: finalURL)
+                        validatedFiles.removeValue(forKey: hash)
+                        _dropResidentLocked(hash)
+                        failedIndexWrites += 1
+                        outcome = "index-insert-failed"
+                    } else {
+                        if let fingerprint = _fileFingerprint(url: finalURL), fingerprint.size > 0 {
+                            validatedFiles[hash] = ValidatedRecord(
+                                file: fingerprint, layout: layout, recurrentGeometry: geometry)
+                            _retainResidentLocked(
+                                hash: hash, arrays: entry.arrays, tokenCount: tokenCount, file: fingerprint)
+                        } else {
+                            validatedFiles.removeValue(forKey: hash)
+                            _dropResidentLocked(hash)
+                        }
+                        if rejectedRestores.removeValue(forKey: hash) != nil {
+                            rewrittenAfterRejection.insert(hash)
+                        }
+                        if enforceQuota { _evictIfNeededLocked() }
+                    }
+                }
+            }
+        } catch {
+            outcome = "failed"
+            RuntimeDiagnostics.write(Data(
+                "[vmlx][cache/disk] write-behind store failed for hash \(hash): \(error)\n".utf8))
+        } }
+        let end = Date()
+        lock.lock()
+        let finalizedChainId = entry.chainId
+        if inflight[hash] === entry { inflight.removeValue(forKey: hash) }
+        inflightBytes -= entry.bytes
+        inflightStoreCount -= 1
+        lastWriteBehindMs = end.timeIntervalSince(start) * 1000
+        lock.unlock()
+        // Drop the payload here, as soon as its bytes are on disk: holding it until the next request
+        // would keep up to a full context of KV above the model's idle footprint between turns.
+        // (MLX's allocator free path is mutex-protected; the arrays are evaluated and unshared.)
+        // The writer owns entry until this call returns, including after clear/replacement.
+        inflightChanged.lock()
+        inflightChanged.broadcast()
+        inflightChanged.unlock()
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            RuntimeDiagnostics.write(Data(
+                ("[vmlx][cache/disk-write-behind] settled count=\(tokenCount) hash=\(hash.prefix(12)) "
+                    + "outcome=\(outcome) queuedMs=\(Int(start.timeIntervalSince(enqueued) * 1000)) "
+                    + "writeMs=\(Int(end.timeIntervalSince(start) * 1000))\n").utf8))
+        }
+        MemoryStageTrace.log("write-settled", tokens: tokenCount, detail: "payload-held-by-writer")
+        return finalizedChainId
+    }
 
     /// Entries an engine could not restore into the running model's cache
     /// (``markRestoreRejected(tokens:mediaSalt:)``), with the fingerprint of
@@ -623,7 +1132,9 @@ public final class DiskCache: @unchecked Sendable {
             opaqueBytes: lastOpaqueBytes,
             rejectedDiskRestores: rejectedDiskRestores,
             rejectedRewritesSuppressed: rejectedRewritesSuppressed,
-            capacityPressureByChain: capacityPressureByChain)
+            capacityPressureByChain: capacityPressureByChain,
+            lastFetchPayloadBytes: lastFetchPayloadBytes,
+            lastFetchMs: lastFetchMs)
     }
 
     // MARK: - Initialization
@@ -659,12 +1170,21 @@ public final class DiskCache: @unchecked Sendable {
         self.modelKey = modelKey
         self.retireRetryInterval = retireRetryInterval
         self.now = now
+        defer {
+            Self.activeCaches.withLock { entries in
+                entries = entries.filter { $0.value != nil }
+                entries.append(WeakCache(self))
+            }
+        }
 
         // Create cache directory if needed
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         // Open SQLite database
         let dbPath = cacheDir.appendingPathComponent("cache_index.db").path
         if sqlite3_open(dbPath, &db) != SQLITE_OK {
+            // SQLite can return a live handle even when open fails. Release
+            // its connection resources before discarding the pointer.
+            if let db { sqlite3_close(db) }
             db = nil
             indexSchemaVersion = 0
             indexHasV2Columns = false
@@ -693,7 +1213,7 @@ public final class DiskCache: @unchecked Sendable {
             Self.isFirstReport(cacheDir.path, in: Self.reportedIndexCreationFailures)
         {
             // Every open tries again, so every open would say so again.
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk-index] \(DiskCacheIndexSchema.modelTokensIndexStatement) "
                     + "failed: \(Self.boundedRendering(of: failure)); carrying on without it\n")
                     .utf8))
@@ -727,7 +1247,7 @@ public final class DiskCache: @unchecked Sendable {
         // mean, and removes none of them from a listing — here, in the
         // import's sweep and in `clear()` alike.
         if indexIsFromANewerBuild {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk] integrity sweep skipped: index schema version "
                     + "\(indexSchemaVersion) is newer than this build's "
                     + "\(DiskCacheIndexSchema.currentVersion)\n").utf8))
@@ -792,7 +1312,7 @@ public final class DiskCache: @unchecked Sendable {
         guard queried else { return nil }
         for count in counts {
             let prefix = Array(targetTokens.prefix(count))
-            if case .arrays(let arrays) = fetchCandidate(
+            if case .arrays(let arrays, _) = fetchCandidate(
                 tokens: prefix, mediaSalt: contract.storageSalt(requestSalt: requestSalt))
             {
                 return (prefix, arrays)
@@ -827,6 +1347,12 @@ public final class DiskCache: @unchecked Sendable {
     /// touch the content key. Re-storing a row updates its owner to the
     /// storing conversation, keeps the previous owner when none is given, and
     /// never demotes a stable root.
+    /// Returns true when this call queues a write-behind publication. Its `afterPublish` runs
+    /// on the writer with the finalized row owner, including metadata merged by duplicate stores.
+    /// False queues no new publication: a duplicate pending payload may still be awaiting disk
+    /// and shares the first store's callback; otherwise the store or refusal finished inline.
+    /// A duplicate's own `afterPublish` is not called.
+    @discardableResult
     func store(
         tokens: [Int],
         arrays: [String: MLXArray],
@@ -836,7 +1362,32 @@ public final class DiskCache: @unchecked Sendable {
         isStableRoot: Bool = false,
         isResumeBoundary: Bool = false,
         isPostAnswer: Bool = false,
-        replayChunkSize: Int? = nil
+        replayChunkSize: Int? = nil,
+        allowWriteBehind: Bool = true,
+        afterPublish: (@Sendable (String?) -> Void)? = nil
+    ) -> Bool {
+        var deferred = false
+        storeImpl(
+            tokens: tokens, arrays: arrays, mediaSalt: mediaSalt, enforceQuota: enforceQuota,
+            chainId: chainId, isStableRoot: isStableRoot, isResumeBoundary: isResumeBoundary,
+            isPostAnswer: isPostAnswer, replayChunkSize: replayChunkSize,
+            allowWriteBehind: allowWriteBehind, afterPublish: afterPublish, deferred: &deferred)
+        return deferred
+    }
+
+    private func storeImpl(
+        tokens: [Int],
+        arrays: [String: MLXArray],
+        mediaSalt: String?,
+        enforceQuota: Bool,
+        chainId: String?,
+        isStableRoot: Bool,
+        isResumeBoundary: Bool,
+        isPostAnswer: Bool,
+        replayChunkSize: Int?,
+        allowWriteBehind: Bool,
+        afterPublish: (@Sendable (String?) -> Void)?,
+        deferred: inout Bool
     ) {
         if let replayChunkSize {
             guard indexHasReplayChunkColumn, replayChunkSize > 0,
@@ -848,10 +1399,32 @@ public final class DiskCache: @unchecked Sendable {
         defer { trace.mark("return") }
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return }
         let tokenCount = tokens.count
+        // NEVER wait for the in-flight budget here. Callers hold `CombinedDiskCacheQuotaLock` across
+        // this call, and the writer's `afterPublish` takes that same lock after each write: waiting
+        // here for the writer to drain deadlocked the engine (live 2026-10-11, Diplodocus K2 in the
+        // osaurus app, ~4.3 GB stores at 800 MB/s, four queued: the turn never finished). Callers
+        // wait for room BEFORE taking their locks (`waitForWriteBehindRoom()`); if the budget is still
+        // full at this point the store is written synchronously instead of queued.
+        var behind = writesBehind && allowWriteBehind
+        var payloadReservation: DiskWriterPayloadBudget.Reservation?
+        if behind {
+            let bytes = arrays.values.reduce(0) { partial, array in
+                let (sum, overflow) = partial.addingReportingOverflow(array.nbytes)
+                return overflow ? Int.max : sum
+            }
+            payloadReservation = DiskWriterPayloadBudget.shared.reserve(
+                bytes: bytes, limit: Self.inflightByteBudget)
+            if payloadReservation == nil {
+                behind = false
+                lock.lock()
+                writeBehindBudgetFallbacks += 1
+                lock.unlock()
+            }
+        }
         let rowKind = Self.rowKind(
             stableRoot: isStableRoot, resumeBoundary: isResumeBoundary, postAnswer: isPostAnswer)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk-store] count=\(tokenCount) hash=\(hash.prefix(12)) "
                     + "modelKey=\(modelKey ?? "nil") salt=\(mediaSalt.map { String($0.prefix(12)) } ?? "nil") "
                     + "kind=\(rowKind) "
@@ -892,23 +1465,28 @@ public final class DiskCache: @unchecked Sendable {
         // process-wide critical section as materialization and safetensors IO.
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
-        trace.mark("before-validation")
-        let nonFinite = Self.nonFiniteTensorNames(in: arrays)
-        trace.mark("validation")
-        if !nonFinite.isEmpty {
-            lock.lock()
-            refusedNonFiniteStores += 1
-            lock.unlock()
-            FileHandle.standardError.write(Data(
-                ("[vmlx][cache/disk-store] REFUSED non-finite payload count=\(tokenCount) "
-                    + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") tensors=\(nonFinite)\n").utf8))
-            return
-        }
-
         lock.lock()
         defer { lock.unlock() }
         trace.mark("locks-acquired")
-        stores += 1
+        // The two skips (already in flight, already validated on disk) come BEFORE the non-finite
+        // screen: the screen evaluates and reduces the whole payload (and materializes a lazy
+        // snapshot copy), which a store that is then skipped never needed. Before 2026-10-11 the
+        // screen ran first. A skipped store counts in `stores` as before; a refused one does not.
+        if let entry = inflight[hash], !entry.invalidated {
+            stores += 1
+            // Deduplicate tensor bytes, but keep the same ownership/kind
+            // contract as a re-store of an already-published payload.
+            entry.chainId = chainId ?? entry.chainId
+            entry.rowKind = Self.rowKind(
+                stableRoot: entry.rowKind == 1 || rowKind == 1,
+                resumeBoundary: entry.rowKind == 2 || rowKind == 2,
+                postAnswer: entry.rowKind == 3 || rowKind == 3)
+            // Publication may have finished before the writer removed its
+            // in-flight entry. Claim that SQL row too, under this same lock.
+            _claimOwnershipLocked(hash: hash, chainId: entry.chainId, kind: entry.rowKind)
+            storeSkips += 1
+            return
+        }
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             traceLastStoredTokens = tokens
             traceLastStoredHash = hash
@@ -934,6 +1512,7 @@ public final class DiskCache: @unchecked Sendable {
            indexed.fileSize == current.size,
            current.size > 0
         {
+            stores += 1
             storeSkips += 1
             _touchEntryLocked(hash: hash)
             _claimOwnershipLocked(
@@ -944,16 +1523,12 @@ public final class DiskCache: @unchecked Sendable {
                            [.int(Int64(replayChunkSize)), .text(hash)])
             }
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[vmlx][cache/disk-store] SKIP validated hash=\(hash) count=\(tokenCount) bytes=\(current.size)\n".utf8))
             }
             return
         }
-        // Refuse before the expensive part: see `_refuseOccupiedStoreLocked`.
-        if _refuseOccupiedStoreLocked(finalURL: url, hash: hash, tokenCount: tokenCount) {
-            return
-        }
-        trace.mark("reuse-and-path-check")
+        trace.mark("before-validation")
         // Pre-realize arrays under the lock so Metal work completes
         // before the writer hits the C++ save path AND no other thread
         // can interleave MLX ops on the same device during this window.
@@ -971,6 +1546,75 @@ public final class DiskCache: @unchecked Sendable {
         synchronizeComputeStream()
         let tEval = Date()
         trace.mark("materialize")
+        // A write-behind store screens its payload for NaN/Inf on the host, off this
+        // synchronous path (`InflightWrite.screen`): the writer refuses a non-finite payload
+        // before any byte reaches disk, and an in-flight fetch waits for the verdict, so nothing
+        // non-finite is published or restored either way. The GPU screen here cost 417 ms at a
+        // 130k-token Ornith 122B checkpoint (3.36 GB), on every turn's end and before every tool
+        // call. Synchronous stores keep it.
+        let behindTensors = behind ? SafetensorsByteWriter.tensors(from: arrays) : nil
+        if behindTensors == nil {
+            let nonFinite = Self.nonFiniteTensorNames(in: arrays)
+            trace.mark("validation")
+            if !nonFinite.isEmpty {
+                refusedNonFiniteStores += 1
+                RuntimeDiagnostics.write(Data(
+                    ("[vmlx][cache/disk-store] REFUSED non-finite payload count=\(tokenCount) "
+                        + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") tensors=\(nonFinite)\n").utf8))
+                return
+            }
+        }
+        stores += 1
+        // Refuse before the expensive part: see `_refuseOccupiedStoreLocked`.
+        if _refuseOccupiedStoreLocked(finalURL: url, hash: hash, tokenCount: tokenCount) {
+            return
+        }
+        trace.mark("reuse-and-path-check")
+        if behind, let tensors = behindTensors {
+            let bytes = tensors.reduce(0) { $0 + $1.byteCount }
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                // Payload shape of the handoff: strided = non-contiguous views written in place.
+                var strided = 0
+                var stridedBytes = 0
+                for tensor in tensors {
+                    if case .strided = tensor.payload {
+                        strided += 1
+                        stridedBytes += tensor.byteCount
+                    }
+                }
+                RuntimeDiagnostics.write(Data(
+                    ("[vmlx][cache/disk-write-behind] enqueue count=\(tokenCount) tensors=\(tensors.count) "
+                        + "strided=\(strided) stridedBytes=\(stridedBytes) bytes=\(bytes)\n").utf8))
+            }
+            let geometry = Self.recurrentGeometry(arrays)
+            let entry = InflightWrite(
+                arrays: arrays, tensors: tensors, tokenCount: tokenCount, bytes: bytes, geometry: geometry,
+                chainId: chainId, rowKind: rowKind, payloadReservation: payloadReservation)
+            entry.startScreen()
+            inflight[hash] = entry
+            inflightBytes += bytes
+            inflightStoreCount += 1
+            writeBehindStores += 1
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                traceLastStoredTokens = tokens
+                traceLastStoredHash = hash
+            }
+            let layout = Self.payloadLayout(arrays)
+            let enqueued = Date()
+            pendingWrites.enter()
+            writerQueue.async { [self] in
+                let finalizedChainId = completeWriteBehind(
+                    hash: hash, finalURL: url, tensors: entry.tensors, tokenCount: tokenCount,
+                    replayChunkSize: replayChunkSize,
+                    enforceQuota: enforceQuota, layout: layout, geometry: geometry,
+                    enqueued: enqueued, entry: entry)
+                afterPublish?(finalizedChainId)
+                pendingWrites.leave()
+            }
+            deferred = true
+            trace.mark("enqueued")
+            return
+        }
         do {
             // Atomic publication: the row becomes visible under its content
             // hash only after every byte is on disk. A reader that races the
@@ -989,6 +1633,8 @@ public final class DiskCache: @unchecked Sendable {
             }
             try save(arrays: arrays, metadata: ["format": "mlx"], url: url)
             synchronizeComputeStream()
+            Self.paceSimulatedWrite(
+                bytes: arrays.values.reduce(0) { $0 + $1.nbytes }, since: tEval)
             guard Self.isCompleteSafetensors(url: url) else {
                 _ = Self.removeRegularFile(at: url)
                 throw DiskCacheIntegrityError.incompleteWrite(finalURL.lastPathComponent)
@@ -1026,7 +1672,7 @@ public final class DiskCache: @unchecked Sendable {
                 // or serializing it. Splitting the two says which, instead of
                 // leaving it to inference.
                 let tSave = Date()
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/store-phase] count=\(tokenCount) "
                         + "eval=\(tEval.timeIntervalSince(tStart))s "
                         + "save=\(tSave.timeIntervalSince(tEval))s\n").utf8))
@@ -1051,8 +1697,9 @@ public final class DiskCache: @unchecked Sendable {
                 // could ever see or evict it. Take it back rather than leak it.
                 _ = Self.removeRegularFile(at: finalURL)
                 validatedFiles.removeValue(forKey: hash)
+                _dropResidentLocked(hash)
                 failedIndexWrites += 1
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/disk-store] index insert failed rc=\(insertResult) "
                         + "hash=\(hash.prefix(12)) — payload removed\n").utf8))
                 return
@@ -1062,8 +1709,10 @@ public final class DiskCache: @unchecked Sendable {
                 validatedFiles[hash] = ValidatedRecord(
                     file: fingerprint, layout: Self.payloadLayout(arrays),
                     recurrentGeometry: Self.recurrentGeometry(arrays))
+                _retainResidentLocked(hash: hash, arrays: arrays, tokenCount: tokenCount, file: fingerprint)
             } else {
                 validatedFiles.removeValue(forKey: hash)
+                _dropResidentLocked(hash)
             }
             // What was refused has just been replaced — the one time this
             // process does that for the entry.
@@ -1079,7 +1728,7 @@ public final class DiskCache: @unchecked Sendable {
             // the caller's request — the model output is already
             // produced. But LOG to stderr so operational failures
             // surface instead of hiding silently.
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/disk] store failed for hash \(hash): \(error)\n"
                 .utf8))
         }
@@ -1100,7 +1749,8 @@ public final class DiskCache: @unchecked Sendable {
     private func _recordRefusedOccupiedStoreLocked(finalURL: URL, hash: String, tokenCount: Int) {
         refusedOccupiedStores += 1
         validatedFiles.removeValue(forKey: hash)
-        FileHandle.standardError.write(Data(
+        _dropResidentLocked(hash)
+        RuntimeDiagnostics.write(Data(
             ("[vmlx][cache/disk-store] REFUSED occupied path count=\(tokenCount) "
                 + "hash=\(hash.prefix(12)) — \(finalURL.lastPathComponent) is not a regular file "
                 + "and is left alone; nothing published\n").utf8))
@@ -1136,9 +1786,29 @@ public final class DiskCache: @unchecked Sendable {
             touchRecency: touchRecency, countHit: countHit)
     }
 
+    /// Where a fetched payload came from.
+    enum FetchSource {
+        /// Read from its file on the SSD.
+        case file
+        /// Kept resident in RAM (the opt-in RAM tier, ``residentByteBudget``).
+        case resident
+        /// Its file is still being written: the writer's payload, released once the file lands.
+        case inflight
+
+        /// The coordinator's tier label for a hit from this source.
+        var detail: CacheDetail {
+            switch self {
+            case .file: return .disk
+            case .resident: return .memory
+            case .inflight: return .diskPending
+            }
+        }
+    }
+
     /// What ``fetchCandidate(tokens:mediaSalt:)`` found.
     enum CandidateFetch {
-        case arrays([String: MLXArray])
+        /// `source`: the file, the resident set, or a payload still being written.
+        case arrays([String: MLXArray], source: FetchSource)
         case miss
         /// The entry is there, and an engine has already refused to restore
         /// this very payload. Nothing was read; not counted as a miss.
@@ -1168,6 +1838,7 @@ public final class DiskCache: @unchecked Sendable {
         let arrays = _fetchLocked(
             hash: hash, url: url, tokens: tokens, mediaSalt: mediaSalt,
             touchRecency: false, countHit: false)
+        let source = lastFetchSource
         // Remember what was served only when the file was the same one on
         // both sides of the read (`_fetchLocked` fingerprints what it loaded).
         servedCandidates.removeAll { $0.hash == hash }
@@ -1177,7 +1848,7 @@ public final class DiskCache: @unchecked Sendable {
                 servedCandidates.removeFirst(servedCandidates.count - Self.servedCandidateLimit)
             }
         }
-        return arrays.map(CandidateFetch.arrays) ?? .miss
+        return arrays.map { CandidateFetch.arrays($0, source: source) } ?? .miss
     }
 
     /// An engine fetched this entry through the coordinator and could not
@@ -1203,10 +1874,12 @@ public final class DiskCache: @unchecked Sendable {
               rejectedRestores[hash] != current
         else { return false }
         rejectedRestores[hash] = current
+        _dropResidentLocked(hash)
         if rewrittenAfterRejection.contains(hash) {
             rejectedRewritesSuppressed += 1
         } else {
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
         }
         if countedHit { hits = max(0, hits - 1) }
         rejectedDiskRestores += 1
@@ -1224,13 +1897,44 @@ public final class DiskCache: @unchecked Sendable {
         rejectedRestores[hash] == current && !rewrittenAfterRejection.contains(hash)
     }
 
+    /// Where the last `_fetchLocked` read its arrays from. Under `lock`.
+    private var lastFetchSource: FetchSource = .file
+
     /// Caller holds ``MLXDiskCacheIOLock`` and `lock`.
     private func _fetchLocked(
         hash: String, url: URL, tokens: [Int], mediaSalt: String?,
         touchRecency: Bool, countHit: Bool
     ) -> [String: MLXArray]? {
+        lastFetchSource = .file
+        // Still being written: serve the payload the store validated and materialized. Same
+        // content-addressed bytes the file will hold; no wait, no disk read.
+        if let entry = inflight[hash], !entry.invalidated, entry.tokenCount == tokens.count,
+            entry.awaitScreen().isEmpty
+        {
+            lastFetchSource = .inflight
+            inflightFetches += 1
+            if countHit { hits += 1 }
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                RuntimeDiagnostics.write(Data(
+                    "[vmlx][cache/disk-fetch] inflight count=\(tokens.count) hash=\(hash.prefix(12))\n".utf8))
+            }
+            return entry.arrays
+        }
+        // Resident: the payload this process stored or read, still the file on disk.
+        if let arrays = _residentPayloadLocked(hash: hash, url: url, tokenCount: tokens.count) {
+            lastFetchSource = .resident
+            residentHits += 1
+            if touchRecency { _touchEntryLocked(hash: hash) }
+            if countHit { hits += 1 }
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                RuntimeDiagnostics.write(Data(
+                    "[vmlx][cache/disk-fetch] resident count=\(tokens.count) hash=\(hash.prefix(12))\n".utf8))
+            }
+            return arrays
+        }
         guard FileManager.default.fileExists(atPath: url.path) else {
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             misses += 1
             // A row that outlives its payload keeps counting toward the quota
             // and keeps being offered as a candidate boundary. Most misses
@@ -1248,7 +1952,7 @@ public final class DiskCache: @unchecked Sendable {
                 // A miss with a row/file present under a DIFFERENT hash is a
                 // key-input mismatch (modelKey or salt), invisible without
                 // printing what this lookup actually hashed.
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/disk-fetch] noFile count=\(tokens.count) "
                         + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") "
                         + "salt=\(mediaSalt.map { String($0.prefix(12)) } ?? "nil")\n").utf8))
@@ -1263,7 +1967,7 @@ public final class DiskCache: @unchecked Sendable {
                     }
                     let storedID = index < stored.count ? String(stored[index]) : "end"
                     let requestedID = index < tokens.count ? String(tokens[index]) : "end"
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         ("[vmlx][cache/key-divergence] count=\(tokens.count) "
                             + "storedHash=\(storedHash.prefix(12)) fetchHash=\(hash.prefix(12)) "
                             + "firstDiff=\(index) storedToken=\(storedID) fetchToken=\(requestedID)\n")
@@ -1282,9 +1986,10 @@ public final class DiskCache: @unchecked Sendable {
         // index to be missing from, and the file alone decides as it always has.
         if db != nil, _entryMetadataLocked(hash: hash) == nil {
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             misses += 1
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/disk-fetch] noRow count=\(tokens.count) "
                         + "hash=\(hash.prefix(12)) — payload present, not indexed\n").utf8))
             }
@@ -1309,6 +2014,7 @@ public final class DiskCache: @unchecked Sendable {
         case .missing:
             // Gone since `fileExists`: the next fetch settles the row.
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             misses += 1
             return nil
         }
@@ -1328,12 +2034,40 @@ public final class DiskCache: @unchecked Sendable {
                     reason: String(cString: strerror(code)))
             }
             try loadFaultForTesting?(url)
+            Self.adviseReadAhead(url: url)
+            let readStart = DispatchTime.now().uptimeNanoseconds
             let (arrays, _) = try loadArraysAndMetadata(url: url)
+            // Materialize the payload HERE, on the CPU stream the loader put
+            // every tensor on, before anything on the GPU can depend on it.
+            // The loader returns lazy `Load` nodes (one `pread` each). Left
+            // lazy, the first GPU consumer — the finite screen below, then
+            // the engine's restore graph (`asType`, owned copies, SSM
+            // seating) evaluated as one `MLX.eval(cache)` — is encoded with
+            // a cross-stream wait on the read, so one Metal command buffer
+            // can wait on the disk read on a cold or contended volume.
+            // Materializing here removes that dependency wait; identifying
+            // the cause of a particular GPU watchdog event still requires
+            // a trace. This eval touches no GPU encoder (CPU primitives
+            // run on the CPU scheduler), costs the read the restore was
+            // about to do anyway, and leaves every array signaled, so the
+            // restore's buffers carry only their own kernels. The screen
+            // below already forced the floating-point tensors; this is a
+            // reordering plus the integer tensors, not a second read.
+            MLX.eval(Array(arrays.values))
+            let readMs = Double(DispatchTime.now().uptimeNanoseconds - readStart) / 1_000_000
             // A record written before the store-side check (or by a build that
             // computed NaN) must never be restored: it is removed on first touch
             // so an installed user recovers on the next prefill without clearing
             // anything by hand.
-            let nonFinite = Self.nonFiniteTensorNames(in: arrays)
+            // Optional drafter conditioning is screened by its consumer before
+            // use. Corruption there must not discard independently valid target
+            // state. Required tensors retain the same finite-value gate; stores
+            // still screen the entire payload before publishing it.
+            let targetArrays = arrays.filter {
+                $0.key != DFlash2PrefixContext.hiddenKey
+                    && $0.key != DFlash2PrefixContext.metadataKey
+            }
+            let nonFinite = Self.nonFiniteTensorNames(in: targetArrays)
             if !nonFinite.isEmpty {
                 refusedNonFiniteFetches += 1
                 throw DiskCacheIntegrityError.nonFinitePayload(nonFinite.joined(separator: ","))
@@ -1342,6 +2076,8 @@ public final class DiskCache: @unchecked Sendable {
                 validatedFiles[hash] = ValidatedRecord(
                     file: fingerprint, layout: Self.payloadLayout(arrays),
                     recurrentGeometry: Self.recurrentGeometry(arrays))
+                // Read and screened once: the next turn of this chat takes it from RAM.
+                _retainResidentLocked(hash: hash, arrays: arrays, tokenCount: tokens.count, file: fingerprint)
             }
             if touchRecency {
                 _touchEntryLocked(hash: hash)
@@ -1349,6 +2085,8 @@ public final class DiskCache: @unchecked Sendable {
             if countHit {
                 hits += 1
             }
+            lastFetchMs = readMs
+            lastFetchPayloadBytes = arrays.values.reduce(Int64(0)) { $0 + Int64($1.nbytes) }
             return arrays
         } catch {
             // Only what has been positively identified as unusable is
@@ -1364,6 +2102,7 @@ public final class DiskCache: @unchecked Sendable {
             }
             misses += 1
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             // A failed deserialize is almost always a corrupt safetensors
             // file — a 0-byte leftover from the pre-synchronous-store
             // bug, a partial write from an earlier crash, disk full
@@ -1372,7 +2111,7 @@ public final class DiskCache: @unchecked Sendable {
             // instead of silently counting a cache miss, and delete the
             // corrupt file so the next turn doesn't retry and log the
             // same error on every fetch.
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/disk] fetch REFUSED entry at \(url.lastPathComponent) count=\(tokens.count): \(error) — removing\n"
                 .utf8))
             // Drop the SQLite row too. Removing only the file orphans the
@@ -1421,8 +2160,9 @@ public final class DiskCache: @unchecked Sendable {
         misses += 1
         unreadablePayloadFetches += 1
         validatedFiles.removeValue(forKey: hash)
+        _dropResidentLocked(hash)
         if Self.isFirstReport(url.path, in: Self.reportedUnreadablePayloads) {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk] fetch could not read \(url.lastPathComponent) "
                     + "count=\(tokenCount): \(reason) — a miss; file and row left alone\n").utf8))
         }
@@ -1451,6 +2191,10 @@ public final class DiskCache: @unchecked Sendable {
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return false }
         lock.lock()
         defer { lock.unlock() }
+        if let entry = inflight[hash], !entry.invalidated {
+            return entry.satisfies(
+                tokenCount: tokens.count, requireNativeRecurrent: requireNativeRecurrent)
+        }
 
         guard let validated = validatedFiles[hash],
               let current = _fileFingerprint(url: url),
@@ -1487,6 +2231,10 @@ public final class DiskCache: @unchecked Sendable {
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return false }
         lock.lock()
         defer { lock.unlock() }
+        if let entry = inflight[hash], !entry.invalidated {
+            return entry.satisfies(
+                tokenCount: tokens.count, requireNativeRecurrent: requireNativeRecurrent)
+        }
         guard let current = _fileFingerprint(url: url), current.size > 0,
               let indexed = _entryMetadataLocked(hash: hash),
               indexed.tokenCount == tokens.count,
@@ -1547,13 +2295,20 @@ public final class DiskCache: @unchecked Sendable {
         let read: (OpaquePointer) -> Void = { stmt in
             counts.append(Int(sqlite3_column_int64(stmt, 0)))
         }
+        // In-flight entries have no row yet; they are this model's (one DiskCache per model key).
+        let inflightCounts = inflight.values.filter { !$0.invalidated }.map(\.tokenCount)
+            .filter { $0 > 0 && $0 <= maxTokens }
+        func merged(_ indexed: [Int]) -> [Int] {
+            guard !inflightCounts.isEmpty else { return indexed }
+            return Array(Set(indexed + inflightCounts).sorted(by: >).prefix(limit))
+        }
         if indexHasV2Columns, !indexIsFromANewerBuild,
             _queryLocked(
                 Self.modelCandidateTokenCountsSQL,
                 [.int(Int64(maxTokens)), .int(Int64(limit)), .text(modelKey ?? "")],
                 read)
         {
-            return counts
+            return merged(counts)
         }
         // No model column to filter on — or the filtered statement did not
         // run to its end, and a length too many costs a probe where a length
@@ -1561,7 +2316,7 @@ public final class DiskCache: @unchecked Sendable {
         counts.removeAll(keepingCapacity: true)
         _queryLocked(
             Self.candidateTokenCountsSQL, [.int(Int64(maxTokens)), .int(Int64(limit))], read)
-        return counts
+        return merged(counts)
     }
 
     static let candidateTokenCountsSQL = """
@@ -1625,7 +2380,7 @@ public final class DiskCache: @unchecked Sendable {
         let sql = indexHasV2Columns
             ? """
                 SELECT hash, file_size, created_at, companion_key, companion_bytes,
-                       token_count, kind, chain_id, rowid, \(indexHasReplayChunkColumn ? "replay_chunk_size" : "NULL")
+                       token_count, kind, chain_id, rowid, \(indexHasReplayChunkColumn ? "replay_chunk_size" : "NULL"), model_key
                 FROM cache_entries
                 """
             : "SELECT hash, file_size, created_at, rowid FROM cache_entries"
@@ -1682,6 +2437,7 @@ public final class DiskCache: @unchecked Sendable {
                 entry.isResumeBoundary = kind == 2
                 entry.isPostAnswer = kind == 3
                 entry.chainId = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
+                entry.modelKey = sqlite3_column_text(stmt, 10).map { String(cString: $0) }
                 if kind == 0, sqlite3_column_type(stmt, 9) == SQLITE_INTEGER {
                     let step = sqlite3_column_int64(stmt, 9)
                     entry.isCanonicalCheckpoint = step > 0 && entry.tokenCount > 0
@@ -1954,6 +2710,8 @@ public final class DiskCache: @unchecked Sendable {
     func forgetValidatedFiles() {
         lock.lock()
         validatedFiles.removeAll(keepingCapacity: true)
+        resident.removeAll()
+        residentBytes = 0
         lock.unlock()
     }
 
@@ -2244,7 +3002,7 @@ public final class DiskCache: @unchecked Sendable {
         if backingOff { retireNotBefore = now().addingTimeInterval(retireRetryInterval) }
         guard Self.isFirstReport("\(cacheDir.path)\u{0}\(reason)", in: Self.reportedRetireFailures)
         else { return }
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[vmlx][cache/disk-index] could not retire records that name nothing: \(reason) — "
                 + "they stay counted, no quota pass is offered them, and nothing real is "
                 + "evicted for them\n").utf8))
@@ -2273,7 +3031,7 @@ public final class DiskCache: @unchecked Sendable {
         guard bytes > 0,
             Self.reportedOpaqueRoots.withLock({ $0.insert(cacheDir.path).inserted })
         else { return }
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[vmlx][cache/disk-index] rows of a newer build hold \(bytes) bytes that this build "
                 + "counts but cannot evict, leaving \(IndexedBytes.difference(capBytes, bytes)) of "
                 + "the \(capBytes)-byte \(what) for its own (index schema version "
@@ -2294,7 +3052,7 @@ public final class DiskCache: @unchecked Sendable {
     static func reportInvalidIndexValue(shown: String, kind: InvalidIndexValueKind) {
         guard isFirstReport("\(kind.rawValue)\u{0}\(shown)", in: reportedInvalidIndexValues)
         else { return }
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[vmlx][cache/disk-index] \(kind.rawValue) \(shown) — it names no file of this "
                 + "cache; no file was looked at or removed\n").utf8))
     }
@@ -2403,14 +3161,14 @@ public final class DiskCache: @unchecked Sendable {
         defer { lock.unlock() }
 
         guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk-index] companion import skipped: "
                     + "\(String(cString: sqlite3_errmsg(db)))\n").utf8))
             return nil
         }
         // Nothing has been deleted or written when this is called.
         func abandon(_ reason: String) -> DiskCacheCompanionImportSummary? {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/disk-index] companion import abandoned, \(reason)\n".utf8))
             sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
             return nil
@@ -2562,7 +3320,7 @@ public final class DiskCache: @unchecked Sendable {
 
         // Everything has been looked at. From here on things are removed.
         if let sweepSkipped {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/disk-index] payload sweep skipped: \(sweepSkipped)\n".utf8))
         } else {
             removeUnindexedPayloadsLocked(
@@ -2573,6 +3331,7 @@ public final class DiskCache: @unchecked Sendable {
         for row in rowsWithoutPayload {
             _runLocked("DELETE FROM cache_entries WHERE rowid = ?", [.int(row.rowid)])
             validatedFiles.removeValue(forKey: row.hash)
+            _dropResidentLocked(row.hash)
             summary.rowsDeletedForMissingPayload += 1
         }
         // By rowid, inside this transaction; nothing under a newer build's
@@ -2643,7 +3402,7 @@ public final class DiskCache: @unchecked Sendable {
         }
 
         if sqlite3_exec(db, "COMMIT", nil, nil, nil) != SQLITE_OK {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk-index] companion import could not commit: "
                     + "\(String(cString: sqlite3_errmsg(db)))\n").utf8))
             sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
@@ -2700,14 +3459,15 @@ public final class DiskCache: @unchecked Sendable {
             let age = now.timeIntervalSince(modified)
             guard age >= guardAge else { continue }
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             let failure = Self.unlinkFile(at: url)
             if failure == 0 {
                 summary.unindexedPayloadsRemoved += 1
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/disk-index] removed unindexed payload \(name) "
                         + "ageSeconds=\(Int(age))\n").utf8))
             } else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/disk-index] could not remove unindexed payload \(name): "
                         + "\(String(cString: strerror(failure)))\n").utf8))
             }
@@ -2739,6 +3499,7 @@ public final class DiskCache: @unchecked Sendable {
               indexed.fileSize == current.size
         else {
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             return false
         }
         return _touchEntryLocked(hash: hash, at: date)
@@ -2782,6 +3543,7 @@ public final class DiskCache: @unchecked Sendable {
             }
             let payloadGone = Self.removeCacheFile(at: url)
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
 
             var companionRemoved = false
             if indexHasV2Columns {
@@ -2836,7 +3598,7 @@ public final class DiskCache: @unchecked Sendable {
         }
         let firstReport = reportedDeleteFailures.withLock { $0.insert(url.path).inserted }
         if firstReport {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk-delete] failed path=\(url.path) "
                     + "error=\(reason) — row kept\n").utf8))
         }
@@ -2891,11 +3653,18 @@ public final class DiskCache: @unchecked Sendable {
     /// be unlinked is left without a row; the import's unindexed-payload
     /// sweep takes it once it is old enough (not in a bundle root).
     public func clear() {
+        // Files being written would land after the sweep and outlive their rows.
+        waitForPendingWrites()
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
 
         lock.lock()
         defer { lock.unlock() }
+
+        // A slow writer may outlive the bounded drain above. Invalidate its publication and
+        // lookups while retaining its arrays until the writer finishes reading their bytes.
+        // A subsequent store of the same hash owns a separate entry and must survive this writer.
+        for entry in inflight.values { entry.invalidated = true }
 
         // Files first, rows after: dying in between leaves rows that name
         // missing files, which the next fetch or import clears — never
@@ -2931,7 +3700,7 @@ public final class DiskCache: @unchecked Sendable {
             }
         }
         if let skipped {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk-index] clear skipped: \(skipped) — nothing is removed from "
                     + "a listing of it, only the \(doomed.count) payload(s) the index names\n").utf8))
         }
@@ -2942,7 +3711,7 @@ public final class DiskCache: @unchecked Sendable {
             }
         }
         if leftBehind > 0 {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/disk-index] clear could not remove \(leftBehind) payload(s)\n".utf8))
         }
 
@@ -2961,6 +3730,8 @@ public final class DiskCache: @unchecked Sendable {
         storeSkips = 0
         failedIndexWrites = 0
         unreadablePayloadFetches = 0
+        lastFetchPayloadBytes = 0
+        lastFetchMs = 0
         evictions = 0
         quotaEvictedBytes = 0
         quotaPasses = 0
@@ -2973,6 +3744,8 @@ public final class DiskCache: @unchecked Sendable {
         lastOpaqueBytes = 0
         retireNotBefore = nil
         validatedFiles.removeAll(keepingCapacity: true)
+        resident.removeAll()
+        residentBytes = 0
         rejectedRestores.removeAll()
         rewrittenAfterRejection.removeAll()
         servedCandidates.removeAll()
@@ -3447,7 +4220,7 @@ public final class DiskCache: @unchecked Sendable {
     ) {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path) else { return }
         if let marker = modelBundleMarker(in: names) {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk] integrity sweep skipped: cache root holds \(marker), "
                     + "so it looks like a model bundle\n").utf8))
             return
@@ -3472,15 +4245,15 @@ public final class DiskCache: @unchecked Sendable {
             case .shortOrMalformed:
                 guard unlinkFile(at: url) == 0 else { continue }
                 removed += 1
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[vmlx][cache/disk] removed incomplete row \(name) at open (short of its declared payload)\n".utf8))
             }
         }
         if removed > 0 {
-            FileHandle.standardError.write(Data("[vmlx][cache/disk] integrity sweep removed \(removed) file(s)\n".utf8))
+            RuntimeDiagnostics.write(Data("[vmlx][cache/disk] integrity sweep removed \(removed) file(s)\n".utf8))
         }
         if unreadable > 0 {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk] integrity sweep could not read \(unreadable) payload(s); "
                     + "left alone\n").utf8))
         }
@@ -3887,7 +4660,8 @@ public final class DiskCache: @unchecked Sendable {
         lock.unlock()
         guard let pending else { return }
         let retained = quotaEntries(retiringInvalidRecords: false).contains {
-            $0.chainId == chainId && !$0.isStableRoot && !$0.isCanonicalCheckpoint
+            $0.chainId == chainId && ($0.modelKey ?? "") == (modelKey ?? "")
+                && !$0.isStableRoot && !$0.isCanonicalCheckpoint
                 && $0.tokenCount >= pending.tipTokenCount
                 && IndexedBytes.sum($0.bytes, $0.companionBytes) <= Int64(maxSizeBytes)
                 && (!requiresCompanion || $0.companionKey != nil)
@@ -3991,7 +4765,7 @@ public final class DiskCache: @unchecked Sendable {
         }
         if hitKind == 3 { _learnPostAnswerResumesLocked() }
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/chain] hit count=\(tokens.count) kind=\(hitKind) "
                     + "postAnswerRowsResume=\(postAnswerRowsResume)\n").utf8))
         }
@@ -4153,6 +4927,7 @@ public final class DiskCache: @unchecked Sendable {
         // once per pass and its bytes are not made up for by evicting more.
         func evict(_ entry: (hash: String, url: URL, fileSize: Int64)) {
             validatedFiles.removeValue(forKey: entry.hash)
+            _dropResidentLocked(entry.hash)
             guard Self.removeCacheFile(at: entry.url) else { return }
             _deleteEntryLocked(hash: entry.hash)
             evictions += 1

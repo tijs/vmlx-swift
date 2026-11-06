@@ -58,26 +58,50 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
             // the selector and the two-tap conv are what this runtime
             // needs, and a DFlash 1 checkpoint has neither despite
             // carrying `dflash_config`.
-            let topK = dflash["selector_top_k"] as? Int, topK > 0,
-            let rank = dflash["selector_rank"] as? Int, rank > 0,
-            let convKernel = dflash["conv_kernel_size"] as? Int, convKernel > 0,
+            // ... or a DSpark drafter: the DFlash 1 backbone plus the Markov head (`markov_rank`, at the root or nested).
+            ((dflash["selector_top_k"] as? Int ?? 0) > 0 && (dflash["selector_rank"] as? Int ?? 0) > 0
+                && (dflash["conv_kernel_size"] as? Int ?? 0) > 0)
+                || ((dflash["markov_rank"] as? Int ?? root["markov_rank"] as? Int ?? 0) > 0),
             let vocabularySize = root["vocab_size"] as? Int,
-            let targetLayerIDs = dflash["target_layer_ids"] as? [Int]
+            let targetLayerIDs = dflash["target_layer_ids"] as? [Int],
+            !targetLayerIDs.isEmpty, targetLayerIDs.allSatisfy({ $0 >= 0 }),
+            Set(targetLayerIDs).count == targetLayerIDs.count
         else { return nil }
 
+        // Match the loader's recursive layout, but read headers only. A config-only,
+        // missing-shard, malformed-header or truncated download is not a usable drafter.
         let fm = FileManager.default
+        guard let enumerator = fm.enumerator(at: directory, includingPropertiesForKeys: nil) else {
+            return nil
+        }
+        var tensorFiles: [String: Set<String>] = [:]
         var bytes: Int64 = 0
-        if let names = try? fm.contentsOfDirectory(atPath: directory.path) {
-            for name in names where name.hasSuffix(".safetensors") {
-                let attrs = try? fm.attributesOfItem(
-                    atPath: directory.appendingPathComponent(name).path)
-                bytes += (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-            }
+        for case let file as URL in enumerator where file.pathExtension == "safetensors" {
+            guard let keys = safetensorsTensorKeys(file), !keys.isEmpty,
+                safetensorsMissingByteCount(file) == nil,
+                let attrs = try? fm.attributesOfItem(atPath: file.resolvingSymlinksInPath().path),
+                let size = attrs[.size] as? NSNumber, size.int64Value > 8
+            else { return nil }
+            let relative = String(file.path.dropFirst(directory.path.count + 1))
+            tensorFiles[relative] = Set(keys)
+            bytes += size.int64Value
+        }
+        guard !tensorFiles.isEmpty else { return nil }
+        let index = directory.appendingPathComponent("model.safetensors.index.json")
+        if fm.fileExists(atPath: index.path) {
+            guard let data = try? Data(contentsOf: index),
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let weights = object["weight_map"] as? [String: String], !weights.isEmpty,
+                weights.allSatisfy({ tensorFiles[$0.value]?.contains($0.key) == true })
+            else { return nil }
         }
 
+        guard DFlash2ArtifactMetadata.rejectionReason(at: directory) == nil else { return nil }
         return VMLXDFlash2DrafterInfo(
             path: directory.path,
-            blockSize: (dflash["block_size"] as? Int) ?? (root["block_size"] as? Int) ?? 8,
+            // Verify width: a DSpark `block_size` counts drafts (the anchor row drafts too), so +1.
+            blockSize: ((dflash["block_size"] as? Int) ?? (root["block_size"] as? Int) ?? 8)
+                + (((dflash["markov_rank"] as? Int ?? root["markov_rank"] as? Int ?? 0) > 0) ? 1 : 0),
             vocabularySize: vocabularySize,
             targetLayerCount: (root["num_target_layers"] as? Int)
                 ?? ((targetLayerIDs.max() ?? 0) + 1),
@@ -96,11 +120,16 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
         guard let configData,
             let root = try? JSONSerialization.jsonObject(with: configData) as? [String: Any]
         else {
-            // No config to check against. Let the runtime's own vocabulary
-            // check be the gate rather than guessing here.
-            return nil
+            return "Target configuration is unavailable; drafter compatibility cannot be verified."
         }
         let text = (root["text_config"] as? [String: Any]) ?? root
+        guard ((text["vocab_size"] as? Int) ?? (root["vocab_size"] as? Int)) != nil,
+            ((text["num_hidden_layers"] as? Int) ?? (root["num_hidden_layers"] as? Int)) != nil,
+            ((text["hidden_size"] as? Int) ?? (root["hidden_size"] as? Int)) != nil,
+            drafterHiddenSize != nil
+        else {
+            return "Target or drafter dimensions are missing; compatibility cannot be verified."
+        }
         if let vocabulary = (text["vocab_size"] as? Int) ?? (root["vocab_size"] as? Int),
             vocabulary != vocabularySize
         {
@@ -112,6 +141,11 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
         {
             return
                 "Drafter reads layer \(deepest) of its target; this model has \(layers) layers."
+        }
+        if let layers = (text["num_hidden_layers"] as? Int) ?? (root["num_hidden_layers"] as? Int),
+            layers != targetLayerCount
+        {
+            return "Drafter expects \(targetLayerCount) target layers; this model has \(layers)."
         }
         if let hidden = (text["hidden_size"] as? Int) ?? (root["hidden_size"] as? Int),
             let drafterHidden = drafterHiddenSize, hidden != drafterHidden

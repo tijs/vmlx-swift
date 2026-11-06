@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import MLX
+#if canImport(os)
+import os
+#endif
 
 /// Stable engine-side contract for an Osaurus server/session settings panel.
 ///
@@ -14,7 +18,10 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     ///
     /// 4: Automatic uses 30% of available space (free + owned payloads).
     ///    Explicit settings, including historical 10% values, are preserved.
-    public static let contractVersion = 4
+    ///
+    /// 5: New installations use `.familyDefault`. Existing stored modes,
+    /// including legacy Off, remain explicit data and are never inferred away.
+    public static let contractVersion = 5
 
     public var network: VMLXServerNetworkSettings
     public var concurrency: VMLXServerConcurrencySettings
@@ -70,6 +77,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// user's saved choice. Earlier migrations could not distinguish a chosen
     /// 10% from the old default, so do not infer intent from the number alone.
     public mutating func migrateToCurrentSchema() {
+        // A stored Off may be an explicit choice. There is no reliable legacy
+        // provenance that permits replacing it with an automatic family default.
         schemaVersion = max(schemaVersion ?? 1, Self.contractVersion)
     }
 
@@ -391,6 +400,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         switch mtp.mode {
         case .off:
             return .off
+        case .familyDefault:
+            return (status?.canAutoLaunchMTP == true && status?.measuredFamilyAutoDepth != nil)
+                ? .speculative : .off
         case .auto:
             return (status?.canAutoLaunchMTP == true) ? .speculative : .off
         case .forceOn:
@@ -398,6 +410,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 // Manual depth can bypass missing measurement, never an
                 // explicit bundle safety block.
                 return (status?.hasCompleteMTPArtifact == true
+                    && status?.isExplicitlyBlocked != true
                     && status?.nativeMTPTuning?.manualBlocked != true) ? .speculative : .blocked
             }
             return (status?.canAutoLaunchMTP == true) ? .speculative : .blocked
@@ -418,6 +431,27 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         guard mtp.mode != .off else {
             return .init(launchMode: .off, recommendation: nil, reason: "MTP disabled by server settings.")
         }
+        // Default-on covers only the family measured to win cold (Qwen3.8 Flash-Next: `measuredFamilyAutoDepth`
+        // is set from model_type, never from a path or name). Every other family keeps the opt-in contract.
+        if mtp.mode == .familyDefault, status?.measuredFamilyAutoDepth == nil {
+            // This native-head decision does not disable an independently
+            // selected DFlash/Uno drafter. Known missing evidence must not
+            // suggest that changing the mode can create a head or tensors.
+            if let status, !status.hasCompleteMTPArtifact {
+                let absent = !status.bundleHasMTP
+                    && status.configuredLayers == 0 && status.tensorCount == 0
+                return .init(
+                    launchMode: .off, recommendation: nil,
+                    reason: absent
+                        ? "This bundle has no native MTP head or tensors."
+                        : "This bundle has incomplete native MTP head/tensor evidence.")
+            }
+            return .init(
+                launchMode: .off, recommendation: nil,
+                reason:
+                    "Native MTP is on by default only for Qwen3.8 Flash-Next; choose On (Adaptive) to enable it for this bundle."
+            )
+        }
         if let limit = mtp.draftTokenLimit, limit <= 0 {
             return .init(
                 launchMode: .blocked,
@@ -436,7 +470,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                     recommendation: nil,
                     reason: "MTP explicit depth must be 1, 2, or 3 (got \(depth)).")
             }
-            if status?.nativeMTPTuning?.manualBlocked == true {
+            if status?.isExplicitlyBlocked == true || status?.nativeMTPTuning?.manualBlocked == true
+            {
                 return .init(
                     launchMode: .blocked,
                     recommendation: nil,
@@ -506,7 +541,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     public func resolvedMTPDraftStrategy(
         configData: Data?,
         jangConfig: JangConfig?,
-        status: MTPBundleStatus?
+        status: MTPBundleStatus?,
+        bundleDirectory: URL? = nil
     ) -> DraftStrategy? {
         let launch = resolvedMTPLaunch(
             configData: configData,
@@ -516,11 +552,29 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         // model. It is checked BEFORE the native-MTP launch decision
         // because the two are alternatives, not layers: a selected
         // drafter means "draft with this", not "draft with this as well".
-        // Note this is deliberately independent of `mtp.mode` — a user
-        // who downloads a drafter and points the runtime at it has asked
-        // for speculation, and making them also flip Mode to Auto would
-        // be a second switch for one decision.
-        if let selection = resolvedDFlash2Selection(configData: configData) {
+        // Off (AR) disables every speculative strategy, including a previously
+        // selected external drafter. Selection is retained for re-enabling.
+        // Order: a drafter the user selected (explicit intent), then a bundled Uno adapter (the
+        // target drafts with its own weights), then a bundled DFlash 2 drafter.
+        if let selected = selectedDFlash2Drafter(configData: configData) {
+            return .dflash2(
+                drafterPath: URL(fileURLWithPath: selected.path),
+                blockSize: mtp.dflash2BlockSize)
+        }
+        // DeepSeek-V4.1 bundles ship their own dSpark head in `dspark/`. It is speed-only and exact
+        // (greedy and sampled requests), and its wall-clock governor keeps it at or above AR, so it is
+        // on by default; Off (and only Off, or VMLX_DSV41_DSPARK=0) turns it off.
+        if let dspark = bundledDSparkDrafter(configData: configData, bundleDirectory: bundleDirectory) {
+            return .dspark(drafterPath: dspark)
+        }
+        if let adapter = bundledUnoAdapter(configData: configData, bundleDirectory: bundleDirectory) {
+            return .uno(
+                adapterPath: adapter,
+                blockSize: Self.unoPinnedBlockSize)
+        }
+        if let selection = resolvedDFlash2Selection(
+            configData: configData, bundleDirectory: bundleDirectory)
+        {
             return .dflash2(
                 drafterPath: URL(fileURLWithPath: selection.path),
                 blockSize: mtp.dflash2BlockSize)
@@ -537,13 +591,138 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// described by `configData`. `nil` otherwise — including when the
     /// folder has gone missing, which must degrade to ordinary decoding
     /// rather than failing the request.
-    public func resolvedDFlash2Selection(configData: Data?) -> VMLXDFlash2DrafterInfo? {
-        guard let path = mtp.dflash2DrafterPath, !path.isEmpty else { return nil }
-        guard let info = VMLXDFlash2DrafterInfo.read(at: URL(fileURLWithPath: path)) else {
+    ///
+    /// Bundled drafter (Eric, 2026-10-06): when no selected drafter fits and the mode is not `.off`, a
+    /// `dflash2/` folder inside the model bundle (`bundleDirectory`) is used if it passes the same fit check.
+    /// That is how a Qwen 27B bundle shipped with its drafter gets DFlash 2 by default.
+    public func resolvedDFlash2Selection(
+        configData: Data?, bundleDirectory: URL? = nil
+    ) -> VMLXDFlash2DrafterInfo? {
+        guard mtp.mode != .off else { return nil }
+        if let path = mtp.dflash2DrafterPath, !path.isEmpty,
+            let info = VMLXDFlash2DrafterInfo.read(at: URL(fileURLWithPath: path)),
+            info.mismatchReason(configData: configData) == nil
+        {
+            return info
+        }
+        return bundledDFlash2Drafter(configData: configData, bundleDirectory: bundleDirectory)
+    }
+
+    /// The user-selected DFlash 2 drafter when it fits this bundle (bundled drafters excluded).
+    public func selectedDFlash2Drafter(configData: Data?) -> VMLXDFlash2DrafterInfo? {
+        guard mtp.mode != .off, let path = mtp.dflash2DrafterPath, !path.isEmpty,
+            let info = VMLXDFlash2DrafterInfo.read(at: URL(fileURLWithPath: path)),
+            info.mismatchReason(configData: configData) == nil
+        else { return nil }
+        return info
+    }
+
+    static let speculationLogger = Logger(subsystem: "vmlx", category: "Speculation")
+
+    /// Model types whose runtime implements the Uno conditional-LoRA pathway
+    /// (``UnoSelfSpeculativeModel``).
+    public static let unoModelTypes: Set<String> = ["k2_horizon"]
+
+    /// Pinned Uno rows per cycle (`VMLX_UNO_BLOCK`, diagnostic). Nil: Uno chooses per cycle
+    /// (`UnoWidthPlan`), starting from the width the bundle declares.
+    public static var unoPinnedBlockSize: Int? {
+        Int(ProcessInfo.processInfo.environment["VMLX_UNO_BLOCK"] ?? "").flatMap { $0 >= 2 ? $0 : nil }
+    }
+
+    /// The bundle-local `uno/` adapter (IFM Uno self-speculation) when speculation is not switched off,
+    /// the folder holds a PEFT adapter, and the bundle's model type implements the Uno pathway.
+    public func bundledUnoAdapter(configData: Data?, bundleDirectory: URL?) -> URL? {
+        guard mtp.mode != .off, let bundleDirectory, let configData,
+            let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+            let modelType = config["model_type"] as? String,
+            Self.unoModelTypes.contains(modelType)
+        else { return nil }
+        let local = bundleDirectory.appendingPathComponent("uno", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: local.path) else { return nil }
+        if let reason = UnoAdapter.mismatchReason(directory: local, configData: configData) {
+            Self.speculationLogger.warning(
+                "Bundled Uno adapter not used (decoding autoregressively): \(reason, privacy: .public)")
             return nil
         }
-        guard info.mismatchReason(configData: configData) == nil else { return nil }
-        return info
+        return local
+    }
+
+    /// Model types that carry a dSpark head in `dspark/`: DeepSeek-V4.1 (DSV4-0731 has none) and
+    /// MiniMax-M3 / M3.1 (a DSpark block drafter, ``miniMaxDSparkModelTypes``).
+    public static let dsparkModelTypes: Set<String> = [
+        "deepseek_v41", "deepseek_v41_text", "minimax_m3", "minimax_m3_vl",
+    ]
+
+    /// MiniMax-M3 / M3.1: `dspark/` holds a block drafter with its own `config.json`
+    /// (`DSparkMiniMaxDraftModel`, as released or pre-quantized) and safetensors.
+    public static let miniMaxDSparkModelTypes: Set<String> = ["minimax_m3", "minimax_m3_vl"]
+
+    /// True when `directory/config.json` declares a DSpark drafter (an architecture naming DSpark, or a
+    /// `dspark` projector) and the directory holds its safetensors. The vMLX Python runtime's rule
+    /// (`config_declares_dspark`): a sidecar config that does not declare DSpark is not a DSpark drafter.
+    public static func declaresDSparkDrafter(_ directory: URL) -> Bool {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("config.json")),
+            let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        let architectures = (config["architectures"] as? [Any])?.compactMap { $0 as? String } ?? []
+        let projector =
+            ((config["dflash_config"] as? [String: Any])?["projector_type"] ?? config["projector_type"]) as? String
+        guard architectures.contains(where: { $0.lowercased().contains("dspark") })
+            || projector?.lowercased() == "dspark"
+        else { return false }
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        return files.contains { $0.hasSuffix(".safetensors") && !$0.hasPrefix("._") }
+    }
+
+    /// The bundle-local `dspark/` head when the bundle's model type carries one and speculation is not
+    /// switched off: DeepSeek-V4.1's `dspark.safetensors`, or a MiniMax-M3 drafter directory whose
+    /// `config.json` declares DSpark. `VMLX_DSV41_DSPARK=0` (and, for MiniMax-M3, the Python runtime's
+    /// `VMLX_DSPARK=0`) can only turn it off.
+    public func bundledDSparkDrafter(
+        configData: Data?, bundleDirectory: URL?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
+        guard mtp.mode != .off, !DSparkEnvironment.disabled(environment), let bundleDirectory,
+            let configData,
+            let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any]
+        else { return nil }
+        let text = config["text_config"] as? [String: Any]
+        let types = [config["model_type"], text?["model_type"]].compactMap {
+            ($0 as? String)?.lowercased().replacingOccurrences(of: "-", with: "_")
+        }
+        guard types.contains(where: Self.dsparkModelTypes.contains) else { return nil }
+        let local = bundleDirectory.appendingPathComponent("dspark", isDirectory: true)
+        if types.contains(where: Self.miniMaxDSparkModelTypes.contains) {
+            guard !DSparkEnvironment.miniMaxDisabled(environment), Self.declaresDSparkDrafter(local) else {
+                return nil
+            }
+            return local
+        }
+        guard
+            FileManager.default.fileExists(
+                atPath: local.appendingPathComponent("dspark.safetensors").path)
+        else { return nil }
+        return local
+    }
+
+    /// The bundle-local `dflash2/` drafter when it fits and speculation is not switched off.
+    public func bundledDFlash2Drafter(
+        configData: Data?, bundleDirectory: URL?
+    ) -> VMLXDFlash2DrafterInfo? {
+        guard mtp.mode != .off, let bundleDirectory else { return nil }
+        // `dflash2/` (DFlash 2) or `dspark/` (DSpark, e.g. MiniCPM-V 4.7): both run on the DFlash 2 lane. The default
+        // is decided by the weights: a drafter folder that fits the bundle is used; no stamp gates it. A bundle whose
+        // drafter should not run ships without the folder (MiniCPM-V 4.7 1B), and Speculative Decoding Off still
+        // turns any of them off.
+        for name in ["dflash2", "dspark"] {
+            let local = bundleDirectory.appendingPathComponent(name, isDirectory: true)
+            if let info = VMLXDFlash2DrafterInfo.read(at: local),
+                info.mismatchReason(configData: configData) == nil
+            {
+                return info
+            }
+        }
+        return nil
     }
 
     /// Why the selected drafter is not being used for this bundle, for
@@ -566,22 +745,31 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// Hosts should call this alongside ``resolvedMTPDraftStrategy`` so a real
     /// Qwen MTP bundle starts with the sidecar loaded, while non-MTP CRACK or
     /// metadata-only bundles keep the loader's MTP scrub path.
+    /// Pass the same bundle directory used for strategy selection. A compatible
+    /// external drafter replaces native MTP; its unused head must not be loaded.
     public func resolvedLoadConfiguration(
         base: LoadConfiguration = .default,
         configData: Data?,
         jangConfig: JangConfig?,
-        status: MTPBundleStatus?
+        status: MTPBundleStatus?,
+        bundleDirectory: URL? = nil
     ) -> LoadConfiguration {
         var resolved = base
-        let launch = resolvedMTPLaunch(
+        resolved.keepModelInMemory = memorySafety.keepModelInMemory
+        let strategy = resolvedMTPDraftStrategy(
             configData: configData,
             jangConfig: jangConfig,
-            status: status)
-        resolved.nativeMTP = launch.launchMode == .speculative
+            status: status,
+            bundleDirectory: bundleDirectory)
+        if case .nativeMTP? = strategy {
+            resolved.nativeMTP = true
+        } else {
+            resolved.nativeMTP = false
+        }
         // Thread the manual depth into the load scope so the activation gate
         // accepts a tensor-complete head without a measured tuning artifact.
         resolved.nativeMTPManualDepth =
-            (mtp.mode == .forceOn && launch.launchMode == .speculative)
+            (mtp.mode == .forceOn && resolved.nativeMTP)
             ? mtp.explicitDepth : nil
         resolved.deepseekV4ActivationQAT =
             effectivePerformance.deepseekV4ActivationQAT
@@ -605,7 +793,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         let profile = memorySafety.profile
         let physicalMemory = host?.physicalMemory
             ?? bundleFacts?.physicalMemory
-            ?? ProcessInfo.processInfo.physicalMemory
+            ?? HostPhysicalMemory.bytes
         let requestedFraction = memorySafety.customPhysicalMemoryFraction
             ?? profile.loadFraction
         let loadCap = ResidentCap.fraction(requestedFraction)
@@ -629,11 +817,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         loadConfiguration.deepseekV4ActivationQAT =
             effectivePerformance.deepseekV4ActivationQAT
         loadConfiguration.memoryLimit = loadCap
+        loadConfiguration.keepModelInMemory = memorySafety.keepModelInMemory
         loadConfiguration.maxResidentBytes = allocatorCap
-        loadConfiguration.useMmapSafetensors = true
-        loadConfiguration.jangPress = resolvedMemorySafetyJangPress(
-            base: baseLoadConfiguration.jangPress,
-            facts: bundleFacts)
+        loadConfiguration.useMmapSafetensors = false
 
 
         var resolvedConcurrency = concurrency
@@ -682,24 +868,25 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         if profile.allowsNearRAMScaleMaterialization,
             memorySafety.customPhysicalMemoryFraction == nil,
             let facts = bundleFacts,
-            facts.totalSafetensorsBytes > 0,
+            facts.customRoutedFormat == .none,
+            facts.gpuResidentWeightBytes > 0,
             physicalMemory > 0,
-            Double(facts.totalSafetensorsBytes) > 0.55 * Double(physicalMemory),
+            Double(facts.gpuResidentWeightBytes) > 0.55 * Double(physicalMemory),
             // Only when the weights actually fit. A pack larger than ~86%
             // of RAM (e.g. 30 GiB on a 24 GiB host) cannot be made resident
             // at all — mmap streaming is its only viable mode, and
             // materializing it would push the host into swap/jetsam.
-            Double(facts.totalSafetensorsBytes) <= 0.86 * Double(physicalMemory)
+            Double(facts.gpuResidentWeightBytes) <= 0.86 * Double(physicalMemory)
         {
             loadConfiguration.useMmapSafetensors = false
             let needFraction = min(
                 0.92,
-                Double(facts.totalSafetensorsBytes) / Double(physicalMemory) + 0.06)
+                Double(facts.gpuResidentWeightBytes) / Double(physicalMemory) + 0.06)
             if needFraction > requestedFraction {
                 loadConfiguration.memoryLimit = .fraction(needFraction)
             }
             warnings.append(
-                "Weights (\(facts.totalSafetensorsBytes / 1_073_741_824) GiB) approach physical memory; loading materialized instead of mmap so pages stay resident."
+                "Weights (\(facts.gpuResidentWeightBytes / 1_073_741_824) GiB) approach physical memory; using owned weights; load and workspace must fit available memory."
             )
         }
         // Plain affine DSV4 must advertise the same limits the loader will
@@ -714,14 +901,33 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             loadConfiguration.useMmapSafetensors = facts.resolveMmapSafetensors(
                 requested: loadConfiguration.useMmapSafetensors)
         }
+        // Safe Auto owns its default scheduling allowance. All families use
+        // the same bounded owned-weight headroom as the loader. A user
+        // fraction, an explicit base cap, and stricter profiles remain explicit.
+        // Without a measured working-set ceiling, preserve the existing plan;
+        // resolving the base config would reset near-RAM headroom to 70%.
+        if memorySafety.mode == .safeAuto,
+            memorySafety.customPhysicalMemoryFraction == nil,
+            !baseLoadConfiguration.memoryLimitWasExplicit,
+            let workingSet = host?.recommendedWorkingSetBytes, workingSet > 0,
+            var facts = bundleFacts
+        {
+            facts.physicalMemory = physicalMemory
+            loadConfiguration.memoryLimit = baseLoadConfiguration.resolvedSchedulingMemoryLimit(
+                facts: facts, recommendedWorkingSetBytes: workingSet)
+        }
+        if memorySafety.keepModelInMemory, let facts = bundleFacts,
+           let workingSet = host?.recommendedWorkingSetBytes,
+           facts.gpuResidentWeightBytes > 0,
+           modelResidencyWiredTarget(
+                modelBytes: Int(clamping: facts.gpuResidentWeightBytes),
+                workingSet: workingSet, physicalMemory: Int(clamping: physicalMemory)) == nil {
+            warnings.append("This model cannot be kept fully in GPU memory within this Mac's working-set ceiling and OS reserve. If admitted by the selected memory policy, memory pressure can cause disk reads and slower replies.")
+        }
         var blockingIssues: [VMLXServerSettingsIssue] = []
 
         if case .diagnosticDangerous = memorySafety.mode {
             warnings.append("Diagnostic memory mode uses caller-supplied limits and may exceed the host working set.")
-        }
-        if !memorySafety.allowExperimentalMLXPress,
-           baseLoadConfiguration.jangPress != .disabled {
-            warnings.append("MLXPress/JangPress was not selected by the memory slider. It remains disabled unless the host enables a proven routed-bundle lane explicitly.")
         }
 
         let resolvedBudgetBytes = loadCap.resolve(physicalMemory: physicalMemory)
@@ -751,7 +957,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             }
         }
 
-        let displaySummary = "mode=\(memorySafety.mode.rawValue) slider=\(memorySafety.slider) load_cap=\(requestedFraction) allocator_cap=\(allocatorCap.displayValue) max_concurrent=\(resolvedConcurrency.maxConcurrentSequences ?? 0) kv_cap=\(resolvedCache.defaultMaxKVSize ?? 0)"
+        let displaySummary = "mode=\(memorySafety.mode.rawValue) slider=\(memorySafety.slider) load_cap=\(requestedFraction) scheduling_cap=\(loadConfiguration.memoryLimit.displayValue) allocator_cap=\(allocatorCap.displayValue) max_concurrent=\(resolvedConcurrency.maxConcurrentSequences ?? 0) kv_cap=\(resolvedCache.defaultMaxKVSize ?? 0)"
 
         return VMLXResolvedMemorySafetyPlan(
             loadConfiguration: loadConfiguration,
@@ -762,22 +968,6 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             warnings: warnings,
             blockingIssues: blockingIssues,
             displaySummary: displaySummary)
-    }
-
-    private func resolvedMemorySafetyJangPress(
-        base: JangPressPolicy,
-        facts: LoadBundleFacts?
-    ) -> JangPressPolicy {
-        guard memorySafety.allowExperimentalMLXPress else {
-            return .disabled
-        }
-        guard let facts,
-              facts.isRouted,
-              facts.hasJangConfig || facts.hasJangTQRuntime
-        else {
-            return .disabled
-        }
-        return base
     }
 
     /// Apply explicit server-panel parser overrides to a model configuration.
@@ -957,7 +1147,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 legacyGB: diskMaxSizeGB,
                 directory: diskDir))
 
-        return CacheCoordinatorConfig(
+        var config = CacheCoordinatorConfig(
             usePagedCache: reuseEnabled && cache.pagedKV.enabled,
             enableDiskCache: diskEnabled,
             pagedBlockSize: cache.pagedKV.blockSize ?? 64,
@@ -970,6 +1160,11 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             defaultKVMode: cache.defaultKVMode,
             defaultMaxKVSize: cache.defaultMaxKVSize,
             longPromptMultiplier: cache.longPromptMultiplier)
+        // Serving: the end of a turn or tool call never waits for SSD writes (see DiskCache).
+        config.diskWriteBehind = true
+        // Serving: SSD only by default; VMLX_RESIDENT_CACHE_GB keeps entries resident in RAM too.
+        config.residentEntryBytes = CacheCoordinatorConfig.servingResidentEntryBytes
+        return config
     }
 
     /// Automatic uses a share of free space plus this cache's own payloads.
@@ -999,8 +1194,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     }
 
     /// Effective cap shared by runtime, settings and diagnostics. Explicit
-    /// percentages keep their total-volume units and existing host ceiling;
-    /// both that ceiling and Automatic add owned payload bytes back to free.
+    /// percentages use total-volume units without a free-space clamp.
+    /// Automatic adds owned payload bytes back to free before taking its share.
     public static func resolveDiskCacheMaxGB(
         percent: Double?, legacyGB: Double?, directory: URL?
     ) -> Double {
@@ -1523,7 +1718,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     public var dflash2BlockSize: Int?
 
     public init(
-        mode: VMLXMTPServerMode = .off,
+        mode: VMLXMTPServerMode = .familyDefault,
         draftTokenLimit: Int? = nil,
         keepDraftCacheSeparate: Bool = true,
         acceptedTokensOnlyEnterBaseCache: Bool = true,
@@ -1554,7 +1749,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     /// failing the whole settings load.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.mode = try c.decodeIfPresent(VMLXMTPServerMode.self, forKey: .mode) ?? .off
+        self.mode = try c.decodeIfPresent(VMLXMTPServerMode.self, forKey: .mode) ?? .familyDefault
         self.draftTokenLimit = try c.decodeIfPresent(Int.self, forKey: .draftTokenLimit)
         self.keepDraftCacheSeparate =
             try c.decodeIfPresent(Bool.self, forKey: .keepDraftCacheSeparate) ?? true
@@ -1570,6 +1765,11 @@ public enum VMLXMTPServerMode: String, Codable, Sendable, Equatable, CaseIterabl
     case auto
     case off
     case forceOn = "force_on"
+    /// The shipped default (Eric, 2026-10-06): speculation ON where it is measured to win without any user
+    /// action — Qwen3.8 Flash-Next native MTP (Adaptive, family cold-start D3) and a Qwen 27B bundle that ships
+    /// its own `dflash2/` drafter — and OFF for every other family. `.auto` (On (Adaptive)) and `.off` remain
+    /// explicit user choices and always win. Persisted as "family_default".
+    case familyDefault = "family_default"
 }
 
 public enum VMLXMTPLaunchMode: String, Codable, Sendable, Equatable, CaseIterable {
@@ -1647,7 +1847,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         set { mode = VMLXMemorySafetyMode(sliderIndex: newValue) }
     }
 
-    public var allowExperimentalMLXPress: Bool
+    public var keepModelInMemory: Bool
     public var failClosedWhenEstimateUnknown: Bool
     public var customPhysicalMemoryFraction: Double?
     public var customAllocatorCacheBytes: UInt64?
@@ -1657,7 +1857,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case mode
         case slider
-        case allowExperimentalMLXPress
+        case keepModelInMemory
         case failClosedWhenEstimateUnknown
         case customPhysicalMemoryFraction
         case customAllocatorCacheBytes
@@ -1671,8 +1871,8 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         // disagree (they dragged the slider back when it did nothing) keeps the
         // safety level the engine has actually been enforcing for them.
         self.mode = try c.decodeIfPresent(VMLXMemorySafetyMode.self, forKey: .mode) ?? .safeAuto
-        self.allowExperimentalMLXPress =
-            try c.decodeIfPresent(Bool.self, forKey: .allowExperimentalMLXPress) ?? false
+        self.keepModelInMemory =
+            try c.decodeIfPresent(Bool.self, forKey: .keepModelInMemory) ?? true
         self.failClosedWhenEstimateUnknown =
             try c.decodeIfPresent(Bool.self, forKey: .failClosedWhenEstimateUnknown) ?? false
         self.customPhysicalMemoryFraction =
@@ -1690,7 +1890,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         try c.encode(mode, forKey: .mode)
         // Still emitted so the persisted/API shape is unchanged for readers.
         try c.encode(slider, forKey: .slider)
-        try c.encode(allowExperimentalMLXPress, forKey: .allowExperimentalMLXPress)
+        try c.encode(keepModelInMemory, forKey: .keepModelInMemory)
         try c.encode(failClosedWhenEstimateUnknown, forKey: .failClosedWhenEstimateUnknown)
         try c.encodeIfPresent(customPhysicalMemoryFraction, forKey: .customPhysicalMemoryFraction)
         try c.encodeIfPresent(customAllocatorCacheBytes, forKey: .customAllocatorCacheBytes)
@@ -1700,7 +1900,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
 
     public init(
         mode: VMLXMemorySafetyMode = .safeAuto,
-        allowExperimentalMLXPress: Bool = false,
+        keepModelInMemory: Bool = true,
         failClosedWhenEstimateUnknown: Bool = false,
         customPhysicalMemoryFraction: Double? = nil,
         customAllocatorCacheBytes: UInt64? = nil,
@@ -1708,7 +1908,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         customMaxConcurrentSequences: Int? = nil
     ) {
         self.mode = mode
-        self.allowExperimentalMLXPress = allowExperimentalMLXPress
+        self.keepModelInMemory = keepModelInMemory
         self.failClosedWhenEstimateUnknown = failClosedWhenEstimateUnknown
         self.customPhysicalMemoryFraction = customPhysicalMemoryFraction
         self.customAllocatorCacheBytes = customAllocatorCacheBytes

@@ -10,26 +10,45 @@ import Foundation
 import VMLXHub
 
 /// A pair of byte/token strings used in Byte-Pair Encoding (BPE) merge operations.
+///
+/// Compared and hashed literally, by UTF-8 bytes, as Hugging Face tokenizers does. Swift's
+/// `String ==` is canonical instead, so canonically equivalent merges (577 groups in Gemma's table)
+/// collapsed onto one key carrying the rank of the group's last member.
 struct BytePair: Hashable, Sendable {
     let a: String
     let b: String
+
+    /// Stores both halves as native UTF-8, which the byte comparisons read fastest. Merge-table
+    /// strings arrive bridged from `NSString`, mostly as UTF-16; a native string costs a flag test.
     init(_ a: String, _ b: String) {
+        var a = a
+        var b = b
+        a.makeContiguousUTF8()
+        b.makeContiguousUTF8()
         self.a = a
         self.b = b
     }
 
     init(tuple: [String]) {
-        a = tuple[0]
-        b = tuple[1]
+        self.init(tuple[0], tuple[1])
     }
 
     static func == (lhs: BytePair, rhs: BytePair) -> Bool {
-        lhs.a == rhs.a && lhs.b == rhs.b
+        lhs.a.utf8.elementsEqual(rhs.a.utf8) && lhs.b.utf8.elementsEqual(rhs.b.utf8)
     }
 
     func hash(into hasher: inout Hasher) {
-        hasher.combine(a)
-        hasher.combine(b)
+        Self.hashBytes(of: a, into: &hasher)
+        Self.hashBytes(of: b, into: &hasher)
+    }
+
+    /// The string's UTF-8 bytes, after their count so that ("ab", "c") and ("a", "bc") differ.
+    private static func hashBytes(of string: String, into hasher: inout Hasher) {
+        var string = string
+        string.withUTF8 { bytes in
+            hasher.combine(bytes.count)
+            hasher.combine(bytes: UnsafeRawBufferPointer(bytes))
+        }
     }
 }
 
@@ -66,6 +85,9 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
 
     /// Whether consecutive unknown tokens should be fused together.
     let fuseUnknownTokens: Bool
+    /// A serialized BPE contract: an existing whole-piece vocabulary token wins
+    /// without consulting merge ranks when `ignore_merges` is enabled.
+    let ignoreMerges: Bool
 
     static func mergesFromConfig(_ config: Config?) -> [[String]]? {
         guard let config else { return nil }
@@ -102,6 +124,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
             bpeRanks[bp] = i
         }
         self.bpeRanks = bpeRanks
+        ignoreMerges = tokenizerData.model.ignoreMerges.boolean(or: false)
 
         let addedTokens = addedTokens.reduce(into: [BinaryDistinctString: Config]()) { result, element in
             result[BinaryDistinctString(element.key)] = .init(element.value)
@@ -185,22 +208,30 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// (e.g. compact tool JSON), which a naive per-round rescan tokenizes in
     /// seconds.
     ///
-    /// Merges happen in canonical rank-rounds: within a round every
-    /// non-overlapping occurrence of the current min-rank pair is merged (left
-    /// to right) before any pair created by those merges is admitted. This
-    /// matters because SentencePiece tokenizers (Gemma/Llama) give whitespace
-    /// runs non-monotonic ranks — a merged pair can outrank its own components
-    /// (e.g. rank(\t\t,\t) < rank(\t,\t)) — so popping the global min after
-    /// every single merge would let a freshly-formed pair preempt the round's
-    /// remaining merges and diverge from canonical output on any tab/space/
-    /// newline run. Because the heap is keyed `(rank, leftIndex)`, same-rank
-    /// occurrences pop in left-to-right order for free. Stale heap entries (a
-    /// node consumed by an earlier merge, or whose pair rank no longer matches
-    /// the candidate) are skipped on pop.
-    func bpe(token: String) -> String {
-        let parts0 = Array(token).map { String($0) }
+    /// Merges happen in Hugging Face tokenizers' order (`Word::merge_all`):
+    /// the adjacent pair with the lowest rank merges first, the leftmost of
+    /// equals, and the pairs a merge forms with its neighbours join the heap
+    /// at once. A pair that outranks the one that formed it therefore merges
+    /// before that one's other occurrences, as in SentencePiece whitespace
+    /// runs (rank(\t\t,\t) < rank(\t,\t)). Because the heap is keyed
+    /// `(rank, leftIndex)`, equal ranks pop in left-to-right order for free.
+    /// Stale heap entries (a node consumed by an earlier merge, or whose pair
+    /// no longer carries the entry's rank) are skipped on pop.
+    ///
+    /// Returns the pieces in order, and `[]` for an empty token. They stay an
+    /// array, as in upstream swift-transformers #355, because joining them on
+    /// " " and splitting again loses boundaries: a piece that starts with a
+    /// combining mark or an emoji modifier forms one grapheme cluster with the
+    /// space before it, and a piece containing U+0020 is split at it, or lost
+    /// if it holds nothing else.
+    func bpe(token: String) -> [String] {
+        if ignoreMerges, tokensToIds[token as NSString] != nil { return [token] }
+        // Seed from Unicode scalars, as Hugging Face tokenizers does. `Array(token)` yields grapheme
+        // clusters, and no merge can then produce a token that starts or ends inside one. Upstream
+        // swift-transformers #355 made the same fix; AddedTokenTrie.split(_:) notes the same trap.
+        let parts0 = token.unicodeScalars.map { String($0) }
         let n = parts0.count
-        if n <= 1 { return token }
+        if n <= 1 { return parts0 }
 
         var parts = parts0
         var prev = [Int](repeating: 0, count: n)
@@ -256,43 +287,24 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
 
         for i in 0..<n where next[i] >= 0 { push(i) }
 
-        // Adjacencies created during a round, pushed only once the round ends so
-        // a new lower-rank pair cannot preempt the round's remaining merges.
-        var pending: [Int] = []
-        while let head = pop() {
-            let roundRank = head.rank
-            var cand: (rank: Int, left: Int)? = head
-            pending.removeAll(keepingCapacity: true)
-            repeat {
-                let l = cand!.left
-                if alive[l] {
-                    let r = next[l]
-                    // Skip stale entries: the live pair at this node must still
-                    // carry the round's rank.
-                    if r >= 0, alive[r],
-                        let curRank = bpeRanks[BytePair(parts[l], parts[r])], curRank == roundRank
-                    {
-                        // Merge r into l; r leaves the list.
-                        parts[l] = parts[l] + parts[r]
-                        alive[r] = false
-                        let rn = next[r]
-                        next[l] = rn
-                        if rn >= 0 { prev[rn] = l }
+        while let top = pop() {
+            let l = top.left
+            let r = next[l]
+            // Skip stale entries: the node was consumed by an earlier merge, or
+            // the live pair at it no longer carries this entry's rank.
+            guard alive[l], r >= 0, alive[r], bpeRanks[BytePair(parts[l], parts[r])] == top.rank
+            else { continue }
 
-                        // Defer adjacencies created by this merge to the next round.
-                        pending.append(prev[l])
-                        pending.append(l)
-                    }
-                }
-                // Drain remaining same-rank occurrences (they sit at the heap top).
-                if let top = heap.first, top.rank == roundRank {
-                    cand = pop()
-                } else {
-                    cand = nil
-                }
-            } while cand != nil
+            // Merge r into l; r leaves the list.
+            parts[l] = parts[l] + parts[r]
+            alive[r] = false
+            let rn = next[r]
+            next[l] = rn
+            if rn >= 0 { prev[rn] = l }
 
-            for left in pending { push(left) }
+            // Admit the pairs this merge formed with its neighbours at once.
+            push(prev[l])
+            push(l)
         }
 
         // Walk the surviving list from the head (node 0 is never consumed —
@@ -304,7 +316,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
             result.append(parts[i])
             i = next[i]
         }
-        return result.joined(separator: " ")
+        return result
     }
 
     /// Tokenizes input text using the BPE algorithm.
@@ -313,8 +325,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// - Returns: An array of BPE token strings
     func tokenize(text: String) -> [String] {
         var tokens: [String] = []
-        let bpeTokens = bpe(token: text).split(separator: " ").map { String($0) }
-        for token in bpeTokens {
+        for token in bpe(token: text) {
             if convertTokenToId(token) != unknownTokenId {
                 tokens.append(token)
             } else {

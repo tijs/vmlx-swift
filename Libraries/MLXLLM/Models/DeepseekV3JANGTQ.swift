@@ -261,7 +261,7 @@ private struct AffineProjection: Encodable {
 /// through `TurboQuantSwitchGLU`. Everything else — gate (full-
 /// precision `MoEGate`), shared experts (standard `DeepseekV3MLP`,
 /// loaded as affine 8-bit `QuantizedLinear` at hydration time),
-/// activation (`clippedSilu`) — is identical to the affine path.
+/// activation (SiLU) — is identical to the affine path.
 ///
 /// The shared expert carries the non-routed FFN component
 /// DeepSeek-V3 / Kimi K2.6 always run. Per
@@ -373,7 +373,6 @@ final class DeepseekV3JANGTQMoE: Module, UnaryLayer {
         let (indices, scores) = MLXPressStreamingProfile.time("kimi.router_gate") {
             gate(routeInput)
         }
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y: MLXArray
         if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
             y = MLXPressStreamingProfile.time("kimi.streaming_reduce") {
@@ -451,7 +450,6 @@ final class DeepseekV3JANGTQDecoderLayer: Module {
             }
             out = stopGradient(out)
         }
-        MLXPressMmapColdSweep.afterLayer(layerIdx, materialized: out)
         return out
     }
 }

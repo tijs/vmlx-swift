@@ -607,18 +607,35 @@ class BatchEngineIntegrationTests: XCTestCase {
 
         let (requestID, stream) = await engine.submit(input: input, parameters: params)
 
-        // Cancel after receiving a couple tokens
+        // Keep consuming after cancellation: breaking here only proves that
+        // tokens arrived, not that the engine closes with accurate metrics.
         var tokenCount = 0
+        var requestedCancellation = false
+        var completionInfo: GenerateCompletionInfo?
         for await event in stream {
-            if case .token = event {
+            switch event {
+            case .prefillProgress:
+                break
+            case .token:
                 tokenCount += 1
-                if tokenCount >= 2 {
+                if !requestedCancellation, tokenCount >= 2 {
+                    requestedCancellation = true
                     await engine.cancel(requestID)
-                    break
                 }
+            case .info(let info):
+                completionInfo = info
             }
         }
+        await engine.shutdown()
+
         XCTAssertGreaterThanOrEqual(tokenCount, 2)
+        let info = try XCTUnwrap(completionInfo, "Cancellation must close with completion info")
+        XCTAssertEqual(info.stopReason, .cancelled)
+        XCTAssertEqual(info.promptTokenCount, 3)
+        XCTAssertEqual(info.generationTokenCount, tokenCount)
+        XCTAssertGreaterThan(info.generateTime, 0)
+        XCTAssertTrue(info.tokensPerSecond.isFinite)
+        XCTAssertGreaterThan(info.tokensPerSecond, 0)
     }
 
     /// Test: more requests than maxBatchSize — queuing works
@@ -935,13 +952,17 @@ class BatchEngineIntegrationTests: XCTestCase {
 
     /// Test: shutdown closes the high-level generate() stream without hanging.
     func testShutdownDuringGenerateStreamFinishesTextPath() async throws {
-        let engine = makeEngine(maxBatchSize: 1)
+        // Random model weights can emit EOS before the shutdown call. Hold
+        // prefill long enough to cancel a known-live producer instead.
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 100_000, maxBatchSize: 1)
         let stream = await engine.generate(
             input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
             parameters: GenerateParameters(maxTokens: 1000, temperature: 0)
         )
 
-        try await Task.sleep(nanoseconds: 50_000_000)
+        let producerActive = await engine.isSoloFastPathActiveForTesting
+        XCTAssertTrue(producerActive, "The test must shut down an active producer")
         await engine.shutdown()
 
         let result = await collectGenerations(from: stream)
@@ -1217,13 +1238,7 @@ class BatchEngineIntegrationTests: XCTestCase {
 
         let stream = await engine.generate(
             input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
-            // 32, not 1000. `SlowPrefillLanguageModel` returns all-zero logits, so argmax is the
-            // same token every step and the decoded text is one letter repeated. Since
-            // `RepetitionCycleDetector` landed, that is halted as degeneration and reported as
-            // `.stop`, making `.length` unreachable at any cap above its floor — the test was
-            // asserting against a guard doing its job. This test is about the scheduler not being
-            // woken during the solo fast path, which the 20 ms prefill delay governs; the token
-            // count is scaffolding, so keep it under the floor rather than weaken the assertion.
+            // Keep a bounded deterministic stream while exercising scheduler ownership.
             parameters: GenerateParameters(maxTokens: 32, temperature: 0)
         )
         let soloActiveBeforeSubmit = await engine.isSoloFastPathActiveForTesting

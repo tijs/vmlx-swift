@@ -3,16 +3,18 @@
 //
 // Differential + performance regression for the O(n log n) BPE merge rewrite
 // (osaurus-ai/vmlx-swift#73). The optimized `BPETokenizer.bpe(token:)` (heap +
-// doubly-linked list) claims byte-identical output to the original per-round
-// rescan. That claim rests on a load-bearing invariant ("a pair formed by a
-// merge always outranks the pair that formed it"), so it MUST be locked by a
-// test rather than trusted — there was previously no BPE correctness suite.
+// doubly-linked list) must merge in Hugging Face tokenizers' order. A heap
+// whose stale entries are skipped lazily is easy to get subtly wrong, so that
+// order MUST be locked by a test rather than trusted.
 //
-// This test embeds the ORIGINAL algorithm verbatim as the reference oracle,
-// builds a real BPETokenizer from an on-disk Gemma merge table, and asserts the
-// shipped `bpe()` matches the reference across thousands of fuzzed inputs —
-// including the ~11k-char whitespace-free pre-token (compact tool JSON) that
-// motivated the fix. Skips when no Gemma tokenizer is on the machine.
+// This test states the order directly as the reference oracle (merge the
+// adjacent pair with the lowest (rank, left index), then rescan: O(n²) and
+// plainly correct), builds a real BPETokenizer from an on-disk Gemma merge
+// table, and asserts the shipped `bpe()` matches the reference across
+// thousands of fuzzed inputs — including the ~11k-char whitespace-free
+// pre-token (compact tool JSON) that motivated #73. Skips when no Gemma
+// tokenizer is on the machine. BPETokenizerMergeOrderTests checks the order
+// against Hugging Face's own output on small tables.
 
 import Foundation
 import XCTest
@@ -22,48 +24,32 @@ import VMLXHub
 
 final class BPETokenizerDifferentialTests: XCTestCase {
 
-    // MARK: reference oracle — VERBATIM copy of the pre-#73 bpe(token:)
+    // MARK: reference oracle — Hugging Face tokenizers' merge order, stated directly
 
-    private func referenceBpe(_ token: String, _ bpeRanks: [BytePair: Int]) -> String {
-        if token.count <= 1 { return token }
-
-        func getPairs(_ word: [String]) -> Set<BytePair> {
-            var s = Set<BytePair>()
-            for i in 0..<word.count - 1 { s.insert(BytePair(word[i], word[i + 1])) }
-            return s
-        }
-
-        var word = Array(token).map { String($0) }
-        var pairs = Array(getPairs(word))
-
-        while true {
-            let bigrams = pairs.filter { bpeRanks[$0] != nil }
-            if bigrams.count == 0 { break }
-            let bigram = bigrams.min { bpeRanks[$0]! < bpeRanks[$1]! }!
-            let first = bigram.a
-            let second = bigram.b
-            var newWord: [String] = []
-            var i = 0
-            while i < word.count {
-                if let j = word[i..<word.count].firstIndex(of: first) {
-                    newWord.append(contentsOf: word[i..<j])
-                    i = j
-                } else {
-                    newWord.append(contentsOf: word[i..<word.count])
-                    break
-                }
-                if word[i] == first, i < word.count - 1, word[i + 1] == second {
-                    newWord.append(first + second)
-                    i += 2
-                } else {
-                    newWord.append(word[i])
-                    i += 1
+    private func referenceBpe(_ token: String, _ bpeRanks: [BytePair: Int]) -> [String] {
+        // Hugging Face's Word::merge_all pops the lowest (rank, position) from a heap and admits
+        // the pairs each merge creates at once. Rescanning for the lowest (rank, left index) after
+        // every merge is the same order without the heap. Like the shipped bpe(), it seeds from
+        // Unicode scalars, returns an array, and looks pairs up as BytePairs, which compare
+        // literally, since String == is canonical. BPETokenizerUnicodeScalarTests checks the
+        // Unicode handling. The results still compare exactly with ==: both segment the same
+        // scalars.
+        var word = token.unicodeScalars.map { String($0) }
+        while word.count > 1 {
+            var best: (rank: Int, left: Int)?
+            for left in 0 ..< word.count - 1 {
+                // Strictly lower, so the leftmost of equal ranks wins.
+                if let rank = bpeRanks[BytePair(word[left], word[left + 1])],
+                    rank < best?.rank ?? .max
+                {
+                    best = (rank, left)
                 }
             }
-            word = newWord
-            if word.count == 1 { break } else { pairs = Array(getPairs(word)) }
+            guard let best else { break }
+            word[best.left] += word[best.left + 1]
+            word.remove(at: best.left + 1)
         }
-        return word.joined(separator: " ")
+        return word
     }
 
     // MARK: deterministic PRNG so failures reproduce exactly
@@ -139,16 +125,18 @@ final class BPETokenizerDifferentialTests: XCTestCase {
         return (tokenizer, model)
     }
 
-    /// Single-character symbols that actually appear in the merge table — the
-    /// atomic alphabet `bpe()` operates on, so random words over it fire real
-    /// merges.
+    /// The fuzz alphabet: the merge table's parts that are a single `Character`.
     private func atomicAlphabet(_ bpeRanks: [BytePair: Int]) -> [String] {
-        var set = Set<String>()
+        // Literal scalars as keys: a Set<String> folds canonical twins, keeping one by hash order.
+        var parts = Set<[Unicode.Scalar]>()
+        // Characters, not scalars: a multi-scalar part re-merges from its scalars, so merges fire.
         for bp in bpeRanks.keys {
-            if bp.a.count == 1 { set.insert(bp.a) }
-            if bp.b.count == 1 { set.insert(bp.b) }
+            if bp.a.count == 1 { parts.insert(Array(bp.a.unicodeScalars)) }
+            if bp.b.count == 1 { parts.insert(Array(bp.b.unicodeScalars)) }
         }
-        return Array(set).sorted()
+        // Sorted by scalar values: the alphabet, and so every fuzzed word, is the same each run.
+        return parts.sorted { $0.lexicographicallyPrecedes($1) }
+            .map { String(String.UnicodeScalarView($0)) }
     }
 
     private func randomWord(
@@ -164,7 +152,7 @@ final class BPETokenizerDifferentialTests: XCTestCase {
 
     // MARK: tests
 
-    /// The shipped optimized `bpe()` must equal the original algorithm on every
+    /// The shipped optimized `bpe()` must merge in Hugging Face's order on every
     /// input, over the REAL Gemma merge table.
     func testOptimizedBpeMatchesReferenceAcrossFuzzedInputs() throws {
         guard let tok = try loadGemmaBPETokenizer() else {
@@ -247,7 +235,7 @@ final class BPETokenizerDifferentialTests: XCTestCase {
             throw XCTSkip("Local DSV4 0731 tokenizer is unavailable.")
         }
         XCTAssertEqual(model.bpe(token: ".ĊĊ"), referenceBpe(".ĊĊ", model.bpeRanks))
-        XCTAssertEqual(model.bpe(token: ".ĊĊ"), ".ĊĊ")
+        XCTAssertEqual(model.bpe(token: ".ĊĊ"), [".ĊĊ"])
         XCTAssertEqual(tokenizer.encode(text: ".\n\n", addSpecialTokens: false), [339])
         XCTAssertEqual(tokenizer.tokenize(text: ".\n\n"), [".ĊĊ"])
     }

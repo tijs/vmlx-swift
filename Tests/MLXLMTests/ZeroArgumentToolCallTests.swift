@@ -43,6 +43,7 @@ struct ZeroArgumentToolCallTests {
         (.glm4, "<tool_call>list_mailboxes</tool_call>"),
         (.hunyuan, "<tool_calls><tool_call>list_mailboxes<tool_sep></tool_call></tool_calls>"),
         (.minimaxM2, #"<invoke name="list_mailboxes"></invoke>"#),
+        (.minimaxM3, "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"list_mailboxes\">\n]<]minimax[>[</invoke>\n</tool_call>"),
         (.minicpm5, #"<function name="list_mailboxes"></function>"#),
         (.atem, """
             <atem:function_calls>
@@ -65,6 +66,8 @@ struct ZeroArgumentToolCallTests {
         (.gemma4, "<|tool_call>call:list_mailboxes{}<tool_call|>"),
         (.step, "<tool_call><function=list_mailboxes></function></tool_call>"),
         (.nemotron, "<tool_call><function=list_mailboxes></function></tool_call>"),
+        (.mimo, "<tool_call><function=list_mailboxes></function></tool_call>"),
+        (.k2Horizon, "<ifm|tool_calls><ifm|tool_call>list_mailboxes</ifm|tool_call></ifm|tool_calls>"),
     ]
 
     /// A format added without a sample here would silently skip the check.

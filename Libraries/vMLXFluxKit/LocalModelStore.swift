@@ -110,7 +110,18 @@ public struct MLXStudioModelStore: Sendable {
         quantizationBits quantizationOverride: Int? = nil
     ) throws -> LocalFluxModel {
         let name = directoryName
+        let configuration = try? Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let raw = configuration.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let configuredSeedVR2 = raw?["model_type"] as? String == "seedvr2"
+        let wanFormat = directory.appendingPathComponent("wan_native_format.json")
+        let wanMetadata = (try? Data(contentsOf: wanFormat)).flatMap {
+            try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+        }
+        let configuredWan = wanMetadata?["format"] as? String == "wan-original-safetensors-v1"
+            && ["t2v", "i2v"].contains(raw?["model_type"] as? String ?? "")
         let canonical = canonicalOverride
+            ?? (configuredSeedVR2 ? "seedvr2" : nil)
+            ?? (configuredWan ? "wan-2.1" : nil)
             ?? canonicalName(for: name)
             ?? ModelRegistry.lookupFuzzy(name: name)?.name
         let entry = canonical.flatMap { ModelRegistry.lookup(name: $0) }
@@ -139,7 +150,9 @@ public struct MLXStudioModelStore: Sendable {
             canonicalName: canonical,
             displayName: entry?.displayName ?? displayName(forCanonicalName: canonical) ?? name,
             kind: entry?.kind ?? defaultKind(forCanonicalName: canonical),
-            quantizationBits: quantizationOverride ?? quantizationBits(in: name),
+            quantizationBits: quantizationOverride
+                ?? (canonical == "seedvr2" ? (try? SeedVR2BundleMetadata(directory: directory).bits) : nil)
+                ?? quantizationBits(in: name),
             components: components,
             safetensorCount: safetensors.count,
             totalBytes: safetensors.bytes,
@@ -154,11 +167,17 @@ public struct MLXStudioModelStore: Sendable {
         if key.contains("z-image") || key.contains("zimage") {
             return "z-image-turbo"
         }
+        if key.contains("qwen-image-2-1") || key.contains("qwen-image-21") || key.contains("qwenimage21") {
+            return key.contains("turbo") ? "qwen-image-2.1-turbo" : "qwen-image-2.1"
+        }
         if key.contains("qwen-image") || key.contains("qwenimage") {
             return key.contains("edit") ? "qwen-image-edit" : "qwen-image"
         }
         if key.contains("ideogram") {
             return "ideogram"
+        }
+        if key.contains("flux3") || key.contains("flux-3") {
+            return key.split(separator: "-").contains("base") ? nil : "flux3-image-klein"
         }
         if key.contains("flux2") || key.contains("flux-2") {
             return key.contains("edit") ? "flux2-klein-edit" : "flux2-klein"
@@ -251,6 +270,7 @@ public struct MLXStudioModelStore: Sendable {
         }
         let componentDirs: [(LocalFluxComponent, String)] = [
             (.tokenizer, "tokenizer"),
+            (.tokenizer, "processor"),
             (.transformer, "transformer"),
             (.unconditionalTransformer, "unconditional_transformer"),
             (.scheduler, "scheduler"),
@@ -269,6 +289,9 @@ public struct MLXStudioModelStore: Sendable {
             } else if try hasSafetensors(in: url, recursive: true) {
                 components.insert(component)
             }
+        }
+        if fm.fileExists(atPath: directory.appendingPathComponent("text_encoder/tokenizer.json").path) {
+            components.insert(.tokenizer)
         }
         return components
     }
@@ -300,7 +323,8 @@ public struct MLXStudioModelStore: Sendable {
         var count = 0
         var bytes: UInt64 = 0
         for case let url as URL in enumerator where url.pathExtension == "safetensors" {
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            // Through the link: a Hugging Face cache shard is a symlink, which is not a regular file.
+            let values = try url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
             guard values.isRegularFile == true else { continue }
             count += 1
             bytes += UInt64(values.fileSize ?? 0)
@@ -369,6 +393,13 @@ public struct MLXStudioModelStore: Sendable {
         guard canonicalName != nil else {
             return safetensorCount == 0 ? ["no safetensors found"] : ["unknown flux-family model"]
         }
+        if canonicalName == "seedvr2" {
+            do { _ = try SeedVR2BundleMetadata(directory: directory); return [] }
+            catch { return [String(describing: error)] }
+        }
+        if canonicalName == "wan-2.2" {
+            return ["Wan 2.2 dual-transformer routing is not implemented"]
+        }
         var reasons: [String] = []
         if safetensorCount == 0 {
             reasons.append("no safetensors found")
@@ -381,6 +412,18 @@ public struct MLXStudioModelStore: Sendable {
         ]
         if canonicalName == "ideogram" {
             requiredComponents.append(.unconditionalTransformer)
+        }
+        if canonicalName == "wan-2.1" {
+            let config = (try? Data(contentsOf: directory.appendingPathComponent("config.json"))).flatMap {
+                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+            }
+            if !["t2v", "i2v"].contains(config?["model_type"] as? String ?? "") {
+                reasons.append("missing original Wan model_type configuration")
+            }
+            if config?["model_type"] as? String == "i2v",
+                !(try hasSafetensors(in: directory.appendingPathComponent("image_encoder"), recursive: true)) {
+                reasons.append("missing image_encoder safetensors for image-to-video")
+            }
         }
         for component in requiredComponents {
             if !components.contains(component) {
@@ -397,9 +440,12 @@ public struct MLXStudioModelStore: Sendable {
         case "flux1-dev": return "FLUX.1 Dev"
         case "flux1-kontext": return "FLUX.1 Kontext"
         case "flux1-fill": return "FLUX.1 Fill"
+        case "flux3-image-klein": return "FLUX 3 Image Klein"
         case "flux2-klein": return "FLUX.2 Klein"
         case "flux2-klein-edit": return "FLUX.2 Klein Edit"
         case "z-image-turbo": return "Z-Image Turbo"
+        case "qwen-image-2.1": return "Qwen-Image-2.1"
+        case "qwen-image-2.1-turbo": return "Qwen-Image-2.1-Turbo"
         case "qwen-image": return "Qwen-Image"
         case "qwen-image-edit": return "Qwen-Image-Edit"
         case "fibo": return "FIBO"

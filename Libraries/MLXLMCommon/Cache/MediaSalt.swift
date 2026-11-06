@@ -168,6 +168,14 @@ public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> S
     if let thinking = additionalContext["enable_thinking"] as? Bool {
         parts.append(thinking ? "reasoning=on" : "reasoning=off")
     }
+    // MiniMax-M3's control is `thinking_mode` (MiniMaxM3ThinkingTemplateContext drops `enable_thinking` once it has
+    // mapped it); enabled / disabled change the system line and the generation suffix.
+    if let mode = additionalContext["thinking_mode"] as? String {
+        let normalized = mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !normalized.isEmpty {
+            parts.append("thinking_mode=\(normalized)")
+        }
+    }
     if let effort = additionalContext["reasoning_effort"] as? String {
         let normalized = effort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !normalized.isEmpty {
@@ -183,6 +191,12 @@ public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> S
         if !normalized.isEmpty {
             parts.append("strength=\(normalized)")
         }
+    }
+    // Nemotron 3.5's medium reasoning mode is `enable_thinking` +
+    // `medium_effort`; the template appends an effort line to the last user
+    // turn, so it scopes the key like `reasoning_strength` above.
+    if let medium = additionalContext["medium_effort"] as? Bool, medium {
+        parts.append("medium_effort=on")
     }
     return parts.isEmpty ? nil : parts.joined(separator: "|")
 }
@@ -201,7 +215,17 @@ public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> S
 /// - identical scope + different media → different salt (false-positive
 ///   protection that already existed via `computeMediaSalt`).
 public func computeCacheSalt(for input: LMInput) -> String? {
-    let media = computeMediaSalt(for: input)
+    computeCacheSalt(for: input, includingMedia: true)
+}
+
+/// `includingMedia: false` is the salt the same request would carry with no
+/// image/video/audio attached — scope only — which is what the media-
+/// independent prefix of a media request is keyed under (see
+/// ``CacheBoundarySaltPlan``). It is byte-identical to the salt a text-only
+/// turn with the same scope computes, by construction: the same function
+/// with the media component absent.
+public func computeCacheSalt(for input: LMInput, includingMedia: Bool) -> String? {
+    let media = includingMedia ? computeMediaSalt(for: input) : nil
     let scope = input.cacheScopeSalt
     if media == nil && scope == nil { return nil }
 
@@ -225,9 +249,33 @@ public func computeCacheSalt(for input: LMInput) -> String? {
 /// disk/paged entries created with TurboQuant KV, affine KV, rotating-window
 /// caps, or a previous serializer contract must not be restored into a request
 /// using different cache semantics.
-public func computeCacheSalt(for input: LMInput, parameters: GenerateParameters) -> String? {
-    let base = computeCacheSalt(for: input)
-    let policy = cachePolicySalt(for: parameters)
+public func computeCacheSalt(
+    for input: LMInput, parameters: GenerateParameters, model: (any LanguageModel)? = nil
+) -> String? {
+    computeCacheSalt(for: input, parameters: parameters, includingMedia: true, model: model)
+}
+
+/// See `computeCacheSalt(for:includingMedia:)`: with `includingMedia: false`
+/// the result equals the salt of the same request without its media.
+public func computeCacheSalt(
+    for input: LMInput, parameters: GenerateParameters, includingMedia: Bool,
+    model: (any LanguageModel)? = nil
+) -> String? {
+    // Normalize identity only. The actual request, coordinator policy,
+    // memory admission and cache construction continue to receive the
+    // original parameters. Every undeclared model stays conservative.
+    let requestedMaxKVSize = parameters.maxKVSize
+    var parameters = parameters
+    if (model as? PrefixCacheInvariantModel)?.maximumKVSizeIsCacheStateInvariant == true {
+        parameters.maxKVSize = nil
+    }
+    let base = computeCacheSalt(for: input, includingMedia: includingMedia)
+    var policy = cachePolicySalt(for: parameters)
+    // A model that prefills on aligned chunks (MiniMax-M3) stores states whose rows are only interchangeable with a
+    // cold prefill of the same step: entries of another step, or from before aligned prefill, are never served.
+    if let aligned = AlignedPrefill.saltComponent(model: model, prefillStepSize: parameters.prefillStepSize) {
+        policy += "|" + aligned
+    }
 
     var hasher = SHA256()
     if let base {
@@ -246,12 +294,34 @@ public func computeCacheSalt(for input: LMInput, parameters: GenerateParameters)
         // names the differing field directly instead of leaving two opaque
         // digests to stare at.
         let scopeDesc = input.cacheScopeSalt ?? "nil"
-        let mediaDesc = computeMediaSalt(for: input).map { String($0.prefix(12)) } ?? "nil"
-        FileHandle.standardError.write(Data(
+        let mediaDesc = includingMedia
+            ? (computeMediaSalt(for: input).map { String($0.prefix(12)) } ?? "nil")
+            : "excluded"
+        RuntimeDiagnostics.write(Data(
             ("[vmlx][cache/salt] salt=\(salt.prefix(12)) policy={\(policy)} "
-                + "scope=\(scopeDesc) media=\(mediaDesc)\n").utf8))
+                + "scope=\(scopeDesc) media=\(mediaDesc)"
+                + (requestedMaxKVSize != parameters.maxKVSize
+                    ? " requestedMaxKV=\(requestedMaxKVSize.map(String.init) ?? "none") maxKVStateInvariant=true"
+                    : "")
+                + (includingMedia ? mediaComponentTrace(for: input) : "") + "\n").utf8))
     }
     return salt
+}
+
+/// Trace-only description of each media component the salt hashes: shape, dtype, frame grids and a
+/// digest of the values alone, so two salts that differ show whether resolution or pixels changed.
+private func mediaComponentTrace(for input: LMInput) -> String {
+    func describe(_ name: String, _ pixels: MLXArray, _ frames: [THW]?) -> String {
+        var hasher = SHA256()
+        hasher.update(data: pixels.asData(access: .noCopyIfContiguous).data)
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined().prefix(12)
+        let grids = frames.map { $0.map { "\($0.t)x\($0.h)x\($0.w)" }.joined(separator: ",") } ?? "-"
+        return " \(name)=[\(pixels.shape) \(pixels.dtype) grids=\(grids) values=\(digest)]"
+    }
+    var out = ""
+    if let image = input.image { out += describe("image", image.pixels, image.frames) }
+    if let video = input.video { out += describe("video", video.pixels, video.frames) }
+    return out
 }
 
 private func cachePolicySalt(for parameters: GenerateParameters) -> String {

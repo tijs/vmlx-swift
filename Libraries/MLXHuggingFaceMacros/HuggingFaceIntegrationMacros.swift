@@ -80,11 +80,25 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
             // import VMLXTokenizers
             //
             { (huggingFaceTokenizer: VMLXTokenizers.Tokenizer) -> MLXLMCommon.Tokenizer in
-                struct TokenizerBridge: MLXLMCommon.GenerationPromptControllableTokenizer {
+                struct TokenizerBridge: MLXLMCommon.GenerationPromptControllableTokenizer,
+                    MLXLMCommon.DeepseekV4ChatFamilyConfigurableTokenizer
+                {
                     private let upstream: any VMLXTokenizers.Tokenizer
+                    // DSV4-0731 and DeepSeek-V4.1 share the BOS/EOS sniffed below but
+                    // not their prompt contract. The loader sets this from the bundle's
+                    // config.json; an unset bridge keeps the 0731 contract.
+                    private var deepseekV4ChatFamily: MLXLMCommon.DeepseekV4ChatFamily = .deepseekV4
 
                     init(_ upstream: any VMLXTokenizers.Tokenizer) {
                         self.upstream = upstream
+                    }
+
+                    func settingDeepseekV4ChatFamily(
+                        _ family: MLXLMCommon.DeepseekV4ChatFamily
+                    ) -> any MLXLMCommon.Tokenizer {
+                        var copy = self
+                        copy.deepseekV4ChatFamily = family
+                        return copy
                     }
 
                     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
@@ -102,6 +116,17 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
 
                     func convertIdToToken(_ id: Int) -> String? {
                         upstream.convertIdToToken(id)
+                    }
+
+                    var incrementalByteLevelDecoder: (@Sendable (Int) -> MLXLMCommon.ByteLevelDecodingPiece)? {
+                        guard let decoder = upstream.incrementalByteLevelDecoder else { return nil }
+                        return { id in
+                            switch decoder(id) {
+                            case .bytes(let bytes): return .bytes(bytes)
+                            case .literal(let text): return .literal(text)
+                            case .ignored: return .ignored
+                            }
+                        }
                     }
 
                     var bosToken: String? { upstream.bosToken }
@@ -123,6 +148,9 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         // other compatible template) for models blocked by upstream gaps.
                         // Default behaviour (no env var) is unchanged.
                         let env = ProcessInfo.processInfo.environment
+                        let hasGemma4NativeToolSentinels =
+                            (upstream.convertTokenToId("<|tool_call>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call>")
+                            && (upstream.convertTokenToId("<|turn>").flatMap { upstream.convertIdToToken($0) } == "<|turn>")
                         if let path = env["VMLX_CHAT_TEMPLATE_OVERRIDE"], !path.isEmpty,
                            let src = try? String(contentsOfFile: path, encoding: .utf8) {
                             do {
@@ -157,6 +185,15 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 messages: messages, tools: chatTemplateTools,
                                 additionalContext: additionalContext)
                         }
+                        // Keep Liquid's native reasoning/tool template, rather
+                        // than substituting a non-thinking tool-choice template.
+                        if !(tools?.isEmpty ?? true),
+                           MLXLMCommon.LFM2ToolCallParser.preservesNativeReasoningTemplate(
+                            upstream.configuredChatTemplate(forTools: !(tools?.isEmpty ?? true))) {
+                            return try upstream.applyChatTemplate(
+                                messages: messages, tools: MLXLMCommon.LFM2ToolCallParser.nativeTemplateTools(tools),
+                                additionalContext: additionalContext)
+                        }
                         let lagunaEos =
                             String(UnicodeScalar(0x3008)!)
                             + "|EOS|"
@@ -171,7 +208,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         if hasLagunaSentinel
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template auto-correction engaged: LagunaMinimal\\n"
                                         .data(using: .utf8)!)
                             }
@@ -194,7 +231,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            hasLFM2NativeToolSentinels,
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template tools -> LFM2ToolMinimal fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -208,15 +245,12 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                     additionalContext: additionalContext)
                         }
-                        let hasGemma4NativeToolSentinels =
-                            (upstream.convertTokenToId("<|tool_call>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call>")
-                            && (upstream.convertTokenToId("<|turn>").flatMap { upstream.convertIdToToken($0) } == "<|turn>")
                         if !(tools?.isEmpty ?? true),
                            upstream.bosToken == "<s>",
                            (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>"),
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template tools -> NemotronMinimal fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -230,39 +264,9 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                 additionalContext: additionalContext)
                         }
-                        // Route on Gemma-4's OWN tool sentinels, never on `<bos>` alone.
-                        //
-                        // `<bos>` is not a Gemma marker — ZAYA1-VL-8B also uses it while being a
-                        // ChatML model (`<bos><|im_start|>system …`). The bare bos disjunct
-                        // therefore swapped Zaya onto the Gemma-4 turn-marker template the moment
-                        // tools were offered, so the prompt arrived as `<|turn>model … <turn|>`
-                        // instead of `<|im_start|>assistant`. The model echoed that alien format
-                        // back as literal text (`<|turn>user`) and emitted no tool call at all —
-                        // on BOTH shipped quants, and only ever on tool turns.
-                        //
-                        // `hasGemma4NativeToolSentinels` round-trips `<|tool_call>` and `<|turn>`
-                        // through the vocabulary. Every shipped Gemma-4 bundle carries both; Zaya
-                        // carries neither, so it separates them cleanly where `<bos>` cannot.
-                        let gemmaToolSchemasPresent =
-                            !(chatTemplateTools?.isEmpty ?? true)
-                            && hasGemma4NativeToolSentinels
-                            && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
-                        if gemmaToolSchemasPresent {
-                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
-                                    "[vmlx] chat-template tools -> Gemma4WithTools fallback engaged\\n"
-                                        .data(using: .utf8)!)
-                            }
-                            return try upstream.applyChatTemplate(
-                                messages: messages,
-                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
-                                    MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
-                                addGenerationPrompt: true,
-                                truncation: false,
-                                maxLength: nil,
-                                tools: chatTemplateTools,
-                                additionalContext: additionalContext)
-                        }
+                        // Prefer the bundle's native Gemma template, including
+                        // tool schemas. A structural fallback is eligible only
+                        // after native rendering is missing or fails.
                         let step37Bos =
                             "<" + String(UnicodeScalar(0xFF5C)!)
                             + "begin" + String(UnicodeScalar(0x2581)!) + "of"
@@ -283,7 +287,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             )
                         if step37NeedsFallback {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template auto-correction engaged: Step37Minimal\\n"
                                         .data(using: .utf8)!)
                             }
@@ -316,7 +320,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            upstream.bosToken == "]~!b[",
                            upstream.eosToken == "[e~[" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template auto-correction engaged: MiniMaxM2Minimal (enable_thinking=false)\\n"
                                         .data(using: .utf8)!)
                             }
@@ -380,7 +384,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            upstream.eosToken == dsv4Eos,
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] DSV4 native chat encoder engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -388,7 +392,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 messages: messages,
                                 tools: chatTemplateTools,
                                 additionalContext: adjustedContext,
-                                addGenerationPrompt: true)
+                                addGenerationPrompt: true,
+                                family: deepseekV4ChatFamily)
                             return upstream.encode(text: prompt, addSpecialTokens: false)
                         }
                         if !(tools?.isEmpty ?? true),
@@ -396,7 +401,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>"),
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template tools -> NemotronMinimal fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -421,7 +426,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                                 if hasLagunaSentinel {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
+                                        MLXLMCommon.RuntimeDiagnostics.write(
                                             "[vmlx] chat-template missing -> LagunaMinimal fallback engaged\\n"
                                                 .data(using: .utf8)!)
                                     }
@@ -438,7 +443,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 if upstream.bosToken == "]~!b[",
                                    upstream.eosToken == "[e~[" {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
+                                        MLXLMCommon.RuntimeDiagnostics.write(
                                             "[vmlx] chat-template missing -> MiniMaxM2Minimal fallback engaged\\n"
                                                 .data(using: .utf8)!)
                                     }
@@ -452,9 +457,9 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         tools: chatTemplateTools,
                                         additionalContext: additionalContext)
                                 }
-                                if upstream.bosToken == "<bos>" {
+                                if hasGemma4NativeToolSentinels {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
+                                        MLXLMCommon.RuntimeDiagnostics.write(
                                             "[vmlx] chat-template missing -> Gemma4 fallback engaged\\n"
                                                 .data(using: .utf8)!)
                                     }
@@ -473,7 +478,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 if upstream.bosToken == "<s>",
                                    (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>") {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
+                                        MLXLMCommon.RuntimeDiagnostics.write(
                                             "[vmlx] chat-template missing -> NemotronMinimal fallback engaged\\n"
                                                 .data(using: .utf8)!)
                                     }
@@ -500,16 +505,10 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") == "1" {
                                 throw error
                             }
-                            // Family sniff. Gemma-4 is the only widely-used
-                            // family whose bos_token is literally "<bos>";
-                            // ChatML-family models (Nemotron-Cascade-2 + all
-                            // Mistral/Qwen 3.x descendants) use "<s>" or no
-                            // bos. That single check lets us pick the right
-                            // fallback ordering without needing the model
-                            // config parsed separately. `convertTokenToId`
-                            // protects us from applying a fallback whose
-                            // sentinel tokens are not in vocab.
-                            let isGemma = upstream.bosToken == "<bos>"
+                            // A shared BOS is insufficient to identify Gemma:
+                            // require both native markers to round-trip before
+                            // choosing a failure-only Gemma structural fallback.
+                            let isGemma = hasGemma4NativeToolSentinels
                             let hasNemotronSentinel =
                                 (upstream.convertTokenToId("<|im_start|>").flatMap { upstream.convertIdToToken($0) } == "<|im_start|>")
                                 || (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>")
@@ -554,7 +553,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         tools: chatTemplateTools,
                                         additionalContext: additionalContext)
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
+                                        MLXLMCommon.RuntimeDiagnostics.write(
                                             "[vmlx] chat-template fallback engaged: \\(candidate.label)\\n"
                                                 .data(using: .utf8)!)
                                     }
@@ -575,6 +574,9 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                     ) throws -> [Int] {
                         let chatTemplateTools = MLXLMCommon.normalizedToolsForChatTemplate(tools)
                         let env = ProcessInfo.processInfo.environment
+                        let hasGemma4NativeToolSentinels =
+                            (upstream.convertTokenToId("<|tool_call>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call>")
+                            && (upstream.convertTokenToId("<|turn>").flatMap { upstream.convertIdToToken($0) } == "<|turn>")
                         if let path = env["VMLX_CHAT_TEMPLATE_OVERRIDE"], !path.isEmpty,
                            let src = try? String(contentsOfFile: path, encoding: .utf8) {
                             do {
@@ -605,6 +607,15 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 addGenerationPrompt: addGenerationPrompt,
                                 truncation: false, maxLength: nil,
                                 tools: chatTemplateTools, additionalContext: additionalContext)
+                        }
+                        if !(tools?.isEmpty ?? true),
+                           MLXLMCommon.LFM2ToolCallParser.preservesNativeReasoningTemplate(
+                            upstream.configuredChatTemplate(forTools: !(tools?.isEmpty ?? true))) {
+                            return try upstream.applyChatTemplate(
+                                messages: messages, chatTemplate: nil,
+                                addGenerationPrompt: addGenerationPrompt,
+                                truncation: false, maxLength: nil,
+                                tools: MLXLMCommon.LFM2ToolCallParser.nativeTemplateTools(tools), additionalContext: additionalContext)
                         }
                         let lagunaEos =
                             String(UnicodeScalar(0x3008)!)
@@ -638,7 +649,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            hasLFM2NativeToolSentinels,
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template tools -> LFM2ToolMinimal fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -652,9 +663,6 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                     additionalContext: additionalContext)
                         }
-                        let hasGemma4NativeToolSentinels =
-                            (upstream.convertTokenToId("<|tool_call>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call>")
-                            && (upstream.convertTokenToId("<|turn>").flatMap { upstream.convertIdToToken($0) } == "<|turn>")
                         if !(tools?.isEmpty ?? true),
                            upstream.bosToken == "<s>",
                            (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>"),
@@ -669,39 +677,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                 additionalContext: additionalContext)
                         }
-                        // Route on Gemma-4's OWN tool sentinels, never on `<bos>` alone.
-                        //
-                        // `<bos>` is not a Gemma marker — ZAYA1-VL-8B also uses it while being a
-                        // ChatML model (`<bos><|im_start|>system …`). The bare bos disjunct
-                        // therefore swapped Zaya onto the Gemma-4 turn-marker template the moment
-                        // tools were offered, so the prompt arrived as `<|turn>model … <turn|>`
-                        // instead of `<|im_start|>assistant`. The model echoed that alien format
-                        // back as literal text (`<|turn>user`) and emitted no tool call at all —
-                        // on BOTH shipped quants, and only ever on tool turns.
-                        //
-                        // `hasGemma4NativeToolSentinels` round-trips `<|tool_call>` and `<|turn>`
-                        // through the vocabulary. Every shipped Gemma-4 bundle carries both; Zaya
-                        // carries neither, so it separates them cleanly where `<bos>` cannot.
-                        let gemmaToolSchemasPresent =
-                            !(chatTemplateTools?.isEmpty ?? true)
-                            && hasGemma4NativeToolSentinels
-                            && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
-                        if gemmaToolSchemasPresent {
-                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
-                                    "[vmlx] chat-template tools -> Gemma4WithTools fallback engaged\\n"
-                                        .data(using: .utf8)!)
-                            }
-                            return try upstream.applyChatTemplate(
-                                messages: messages,
-                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
-                                    MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
-                                addGenerationPrompt: addGenerationPrompt,
-                                truncation: false,
-                                maxLength: nil,
-                                tools: chatTemplateTools,
-                                additionalContext: additionalContext)
-                        }
+                        // Native bundle templates take priority over structural
+                        // fallbacks, even when tools are offered.
                         let step37Bos =
                             "<" + String(UnicodeScalar(0xFF5C)!)
                             + "begin" + String(UnicodeScalar(0x2581)!) + "of"
@@ -722,7 +699,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             )
                         if step37NeedsFallback {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template auto-correction engaged: Step37Minimal\\n"
                                         .data(using: .utf8)!)
                             }
@@ -784,7 +761,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 messages: messages,
                                 tools: chatTemplateTools,
                                 additionalContext: adjustedContext,
-                                addGenerationPrompt: addGenerationPrompt)
+                                addGenerationPrompt: addGenerationPrompt,
+                                family: deepseekV4ChatFamily)
                             return upstream.encode(text: prompt, addSpecialTokens: false)
                         }
                         if !(tools?.isEmpty ?? true),
@@ -823,7 +801,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         tools: chatTemplateTools,
                                         additionalContext: adjustedContext)
                                 }
-                                if upstream.bosToken == "<bos>" {
+                                if hasGemma4NativeToolSentinels {
                                     let template = (tools?.isEmpty ?? true)
                                         ? MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal
                                         : MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools
@@ -866,7 +844,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") == "1" {
                                 throw error
                             }
-                            let isGemma = upstream.bosToken == "<bos>"
+                            let isGemma = hasGemma4NativeToolSentinels
                             let hasNemotronSentinel =
                                 (upstream.convertTokenToId("<|im_start|>").flatMap { upstream.convertIdToToken($0) } == "<|im_start|>")
                                 || (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>")
@@ -933,6 +911,38 @@ public struct TokenizerLoaderMacro: ExpressionMacro {
         return
             """
             { () -> MLXLMCommon.TokenizerLoader in
+                struct MetadataTokenizer: MLXLMCommon.GenerationPromptControllableTokenizer {
+                    let base: any MLXLMCommon.GenerationPromptControllableTokenizer
+                    let grammarTokenVocabulary: MLXLMCommon.GrammarTokenVocabulary?
+                    var incrementalByteLevelDecoder: (@Sendable (Int) -> MLXLMCommon.ByteLevelDecodingPiece)? {
+                        base.incrementalByteLevelDecoder
+                    }
+                    var bosToken: String? { base.bosToken }
+                    var eosToken: String? { base.eosToken }
+                    var unknownToken: String? { base.unknownToken }
+                    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+                        base.encode(text: text, addSpecialTokens: addSpecialTokens)
+                    }
+                    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+                        base.decode(tokenIds: tokenIds, skipSpecialTokens: skipSpecialTokens)
+                    }
+                    func convertTokenToId(_ token: String) -> Int? { base.convertTokenToId(token) }
+                    func convertIdToToken(_ id: Int) -> String? { base.convertIdToToken(id) }
+                    func applyChatTemplate(
+                        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+                        additionalContext: [String: any Sendable]?
+                    ) throws -> [Int] {
+                        try base.applyChatTemplate(messages: messages, tools: tools, additionalContext: additionalContext)
+                    }
+                    func applyChatTemplate(
+                        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+                        additionalContext: [String: any Sendable]?, addGenerationPrompt: Bool
+                    ) throws -> [Int] {
+                        try base.applyChatTemplate(
+                            messages: messages, tools: tools, additionalContext: additionalContext,
+                            addGenerationPrompt: addGenerationPrompt)
+                    }
+                }
                 struct TransformersLoader: MLXLMCommon.TokenizerLoader {
                     public init() {}
 
@@ -942,7 +952,27 @@ public struct TokenizerLoaderMacro: ExpressionMacro {
                         // import VMLXTokenizers
                         //
                         let upstream = try await VMLXTokenizers.AutoTokenizer.from(modelFolder: directory)
-                        return #adaptHuggingFaceTokenizer(upstream)
+                        var adapted = #adaptHuggingFaceTokenizer(upstream)
+                        // Thread the DSV4 prompt-contract family from the bundle config:
+                        // 0731 and V4.1 are indistinguishable by tokenizer alone.
+                        let deepseekV4ChatFamily = MLXLMCommon.DeepseekV4ChatFamily.detect(
+                            modelDirectory: directory)
+                        if deepseekV4ChatFamily != .deepseekV4,
+                            let configurable = adapted
+                                as? any MLXLMCommon.DeepseekV4ChatFamilyConfigurableTokenizer
+                        {
+                            adapted = configurable.settingDeepseekV4ChatFamily(deepseekV4ChatFamily)
+                        }
+                        // Only file-backed metadata plus the upstream lossless decoder
+                        // can qualify a vocabulary. The standalone adaptor stays nil.
+                        guard upstream.incrementalByteLevelDecoder != nil,
+                            let data = try? Data(contentsOf: directory.appendingPathComponent("tokenizer.json")),
+                            let config = try? Data(contentsOf: directory.appendingPathComponent("tokenizer_config.json")),
+                            let vocabulary = MLXLMCommon.GrammarTokenVocabulary.fromTokenizerJSON(
+                                data, tokenizerConfig: config),
+                            let controllable = adapted as? any MLXLMCommon.GenerationPromptControllableTokenizer
+                        else { return adapted }
+                        return MetadataTokenizer(base: controllable, grammarTokenVocabulary: vocabulary)
                     }
                 }
 

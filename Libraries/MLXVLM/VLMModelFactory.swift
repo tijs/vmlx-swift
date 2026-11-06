@@ -137,6 +137,18 @@ public enum VLMTypeRegistry {
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_5": createSelecting(Qwen35Configuration.self, Qwen35.init(_:requesting:)),
         "qwen3_5_moe": createSelecting(Qwen35Configuration.self, Qwen35MoE.init(_:requesting:)),
+        // MiniCPM-V 4.7: a Qwen3.5 text model (dense `qwen3_5_text` 1B, MoE `qwen3_5_moe_text` 35B-A3B) under the
+        // same `language_model.` keys, plus MiniCPM's own SigLIP-style tower, window merger and resampler
+        // (`vision_tower.`, `merger.`). `Qwen35Configuration` decodes the MiniCPM `vision_config` and canvas fields
+        // for this model type and `Qwen35` carries `MiniCPMV47Vision.Tower` in its `vision_tower` slot; images
+        // are served, video is refused by the processor (frame stacking not ported).
+        "minicpmv4_7": { data, requesting in
+            let configuration = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: data)
+            if configuration.textConfiguration.numExperts > 0 {
+                return try Qwen35MoE(configuration, requesting: requesting)
+            }
+            return try Qwen35(configuration, requesting: requesting)
+        },
         "qwen4_exp": createSelecting(Qwen4ExpConfiguration.self, Qwen4Exp.init(_:requesting:)),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "muse_glimmer": createSelecting(MuseGlimmerConfiguration.self, MuseGlimmer.init(_:requesting:)),
@@ -152,6 +164,10 @@ public enum VLMTypeRegistry {
         // both keys to the same dispatch.
         "ministral3": dispatchMistral3VLM,
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
+        "lfm3_vl": create(LFM3VLConfiguration.self, LFM3VL.init),
+        // LFM3-Audio / LFM3-Omni: speech input (and Omni vision) into the LFM3 decoder.
+        "lfm3_audio": create(LFM3OmniConfiguration.self, LFM3Omni.init),
+        "lfm3_omni": create(LFM3OmniConfiguration.self, LFM3Omni.init),
             "apertus1p5": create(Apertus1p5Configuration.self, Apertus1p5.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
@@ -247,11 +263,17 @@ public enum VLMProcessorTypeRegistry {
             "ministral3": "Mistral3Processor",
             "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHOmniProcessor",
             "nemotron_h_omni": "NemotronHOmniProcessor",
+            "minicpmv4_7": "MiniCPMV47Processor",
+            "lfm3_vl": "Lfm3VlProcessor",
+            // LFM3-Audio's preprocessor_config.json (read first) has no processor_class.
+            "lfm3_audio": "Lfm3AudioProcessor",
+            "lfm3_omni": "Lfm3OmniProcessor",
         ]
         return processorTypeOverrides[modelType] ?? declaredProcessorType
     }
 
     /// Shared instance with default processor types.
+    #if canImport(CoreImage) && canImport(AVFoundation) && canImport(Accelerate)
     public static let shared: ProcessorTypeRegistry = .init(creators: [
         "MiMoV26Processor": { data, tokenizer in
             try MiMoV26Processor(JSONDecoder.json5().decode(MiMoV26ProcessorConfiguration.self, from: data), tokenizer: tokenizer)
@@ -267,7 +289,9 @@ public enum VLMProcessorTypeRegistry {
         "Qwen2_5_VLProcessor": create(
             Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init),
         "Qwen3VLProcessor": create(
-            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+            Qwen3VLProcessorConfiguration.self, { Qwen3VLProcessor($0, tokenizer: $1) }),
+        "MiniCPMV47Processor": create(
+            MiniCPMV47ProcessorConfiguration.self, MiniCPMV47Processor.init),
         "Idefics3Processor": create(
             Idefics3ProcessorConfiguration.self, Idefics3Processor.init),
         "Gemma3Processor": create(
@@ -282,6 +306,20 @@ public enum VLMProcessorTypeRegistry {
             Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
         "Lfm2VlProcessor": create(
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
+        // LFM3-VL ships the transformers-v5 nested processor_config.json (image_processor /
+        // video_processor), which the Qwen3-VL configuration decodes.
+        "Lfm3VlProcessor": create(
+            Qwen3VLProcessorConfiguration.self, { LFM3VLProcessor($0, tokenizer: $1) }),
+        // LFM3-Audio ships feature settings only; LFM3-Omni adds LFM3-VL's image / video blocks.
+        "Lfm3AudioProcessor": { _, tokenizer in
+            LFM3OmniProcessor(tokenizer: tokenizer, vision: nil)
+        },
+        "Lfm3OmniProcessor": { data, tokenizer in
+            LFM3OmniProcessor(
+                tokenizer: tokenizer,
+                vision: try JSONDecoder.json5().decode(
+                    Qwen3VLProcessorConfiguration.self, from: data))
+        },
         "Apertus1p5Processor": create(
             Apertus1p5ProcessorConfiguration.self, Apertus1p5Processor.init),
         "Glm46VProcessor": create(
@@ -309,7 +347,29 @@ public enum VLMProcessorTypeRegistry {
         "Zaya1VLProcessor": create(
             Qwen25VLProcessorConfiguration.self, Zaya1VLProcessor.init),
     ])
+    #else
+    public static let shared: ProcessorTypeRegistry = .init(creators: [:])
+    #endif
 }
+
+#if !(canImport(CoreImage) && canImport(AVFoundation) && canImport(Accelerate))
+    /// The processor `VLMModelFactory` installs on a platform without Apple's media frameworks, for a
+    /// processor type that the registry does not know. It refuses every input, text-only included,
+    /// so that no prompt is ever built differently from what the bundle's own processor builds.
+    struct PreparedInputRequiredProcessor: UserInputProcessor {
+        let processorType: String
+
+        static func message(_ processorType: String) -> String {
+            "\(processorType) needs Apple's media frameworks (CoreImage, AVFoundation, Accelerate), "
+                + "which this platform lacks. Register a processor for \"\(processorType)\", "
+                + "or prepare the LMInput yourself."
+        }
+
+        func prepare(input: UserInput) async throws -> LMInput {
+            throw VLMError.processing(Self.message(processorType))
+        }
+    }
+#endif
 
 /// Registry of models and any overrides that go with them, e.g. prompt augmentation.
 /// If asked for an unknown configuration this will use the model/tokenizer as-is.
@@ -466,15 +526,70 @@ public final class VLMModelFactory: ModelFactory {
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
         let modelDirectory = configuration.modelDirectory
+        if DecisionBundle.declaresDecisionModel(at: modelDirectory) {
+            throw DecisionRuntimeError.invalid("This is a decision model; use the System One decision runtime, not chat generation")
+        }
+
+        var loadTiming = ModelLoadTiming(scope: "vlm")
 
         // Load config.json once and decode for both base config and model-specific config
         let configurationURL = modelDirectory.appending(component: "config.json")
-        let configData: Data
+        var configData: Data
         do {
             configData = try Data(contentsOf: configurationURL)
         } catch {
             throw ModelFactoryError.configurationFileError(
                 configurationURL.lastPathComponent, configuration.name, error)
+        }
+        // Flint is text-only and its custom banks belong to the LLM factory.
+        // Do not let an unrelated generic quantization error mask its admission error.
+        if let root = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+            root["model_type"] as? String == "flint"
+        {
+            throw ModelFactoryError.unsupportedModelType("flint")
+        }
+        // Custom packed banks are admitted before the strict generic quantization
+        // decoder. Only their validated entries are removed from its ordinary view.
+        let jangHPreparation = try Glm5NextJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let jangHPreparation { configData = jangHPreparation.banks.ordinaryConfiguration }
+        let qwen4JANGHPreparation = jangHPreparation == nil
+            ? try Qwen4ExpJANGHPreparation.loadIfDeclared(directory: modelDirectory, configurationData: configData)
+            : nil
+        if let qwen4JANGHPreparation {
+            configData = qwen4JANGHPreparation.banks.ordinaryConfiguration
+        }
+        let qwen35JANGHPreparation =
+            (jangHPreparation == nil && qwen4JANGHPreparation == nil)
+            ? try Qwen35JANGHPreparation.loadIfDeclared(
+                directory: modelDirectory, configurationData: configData)
+            : nil
+        if let qwen35JANGHPreparation {
+            configData = qwen35JANGHPreparation.dense.ordinaryConfiguration
+        }
+        // Nemotron-H relu2 JANGH banks (Nemotron 3.5 Bolt). Its bundle also
+        // ships config_omni.json, so it constructs through NemotronHOmni below.
+        let nemotronJANGHPreparation =
+            (jangHPreparation == nil && qwen4JANGHPreparation == nil && qwen35JANGHPreparation == nil)
+            ? try NemotronHJANGHPreparation.loadIfDeclared(
+                directory: modelDirectory, configurationData: configData)
+            : nil
+        if let nemotronJANGHPreparation {
+            configData = nemotronJANGHPreparation.banks.ordinaryConfiguration
+        }
+        let miniCPMJANGHPreparation =
+            (jangHPreparation == nil && qwen4JANGHPreparation == nil && qwen35JANGHPreparation == nil
+                && nemotronJANGHPreparation == nil)
+            ? try MiniCPMV47JANGHPreparation.loadIfDeclared(
+                directory: modelDirectory, configurationData: configData)
+            : nil
+        if let miniCPMJANGHPreparation {
+            configData = miniCPMJANGHPreparation.banks.ordinaryConfiguration
+        }
+        let qwen35MoEJANGHPreparation = try Qwen35MoEJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let qwen35MoEJANGHPreparation {
+            configData = qwen35MoEJANGHPreparation.banks.ordinaryConfiguration
         }
         let baseConfig: BaseConfiguration
         do {
@@ -524,9 +639,11 @@ public final class VLMModelFactory: ModelFactory {
         let processorType = VLMProcessorTypeRegistry.processorType(
             modelType: dispatchModelType,
             declaredProcessorType: baseProcessorConfig.processorClass)
+        #if canImport(CoreImage) && canImport(AVFoundation) && canImport(Accelerate)
         guard processorRegistry.containsProcessorType(processorType) else {
             throw ModelFactoryError.unsupportedProcessorType(processorType)
         }
+        #endif
 
         // 2026-04-29: merge jang_config.json fields into the config.json
         // dictionary BEFORE decoding so omni `NemotronHOmniConfiguration`
@@ -537,7 +654,8 @@ public final class VLMModelFactory: ModelFactory {
         // without `jang_config.json` skip this entirely.
         var mergedConfigData = configData
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if FileManager.default.fileExists(atPath: jangConfigURL.path),
+        if jangHPreparation == nil, nemotronJANGHPreparation == nil, qwen35MoEJANGHPreparation == nil,
+            FileManager.default.fileExists(atPath: jangConfigURL.path),
             let jangData = try? Data(contentsOf: jangConfigURL),
             let jangJSON = try? JSONSerialization.jsonObject(with: jangData)
                 as? [String: Any],
@@ -656,6 +774,40 @@ public final class VLMModelFactory: ModelFactory {
             }
         }
 
+        // Nemotron Omni bundle profile (config_omni.json + the shard index):
+        // which towers exist and whether the Super-VL vision final LayerNorm
+        // ships. Decoded by `NemotronHOmniConfiguration` from `_omni_*` keys.
+        if dispatchModelType == "NemotronH_Nano_Omni_Reasoning_V3",
+            let omniData = try? Data(contentsOf: configOmniURL),
+            let omni = try? JSONSerialization.jsonObject(with: omniData) as? [String: Any],
+            var configDict = try? JSONSerialization.jsonObject(with: mergedConfigData)
+                as? [String: Any]
+        {
+            let vision = omni["vision_config"] as? [String: Any] ?? [:]
+            configDict["_omni_has_sound"] = !(omni["sound_config"] is NSNull)
+                && omni["sound_config"] != nil
+            configDict["_omni_has_video"] = !(omni["video_context_token_id"] is NSNull)
+                && omni["video_context_token_id"] != nil
+            if let eps = vision["layer_norm_eps"] as? Double {
+                configDict["_omni_vision_layer_norm_eps"] = eps
+            }
+            if let token = omni["img_context_token_id"] as? Int {
+                configDict["_omni_img_context_token_id"] = token
+            }
+            if let cls = vision["num_cls_tokens"] as? Int {
+                configDict["_omni_vision_num_cls_tokens"] = cls + ((vision["num_registers"] as? Int) ?? 0)
+            }
+            let tensorNames = Set(try MTPBundleInspector.loadableTensorNames(from: modelDirectory))
+            let llm = omni["llm_config"] as? [String: Any] ?? configDict
+            let hasFinalLN = try nemotronVisionFinalLayerNormPresent(
+                tensorNames: tensorNames,
+                nextTokenLayers: (llm["num_nextn_predict_layers"] as? Int) ?? 0)
+            configDict["_omni_vision_final_layernorm"] = hasFinalLN
+            if let merged = try? JSONSerialization.data(withJSONObject: configDict) {
+                mergedConfigData = merged
+            }
+        }
+
         let earlyJangConfig: JangConfig?
         if JangLoader.isJangModel(at: modelDirectory) {
             earlyJangConfig = try JangLoader.loadConfig(at: modelDirectory)
@@ -672,17 +824,51 @@ public final class VLMModelFactory: ModelFactory {
         if !loadNativeMTP {
             mergedConfigData = try NativeMTPActivation.scrubInactiveMTPConfig(mergedConfigData)
         }
+        // A qwen4_exp bundle whose vision tower has no processor file is constructed text-only.
+        mergedConfigData = Qwen4ExpTextOnlyBundle.textOnlyConfiguration(
+            mergedConfigData, modelDirectory: modelDirectory)
 
         let model: LanguageModel
         do {
-            model = try await typeRegistry.createModel(
-                configuration: mergedConfigData, modelType: dispatchModelType,
-                requesting: configuration.requestedModalities)
+            if let jangHPreparation {
+                model = try jangHPreparation.construct(requesting: configuration.requestedModalities)
+            } else if let qwen4JANGHPreparation {
+                model = try qwen4JANGHPreparation.construct(
+                    configurationData: mergedConfigData, requesting: configuration.requestedModalities)
+            } else if let qwen35JANGHPreparation {
+                model = try qwen35JANGHPreparation.construct(
+                    configurationData: mergedConfigData,
+                    requesting: configuration.requestedModalities)
+            } else if let qwen35MoEJANGHPreparation {
+                model = try qwen35MoEJANGHPreparation.construct(
+                    configurationData: mergedConfigData,
+                    requesting: configuration.requestedModalities)
+            } else if let miniCPMJANGHPreparation {
+                model = try miniCPMJANGHPreparation.construct(
+                    configurationData: mergedConfigData,
+                    requesting: configuration.requestedModalities)
+            } else if let nemotronJANGHPreparation {
+                let languageModel = try nemotronJANGHPreparation.makeLanguageModel()
+                if dispatchModelType == "NemotronH_Nano_Omni_Reasoning_V3" {
+                    let omniConfig = try JSONDecoder.json5().decode(
+                        NemotronHOmniConfiguration.self, from: mergedConfigData)
+                    model = NemotronHOmni(omniConfig, languageModel: languageModel)
+                } else {
+                    model = languageModel
+                }
+                try NemotronLiLiCorrAttachment.attachIfRequested(
+                    to: languageModel, bundle: modelDirectory)
+            } else {
+                model = try await typeRegistry.createModel(
+                    configuration: mergedConfigData, modelType: dispatchModelType,
+                    requesting: configuration.requestedModalities)
+            }
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        loadTiming.mark("configuration_and_model_construction")
         // qwen4_exp's PLE embedding is a ~95 GiB table. Its model object must
         // receive the bundle directory so it can install the page-granular
         // safetensors row reader before any forward; ordinary MLX weight
@@ -693,6 +879,7 @@ public final class VLMModelFactory: ModelFactory {
         if let mimo = model as? MiMoV26 {
             try mimo.configure(modelDirectory: modelDirectory)
         }
+        loadTiming.mark("file_backed_tables")
 
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig =
@@ -714,7 +901,6 @@ public final class VLMModelFactory: ModelFactory {
 
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
-
         // Detect JANG model BEFORE tool-format selection so the `capabilities.tool_parser`
         // stamp is authoritative for JANG bundles. Standard MLX models skip this and
         // jangConfig stays nil, in which case we fall through to the model_type heuristic.
@@ -761,7 +947,7 @@ public final class VLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
+                        ? ParserResolution.templateReasoningStampName(resolvedReasoning.parser)
                         : reasoningStampFromModelType(baseConfig.modelType))
             } else if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
@@ -774,7 +960,7 @@ public final class VLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
+                        ? ParserResolution.templateReasoningStampName(resolvedReasoning.parser)
                         : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
@@ -794,6 +980,7 @@ public final class VLMModelFactory: ModelFactory {
             for: templateResolvedDir)
         async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
 
+        loadTiming.mark("generation_and_mtp_setup")
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
             // 2026-04-28: pass top-level `quantization` through too, matching
@@ -803,17 +990,35 @@ public final class VLMModelFactory: ModelFactory {
             // gs. Without it, MXFP4 omni fell back to `jangConfig.blockSize`'s
             // default 64 instead of the actual gs=32, mis-inferring layers
             // and causing mid-prefill rmsNorm shape traps.
-            quantization: jangConfig != nil ? baseConfig.quantizationContainer?.quantization : nil,
+            quantization: (jangHPreparation != nil || jangConfig != nil)
+                ? baseConfig.quantizationContainer?.quantization : nil,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: jangConfig,
+            // Custom v2 banks already have an authoritative typed contract. Keep
+            // their ordinary modes explicit, bypassing legacy JANG shape inference.
+            jangConfig: jangHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
+        loadTiming.mark("weights")
 
         let tokenizer = try await tokenizerTask
+        #if canImport(CoreImage) && canImport(AVFoundation) && canImport(Accelerate)
         let baseProcessor = try await processorRegistry.createModel(
             configuration: processorConfigData,
             processorType: processorType, tokenizer: tokenizer)
+        #else
+        // Every built-in processor needs Apple's media frameworks. A processor that the caller
+        // registered is used; for any other type, the model loads with a stand-in processor that
+        // refuses input, so that the caller can prepare the LMInput itself.
+        let baseProcessor: any UserInputProcessor
+        if processorRegistry.containsProcessorType(processorType) {
+            baseProcessor = try await processorRegistry.createModel(
+                configuration: processorConfigData,
+                processorType: processorType, tokenizer: tokenizer)
+        } else {
+            baseProcessor = PreparedInputRequiredProcessor(processorType: processorType)
+        }
+        #endif
         let defaultAdditionalContext = VLMDefaultContextUserInputProcessor.defaultContext(
-            capabilities: jangConfig?.capabilities)
+            capabilities: jangConfig?.capabilities, chatConfig: jangConfig?.chat)
         let needsReasoningTranslation =
             VLMDefaultContextUserInputProcessor.requiresReasoningTranslation(
                 modelType: baseConfig.modelType)
@@ -846,6 +1051,7 @@ public final class VLMModelFactory: ModelFactory {
             generationDefaults: generationConfig,
             mtpStatus: mtpStatus)
 
+        loadTiming.mark("tokenizer_and_processor")
         return .init(
             configuration: modelConfig, model: model, processor: processor,
             tokenizer: tokenizer)
@@ -854,7 +1060,7 @@ public final class VLMModelFactory: ModelFactory {
 }
 
 /// Error wrapper that includes the filename for better error messages.
-private struct ProcessorConfigError: Error {
+struct ProcessorConfigError: Error {
     let filename: String
     let underlying: Error
 }
@@ -872,7 +1078,7 @@ private struct QwenTowerDeclaration: Decodable {
 /// Loads processor configuration, preferring preprocessor_config.json over processor_config.json.
 /// Marked async to enable parallel scheduling via async let, though the underlying I/O is synchronous.
 /// Throws ProcessorConfigError wrapping any underlying error with the filename.
-private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
+func loadProcessorConfig(from modelDirectory: URL) async throws -> (
     Data, BaseProcessorConfiguration
 ) {
     // Converted MiMo carries the authoritative settings in config.json.
@@ -880,6 +1086,13 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
     if let data = try? Data(contentsOf: modelDirectory.appendingPathComponent("config.json")),
         MiMoV26Contract.matches(data) {
         return (data, BaseProcessorConfiguration(processorClass: "MiMoV26Processor"))
+    }
+    // Text-only qwen4_exp bundles ship no processor files (Qwen4ExpTextOnlyBundle).
+    if let synthesized = Qwen4ExpTextOnlyBundle.processorConfiguration(
+        modelDirectory: modelDirectory,
+        configData: try? Data(contentsOf: modelDirectory.appendingPathComponent("config.json")))
+    {
+        return (synthesized, try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: synthesized))
     }
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
@@ -925,6 +1138,17 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
                     underlying: error)
             }
         }
+        // Image-only Nemotron Omni bundles (3.5 Bolt / Super-VL: no sound
+        // tower) expand the chat template's own `<image>` markers.
+        let omniURL = modelDirectory.appending(component: "config_omni.json")
+        if let omniData = try? Data(contentsOf: omniURL),
+            let omni = try? JSONSerialization.jsonObject(with: omniData) as? [String: Any],
+            omni["sound_config"] == nil || omni["sound_config"] is NSNull,
+            var processorObject = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            processorObject["_omni_template_image_markers"] = true
+            data = try JSONSerialization.data(withJSONObject: processorObject)
+        }
         let config = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data)
         return (data, config)
     } catch {
@@ -960,11 +1184,19 @@ struct VLMDefaultContextUserInputProcessor: UserInputProcessor {
         MuseGlimmerReasoningTemplateContext.applies(to: modelType)
     }
 
-    static func defaultContext(capabilities: JangCapabilities?) -> [String: any Sendable]? {
+    static func defaultContext(
+        capabilities: JangCapabilities?, chatConfig: JangChatConfig? = nil
+    ) -> [String: any Sendable]? {
         var context: [String: any Sendable] = [:]
 
         if capabilities?.supportsThinking == false {
             context["enable_thinking"] = false
+        } else if let enabled = chatConfig?.templateKwargsDefaults?.enableThinking {
+            // Only explicit bundle defaults, never a family/capability guess.
+            context["enable_thinking"] = enabled
+            if enabled, let effort = chatConfig?.reasoning?.defaultEffort {
+                context["reasoning_effort"] = effort
+            }
         }
 
         return context.isEmpty ? nil : context

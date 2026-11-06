@@ -28,10 +28,6 @@ import MLX
 ///   is reported through ``didForceClose`` and traced under
 ///   `VMLX_REASONING_BUDGET_TRACE`.
 ///
-/// It is the upper bound to `MinimumReasoningFloor`'s lower bound: the floor
-/// can only DELAY a close, this can only REQUIRE one, and neither can make the
-/// model prefer a close while it still has budget.
-///
 /// ## Why a budget is needed at all
 ///
 /// Reasoning depth is otherwise bounded only by prose. DSV4's "Low" rail is a
@@ -243,7 +239,7 @@ public struct ReasoningBudgetProcessor: LogitProcessor {
         guard closeTokenID >= 0, closeTokenID < vocabSize else { return logits }
         if trace {
             let line = "[vmlx][reasoning-budget] requiring close id=\(closeTokenID)\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
         // Build the mask OUT OF PLACE. `MLXArray` is a class and subscript
         // assignment aliases its buffer, so writing one column into a `full`
@@ -262,7 +258,7 @@ public struct ReasoningBudgetProcessor: LogitProcessor {
             started = true
             if trace {
                 let line = "[vmlx][reasoning-budget] reasoning opened by model; counting\n"
-                FileHandle.standardError.write(Data(line.utf8))
+                RuntimeDiagnostics.write(Data(line.utf8))
             }
             return
         }
@@ -275,7 +271,7 @@ public struct ReasoningBudgetProcessor: LogitProcessor {
         didForceClose = true
         if trace {
             let line = "[vmlx][reasoning-budget] close required; budget disarmed\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
     }
 }

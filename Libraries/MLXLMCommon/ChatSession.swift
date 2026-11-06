@@ -26,6 +26,7 @@ public final class ChatSession {
         case empty
         case kvcache([KVCache])
         case history([Chat.Message])
+        case invalidatedAfterPreparation
     }
 
     private let model: ModelContainer
@@ -400,9 +401,10 @@ public final class ChatSession {
                     // Whether this session already carries conversation state the caller depends on.
                     var kvCacheIsPopulated = false
                     switch cache {
+                    case .invalidatedAfterPreparation:
+                        throw ChatSessionError.cacheInvalidatedAfterPreparation
                     case .empty:
                         kvCache = model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache)
 
                     case .kvcache(let array):
                         kvCacheIsPopulated = array.contains { $0.offset > 0 }
@@ -417,7 +419,6 @@ public final class ChatSession {
                     case .history(let history):
                         // the KVCache is represented by a chat history
                         kvCache = model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache)
                         messages.append(contentsOf: history)
                     }
 
@@ -465,6 +466,10 @@ public final class ChatSession {
                             tools: tools, additionalContext: additionalContext)
                         let input = try await processor.prepare(input: userInput)
                             .withToolSchemas(tools)
+                        // Tokenization/template failure has not mutated model KV. Keep
+                        // pending history until preparation succeeds so retry cannot
+                        // silently drop the conversation's earlier messages.
+                        cache = .kvcache(kvCache)
                         messages.removeAll()
 
                         // generate output — block-diffusion models (e.g.
@@ -473,65 +478,85 @@ public final class ChatSession {
                         // prepare() guard.
                         let stream: AsyncStream<Generation>
                         let task: Task<Void, Never>
-                        if let diffusionModel = model as? any BlockDiffusionModel {
-                            let options = diffusionModel.blockDiffusionDefaults
-                                .resolving(
-                                    generationConfig: modelConfiguration.generationDefaults)
-                                .overriding(parameters: generateParameters)
-                            let iterator = try BlockDiffusionTokenIterator(
-                                input: input, model: diffusionModel, cache: kvCache,
-                                parameters: generateParameters,
-                                options: options,
-                                cacheCoordinator: cacheCoordinator)
-                            (stream, task) = MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                toolSchemas: input.toolSchemas
-                            )
-                        } else if let strategy = generateParameters.draftStrategy,
-                            case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
-                            generateParameters.canUseNativeMTP(for: input)
-                        {
-                            // Native model-owned MTP speculative decode. `generate(...)` and
-                            // `generateTokensTask(...)` already dispatch on `draftStrategy`, but
-                            // `ChatSession` did not — so a caller using the high-level chat API got
-                            // plain autoregressive decode no matter what it set, with no error and
-                            // no log line to say so. Eligibility is `canUseNativeMTP` (penalty-free,
-                            // no media, unbounded KV; greedy verifies token-identical, sampled runs
-                            // the exact-pq accept path), so this cannot change the output law.
-                            guard let nativeModel = model as? any NativeMTPModel else {
-                                throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
+                        do {
+                            if let diffusionModel = model as? any BlockDiffusionModel {
+                                let options = diffusionModel.blockDiffusionDefaults
+                                    .resolving(
+                                        generationConfig: modelConfiguration.generationDefaults
+                                    )
+                                    .overriding(parameters: generateParameters)
+                                let iterator = try BlockDiffusionTokenIterator(
+                                    input: input, model: diffusionModel, cache: kvCache,
+                                    parameters: generateParameters,
+                                    options: options,
+                                    cacheCoordinator: cacheCoordinator)
+                                (stream, task) = MLXLMCommon.generateTask(
+                                    promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration,
+                                    tokenizer: tokenizer,
+                                    iterator: iterator,
+                                    toolSchemas: input.toolSchemas
+                                )
+                            } else if let strategy = generateParameters.draftStrategy,
+                                case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
+                                generateParameters.canUseNativeMTP(for: input)
+                            {
+                                // Native model-owned MTP speculative decode. `generate(...)` and
+                                // `generateTokensTask(...)` already dispatch on `draftStrategy`, but
+                                // `ChatSession` did not — so a caller using the high-level chat API got
+                                // plain autoregressive decode no matter what it set, with no error and
+                                // no log line to say so. Eligibility is `canUseNativeMTP` (penalty-free,
+                                // no media, unbounded KV; greedy verifies token-identical, sampled runs
+                                // the exact-pq accept path), so this cannot change the output law.
+                                guard let nativeModel = model as? any NativeMTPModel else {
+                                    throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
+                                }
+                                let iterator = try NativeMTPTokenIterator(
+                                    input: input, model: nativeModel, cache: kvCache,
+                                    parameters: generateParameters, depth: depth,
+                                    cacheCoordinator: cacheCoordinator)
+                                (stream, task) = MLXLMCommon.generateTask(
+                                    promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration,
+                                    tokenizer: tokenizer,
+                                    iterator: iterator,
+                                    toolSchemas: input.toolSchemas
+                                )
+                            } else {
+                                let iterator = try TokenIterator(
+                                    input: input, model: model, cache: kvCache,
+                                    parameters: generateParameters,
+                                    cacheCoordinator: cacheCoordinator)
+                                (stream, task) = MLXLMCommon.generateTask(
+                                    promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration,
+                                    tokenizer: tokenizer,
+                                    iterator: iterator,
+                                    toolSchemas: input.toolSchemas
+                                )
                             }
-                            let iterator = try NativeMTPTokenIterator(
-                                input: input, model: nativeModel, cache: kvCache,
-                                parameters: generateParameters, depth: depth,
-                                cacheCoordinator: cacheCoordinator)
-                            (stream, task) = MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                toolSchemas: input.toolSchemas
-                            )
-                        } else {
-                            let iterator = try TokenIterator(
-                                input: input, model: model, cache: kvCache,
-                                parameters: generateParameters,
-                                cacheCoordinator: cacheCoordinator)
-                            (stream, task) = MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                toolSchemas: input.toolSchemas
-                            )
+
+                        } catch {
+                            // Preparation may mutate this session's live KV before
+                            // throwing. Drop it while still holding cache.update's
+                            // exclusive ownership; never reset later and race a
+                            // newer request. This session cannot reconstruct prior
+                            // conversation history from a single next-turn prompt.
+                            StreamOrDevice.default.stream.synchronize()
+                            cache = .invalidatedAfterPreparation
+                            throw error
                         }
 
                         var pendingToolCalls: [ToolCall] = []
 
                         for await item in stream {
+                            // GenerationFailure currently represents preparation only;
+                            // this is not a claim of recoverable decode-step errors.
+                            if case .info(let info) = item, let failure = info.generationFailure {
+                                await task.value
+                                cache = .invalidatedAfterPreparation
+                                throw failure
+                            }
                             if case .info(let info) = item,
                                 let failure = info.toolCallProtocolFailure
                             {
@@ -659,6 +684,8 @@ public final class ChatSession {
             switch cache {
             case .kvcache(let cache):
                 try savePromptCache(url: url, cache: cache)
+            case .invalidatedAfterPreparation:
+                throw ChatSessionError.cacheInvalidatedAfterPreparation
             default:
                 throw ChatSessionError.noCacheAvailable
             }
@@ -671,12 +698,18 @@ public enum ChatSessionError: LocalizedError {
     /// ``ChatSession/saveCache(to:)`` was called before any generation occurred.
     case noCacheAvailable
 
+    /// A failed preparation invalidated append-only session state. Clear the
+    /// session or create a new session with complete history before continuing.
+    case cacheInvalidatedAfterPreparation
+
     /// The model completed a committed tool-call envelope that could not be
     /// parsed into an executable call.
     case toolCallProtocolFailure(ToolCallProtocolFailure)
 
     public var errorDescription: String? {
         switch self {
+        case .cacheInvalidatedAfterPreparation:
+            "Session preparation failed and its KV cache was discarded. Clear the session or create a new session with the complete conversation history before continuing."
         case .noCacheAvailable:
             "No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."
         case .toolCallProtocolFailure(let failure):

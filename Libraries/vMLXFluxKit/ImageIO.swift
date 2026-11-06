@@ -132,7 +132,8 @@ public enum ImageIO {
     public static func writePNG(
         _ tensor: MLXArray,
         outputDir: URL,
-        prefix: String = "vmlx"
+        prefix: String = "vmlx",
+        atomic: Bool = false
     ) throws -> URL {
         #if canImport(AppKit)
         guard tensor.ndim == 4 || tensor.ndim == 3 else {
@@ -163,7 +164,11 @@ public enum ImageIO {
 
         // (C, H, W) → (H, W, C) for pixel buffer interpretation.
         let interleaved = asUInt8.transposed(1, 2, 0)
-        let bytes = interleaved.asArray(UInt8.self)
+        // Throwing read: if the diffusion/VAE graph behind this tensor failed
+        // to evaluate (Metal allocation or command-buffer failure under memory
+        // pressure, Sentry APPLE-MACOS-319), fail the job instead of writing a
+        // black PNG and reporting success.
+        let bytes = try interleaved.asArrayChecked(UInt8.self)
 
         // Build an NSBitmapImageRep and serialize.
         let bitsPerPixel = channels == 3 ? 24 : 8
@@ -198,7 +203,7 @@ public enum ImageIO {
             at: outputDir, withIntermediateDirectories: true)
         let filename = "\(prefix)-\(UUID().uuidString).png"
         let url = outputDir.appendingPathComponent(filename)
-        try pngData.write(to: url)
+        try pngData.write(to: url, options: atomic ? .atomic : [])
         return url
         #else
         throw FluxError.notImplemented("ImageIO.writePNG requires AppKit")

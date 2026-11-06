@@ -10,6 +10,7 @@
 //
 
 import Foundation
+import MLXLMCommon
 @preconcurrency import MLX
 import MLXNN
 import MLXRandom
@@ -859,18 +860,18 @@ final class QwenImagePipeline {
     }
 
     private static func mark(_ s: String) {
-        FileHandle.standardError.write("[qwen] >> \(s)\n".data(using: .utf8)!)
+        RuntimeDiagnostics.write("[qwen] >> \(s)\n".data(using: .utf8)!)
     }
     private static func dbg(_ label: String, _ x: MLXArray) {
-        FileHandle.standardError.write("[qwen] \(label) shape=\(x.shape) (evaluating...)\n".data(using: .utf8)!)
+        RuntimeDiagnostics.write("[qwen] \(label) shape=\(x.shape) (evaluating...)\n".data(using: .utf8)!)
         eval(x)
         let f = x.asType(.float32)
         let mn = mean(f).item(Float.self), mx = MLX.max(f).item(Float.self)
-        FileHandle.standardError.write("[qwen] \(label) mean=\(mn) max=\(mx) finite=\(mn.isFinite && mx.isFinite)\n".data(using: .utf8)!)
+        RuntimeDiagnostics.write("[qwen] \(label) mean=\(mn) max=\(mx) finite=\(mn.isFinite && mx.isFinite)\n".data(using: .utf8)!)
     }
 
     func generate(prompt: String, negativePrompt: String?, width: Int, height: Int, steps: Int,
-                  guidance: Float, seed: UInt64?, progress: (Int, Int, Double?) -> Void) throws -> MLXArray {
+                  guidance: Float, seed: UInt64?, preview: ImagePreviewEmitter? = nil, progress: (Int, Int, Double?) -> Void) throws -> MLXArray {
         guard width % 16 == 0, height % 16 == 0 else {
             throw FluxError.invalidRequest("Qwen width/height must be divisible by 16")
         }
@@ -887,6 +888,7 @@ final class QwenImagePipeline {
 
         let start = Date()
         for step in 0 ..< steps {
+            try FluxInterruptScope.check()
             // QwenTimeEmbed applies the ×1000 scale internally (QwenTimesteps scale=1000),
             // so pass the RAW sigma here (not sigma×1000) to avoid double-scaling.
             let t = scheduler.sigmas[step]
@@ -898,6 +900,12 @@ final class QwenImagePipeline {
                 guidance: guidance)
             latents = scheduler.step(latent: latents, velocity: guided, stepIndex: step)
             eval(latents)
+            preview?.emit(step: step + 1) {
+                let lh = height / 16, lw = width / 16
+                let spatial = latents.reshaped([1, lh, lw, 16, 2, 2])
+                    .transposed(0, 3, 1, 4, 2, 5).reshaped([1, 16, lh * 2, lw * 2])
+                return vae.decode(preview!.reducedLatent(spatial, scale: 8))
+            }
             if step == 0 { QwenImagePipeline.dbg("step0", latents) }
             let el = Date().timeIntervalSince(start)
             progress(step + 1, steps, el / Double(step + 1) * Double(steps - step - 1))

@@ -1,5 +1,8 @@
 # Qwen AR checkpoint — measured gains, broader qualification PARTIAL
 
+> Historical measurement/implementation record. For current product defaults and controls, see [Speculative decoding defaults](SPECULATIVE_DECODING_DEFAULTS.md). Fixed-depth probes here are diagnostics, not current user settings.
+
+
 ## Tested code and app
 
 Engine `67ccb4b347a23820b838a98f0c195b0c29c676d2`; Osaurus

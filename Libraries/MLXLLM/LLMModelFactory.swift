@@ -24,6 +24,36 @@ public enum LLMTypeRegistry {
     // Split into functions to help the compiler type-check the large model registry
     private static func coreModels() -> [String: ModelCreator] {
         [
+            "k2_horizon": { data, requesting in
+                guard requesting == nil || requesting == [.text], !NativeMTPActivation.isExplicitlyRequested,
+                      !JANGHModelPreparation.declaresCustomFormat(configuration: data, sidecar: nil) else {
+                    throw K2HorizonConfiguration.ContractError.unsupported(
+                        "K2 requires text-only autoregressive loading; custom banks require a model directory")
+                }
+                return try K2HorizonModel(JSONDecoder.json5().decode(K2HorizonConfiguration.self, from: data))
+            },
+            "naive_n05_flash": { data, requesting in
+                guard !JANGHModelPreparation.declaresCustomFormat(configuration: data, sidecar: nil)
+                else {
+                    throw NaiveN05ArchitectureContract.ContractError.unsupported(
+                        "JANGH banks require validated directory-backed model loading")
+                }
+                guard requesting == nil || requesting == [.text],
+                    !NativeMTPActivation.isExplicitlyRequested
+                else {
+                    throw NaiveN05ArchitectureContract.ContractError.unsupported(
+                        "Naive-N0.5 requires text-only autoregressive loading")
+                }
+                let config = try JSONDecoder.json5().decode(NaiveN05ArchitectureContract.self, from: data)
+                return try NaiveN05FlashModel(config)
+            },
+            "flint": { data, requesting in
+                guard !JANGHModelPreparation.declaresCustomFormat(configuration: data, sidecar: nil),
+                    requesting == nil || requesting == [.text] else {
+                    throw FlintError.invalidConfiguration
+                }
+                return try FlintModel(JSONDecoder.json5().decode(FlintConfiguration.self, from: data))
+            },
             "mistral": create(LlamaConfiguration.self, LlamaModel.init),
             "llama": create(LlamaConfiguration.self, LlamaModel.init),
             "phi": create(PhiConfiguration.self, PhiModel.init),
@@ -138,6 +168,9 @@ public enum LLMTypeRegistry {
                 let config = try JSONDecoder.json5().decode(MiniMaxConfiguration.self, from: data)
                 return MiniMaxModel(config)
             },
+            // MiniMax-M3 / M3.1: MSA attention, sigmoid-routed MoE, a separate architecture from M2.
+            "minimax_m3": dispatchMiniMaxM3,
+            "minimax_m3_vl": dispatchMiniMaxM3,
             "glm4": create(GLM4Configuration.self, GLM4Model.init),
             "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
             "glm4_moe_lite": create(GLM4MoELiteConfiguration.self, GLM4MoELiteModel.init),
@@ -147,6 +180,7 @@ public enum LLMTypeRegistry {
             "smollm3": create(SmolLM3Configuration.self, SmolLM3Model.init),
             "ernie4_5": create(Ernie45Configuration.self, Ernie45Model.init),
             "lfm2": create(LFM2Configuration.self, LFM2Model.init),
+            "lfm3": create(LFM3Configuration.self, LFM3Model.init),
             // Laguna is config-driven: S-2.1 uses 48 layers, alternating
             // full/SWA attention, 48/72 query heads, dual RoPE, 256 routed
             // experts with top-10 selection, and one shared expert. Older
@@ -228,7 +262,13 @@ public enum LLMTypeRegistry {
             "olmo3": create(Olmo3Configuration.self, Olmo3Model.init),
             "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
             "bailing_hybrid": dispatchBailingHybrid,
-            "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
+            "lfm2_moe": { data, requesting in
+                guard !JANGHModelPreparation.declaresCustomFormat(configuration: data, sidecar: nil) else {
+                    throw LFM2MoEJANGHError.invalid("LFM JANGH requires validated directory-backed loading")
+                }
+                try LFM2MoEJANGHPreparation.validateRequestedModalities(requesting)
+                return LFM2MoEModel(try JSONDecoder.json5().decode(LFM2MoEConfiguration.self, from: data))
+            },
             "step": dispatchStep3p5,
             "step3p5": dispatchStep3p5,
             "step3p7": dispatchStep3p5,
@@ -261,6 +301,10 @@ public enum LLMTypeRegistry {
             // Swift port plan + status:
             //   Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md
             "deepseek_v4": dispatchDeepseekV4,
+            // DeepSeek-V4.1-Flash: V4-family backbone (MLA head_dim-512, mHC, DSA compressor/indexer,
+            // quantized pool cache) + engram n-gram taps + 3-stage dSpark. Routes to the V4 dispatch as
+            // the base; engram + dSpark are the V4.1-specific additions still being ported.
+            "deepseek_v41": dispatchDeepseekV4,
             "hy_v3": create(Hy3Configuration.self, Hy3Model.init),
             "hy3":   create(Hy3Configuration.self, Hy3Model.init),
             "hy-v3": create(Hy3Configuration.self, Hy3Model.init),
@@ -395,6 +439,19 @@ public enum LLMTypeRegistry {
         return ZayaModel(config, moe: context)
     }
 
+    /// MiniMax-M3 / M3.1. A `minimax_m3_vl` config with `vision_config` builds its vision stack unless the caller asks
+    /// for text only; a lane the config cannot build is refused instead of being served text-only.
+    private static func dispatchMiniMaxM3(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
+        let vision = try MiniMaxM3VisionConfiguration.decode(configuration: data)
+        let lanes = try Set.resolveForConstruction(
+            requested: requesting, constructible: vision == nil ? [.text] : [.text, .vision])
+        return MiniMaxM3Model(
+            try JSONDecoder.json5().decode(MiniMaxM3Configuration.self, from: data),
+            vision: lanes.contains(.vision) ? vision : nil)
+    }
+
     /// `model_type = "bailing_hybrid"` covers two architectures that share the
     /// model type:
     /// - Ling 3.0 (KDA + MLA + V3 MoE, `BailingMoeV3Model`): any Ling 3 marker
@@ -439,18 +496,18 @@ public enum LLMTypeRegistry {
         {
             let configuration = try JSONDecoder().decode(
                 BailingHybridConfiguration.self, from: data)
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[LLMModelFactory] bailing_hybrid → Ling 2.6 runtime (BailingHybridModel, GLA) \(markers)\n".utf8))
             return BailingHybridModel(configuration)
         }
         do {
             let configuration = try JSONDecoder().decode(
                 BailingMoeV3Configuration.self, from: data)
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[LLMModelFactory] bailing_hybrid → Ling 3.0 runtime (BailingMoeV3Model, KDA) \(markers)\n".utf8))
             return BailingMoeV3Model(configuration)
         } catch {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[LLMModelFactory] bailing_hybrid config does not decode as Ling 3.0 (BailingMoeV3Configuration): "
                     + "\(error). The Ling 2.6 GLA runtime is reached only by a config naming the "
                     + "BailingMoeV2 architecture; it is not a fallback (it produces garbage for Ling 3 bundles). \(markers)\n").utf8))
@@ -622,7 +679,10 @@ public enum LLMTypeRegistry {
             }
         }
 
-        let config = try decodeDeepseekV4Configuration(data: data)
+        var config = try decodeDeepseekV4Configuration(data: data)
+        // DeepSeek-V4.1 builds its vision tower only when the caller wants the vision lane
+        // (nil = everything the bundle offers); `VMLX_DSV41_VL=0` is checked by the model.
+        if let requesting, !requesting.contains(.vision) { config.vision = nil }
         let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data)
         let forced = ProcessInfo.processInfo.environment["DSV4_FORCE_JANGTQ"] == "1"
         let weightFormat = check?.weightFormat?.lowercased()
@@ -1340,13 +1400,24 @@ struct LLMUserInputProcessor: UserInputProcessor {
     /// SYSTEM turn). Then the kwarg is passed through untouched; the legacy
     /// Bailing directive prepend is only for templates that do not read it.
     let templateReadsEnableThinking: Bool
+    let k2ReasoningDeclaration: K2HorizonTemplateContract.FixedReasoningDeclaration?
+    /// DeepSeek-V4.1 with its vision tower built: image content parts render as placeholders in
+    /// their own turn, expand to image spans, and ship their patches in `LMInput.image`. nil for
+    /// every other model (images are ignored there, as before).
+    let deepseekV41Vision: DeepseekV41VisionConfiguration?
+    /// MiniMax-M3 / M3.1 with its vision stack built: image items in their turn, expanded to image runs, patches in
+    /// `LMInput.image` (`MiniMaxM3Vision.swift`). nil for every other model.
+    let miniMaxM3Vision: MiniMaxM3VisionPromptConfiguration?
 
     internal init(
         tokenizer: any Tokenizer, configuration: ModelConfiguration,
         modelType: String?,
         messageGenerator: MessageGenerator,
         defaultAdditionalContext: [String: any Sendable]? = nil,
-        templateReadsEnableThinking: Bool = false
+        templateReadsEnableThinking: Bool = false,
+        k2ReasoningDeclaration: K2HorizonTemplateContract.FixedReasoningDeclaration? = nil,
+        deepseekV41Vision: DeepseekV41VisionConfiguration? = nil,
+        miniMaxM3Vision: MiniMaxM3VisionPromptConfiguration? = nil
     ) {
         self.tokenizer = tokenizer
         self.configuration = configuration
@@ -1354,16 +1425,24 @@ struct LLMUserInputProcessor: UserInputProcessor {
         self.messageGenerator = messageGenerator
         self.defaultAdditionalContext = defaultAdditionalContext
         self.templateReadsEnableThinking = templateReadsEnableThinking
+        self.k2ReasoningDeclaration = k2ReasoningDeclaration
+        self.deepseekV41Vision = deepseekV41Vision
+        self.miniMaxM3Vision = miniMaxM3Vision
     }
 
     func prepare(input: UserInput) throws -> LMInput {
-        // Two per-family adapters, each translating the generic request
-        // surface into ITS template's contract. Both are no-ops for every
-        // other family (they gate on `modelType` first), so the order between
-        // them is irrelevant.
-        let additionalContext = MuseGlimmerReasoningTemplateContext.apply(
-            additionalContext: Hy3ReasoningTemplateContext.apply(
-                additionalContext: try mergedAdditionalContext(input.additionalContext),
+        try K2HorizonTemplateContract.validateContext(
+            input.additionalContext, modelType: modelType, declaration: k2ReasoningDeclaration)
+        // Per-family adapters, each translating the generic request surface
+        // into ITS template's contract. Each is a no-op for every other family
+        // (they gate on `modelType` first), so the order between them is
+        // irrelevant.
+        let additionalContext = MiniMaxM3ThinkingTemplateContext.apply(
+            additionalContext: MuseGlimmerReasoningTemplateContext.apply(
+                additionalContext: Hy3ReasoningTemplateContext.apply(
+                    additionalContext: try mergedAdditionalContext(input.additionalContext),
+                    modelType: modelType
+                ),
                 modelType: modelType
             ),
             modelType: modelType
@@ -1374,11 +1453,40 @@ struct LLMUserInputProcessor: UserInputProcessor {
             additionalContext: additionalContext,
             templateReadsEnableThinking: templateReadsEnableThinking
         )
-        let messages = NemotronToolChoiceTemplateContext.apply(
+        let nemotronMessages = NemotronToolChoiceTemplateContext.apply(
             to: bailingMessages,
             modelType: modelType,
             additionalContext: additionalContext
         )
+        try K2HorizonTemplateContract.validateContext(
+            additionalContext, modelType: modelType, declaration: k2ReasoningDeclaration)
+        let messages = K2HorizonTemplateContract.prepare(messages: nemotronMessages, modelType: modelType)
+        if let vision = deepseekV41Vision, !input.images.isEmpty {
+            let chat: [Chat.Message]? = {
+                if case .chat(let chat) = input.prompt { return chat }
+                return nil
+            }()
+            let anchored = try DeepseekV41VisionPrompt.anchorImages(
+                chat: chat, looseImages: input.images, generated: messages)
+            if !anchored.images.isEmpty {
+                return try deepseekV41ImageInput(
+                    input: input, messages: anchored.messages, images: anchored.images,
+                    additionalContext: additionalContext, vision: vision)
+            }
+        }
+        if let vision = miniMaxM3Vision, !input.images.isEmpty {
+            let chat: [Chat.Message]? = {
+                if case .chat(let chat) = input.prompt { return chat }
+                return nil
+            }()
+            let anchored = MiniMaxM3VisionPrompt.anchorImages(
+                chat: chat, looseImages: input.images, generated: messages)
+            if !anchored.images.isEmpty {
+                return try miniMaxM3ImageInput(
+                    input: input, messages: anchored.messages, images: anchored.images,
+                    additionalContext: additionalContext, vision: vision)
+            }
+        }
         do {
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: input.tools, additionalContext: additionalContext)
@@ -1412,6 +1520,99 @@ struct LLMUserInputProcessor: UserInputProcessor {
                 cacheScopeSalt: cacheScopeSalt(from: additionalContext),
                 toolSchemas: input.tools)
         }
+    }
+
+    /// DeepSeek-V4.1 image request (engine `preprocess_dsv41_vl`): render through the same chat
+    /// template path as text (so an image turn and its text continuation share one prompt format
+    /// and cache boundaries), preprocess each image, expand every placeholder token into its
+    /// image span, and remap the cache boundaries into the expanded token space.
+    private func deepseekV41ImageInput(
+        input: UserInput, messages: [Message], images: [UserInput.Image],
+        additionalContext: [String: any Sendable]?, vision: DeepseekV41VisionConfiguration
+    ) throws -> LMInput {
+        let promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools, additionalContext: additionalContext)
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: input.tools,
+            additionalContext: additionalContext,
+            promptTokens: promptTokens,
+            staticSystemPrefix: input.cacheStableSystemPrefix)
+        let processed = try images.map {
+            DeepseekV41ImagePreprocessor.preprocess(
+                try DeepseekV41ImagePreprocessor.decodeRGB($0), config: vision)
+        }
+        let expansion = try DeepseekV41VisionPrompt.expand(
+            tokens: promptTokens, imageTokenId: vision.imageTokenId, grids: processed.map(\.grid))
+        if DeepseekV4Model.visionLogEnabled {
+            NSLog(
+                "VMLX DSV4.1 VL preprocess: \(expansion.tokens.count) tokens, "
+                    + "\(processed.reduce(0) { $0 + $1.grid.tokenCount }) image-span tokens, "
+                    + "\(processed.count) image(s) "
+                    + processed.map { "\($0.grid.bestW)x\($0.grid.bestH)->\($0.grid.llmH)x\($0.grid.llmW)" }
+                    .joined(separator: ","))
+        }
+        return LMInput(
+            text: .init(tokens: MLXArray(expansion.tokens), tokenIds: expansion.tokens),
+            image: DeepseekV41VisionPrompt.processedImage(processed, patchSize: vision.patchSize),
+            mediaTokenIds: [vision.imageTokenId],
+            cacheScopeSalt: cacheScopeSalt(from: additionalContext),
+            cachePrefixTokenCounts: DeepseekV41VisionPrompt.remapBoundaries(
+                boundaries.all, rawToExpanded: expansion.rawToExpanded),
+            cacheStablePrefixTokenCounts: DeepseekV41VisionPrompt.remapBoundaries(
+                boundaries.stable, rawToExpanded: expansion.rawToExpanded),
+            toolSchemas: input.tools)
+    }
+
+    /// MiniMax-M3 / M3.1 image request (vMLX `preprocess_m3_vl_messages`): render the image items through the same
+    /// chat template path as text (an image turn and its text continuation share one prompt format and cache
+    /// boundaries), preprocess each image as the bundle's processor does, expand every image token into
+    /// `start, image x (t h w / 4), end`, and remap the cache boundaries into the expanded token space.
+    private func miniMaxM3ImageInput(
+        input: UserInput, messages: [Message], images: [UserInput.Image],
+        additionalContext: [String: any Sendable]?, vision: MiniMaxM3VisionPromptConfiguration
+    ) throws -> LMInput {
+        let promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools, additionalContext: additionalContext)
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: input.tools,
+            additionalContext: additionalContext,
+            promptTokens: promptTokens,
+            staticSystemPrefix: input.cacheStableSystemPrefix)
+        let processed = try images.map {
+            try MiniMaxM3ImagePreprocessor.process(
+                try DeepseekV41ImagePreprocessor.decodeRGB($0), config: vision.processor)
+        }
+        let token = { (text: String) throws -> Int in
+            guard let id = tokenizer.convertTokenToId(text) else { throw MiniMaxM3VisionError.missingToken(text) }
+            return id
+        }
+        let merge = vision.processor.mergeSize * vision.processor.mergeSize
+        let expansion = try MiniMaxM3VisionPrompt.expand(
+            tokens: promptTokens, imageTokenId: vision.imageTokenId,
+            startTokenId: try token(MiniMaxM3VisionPrompt.startToken),
+            endTokenId: try token(MiniMaxM3VisionPrompt.endToken),
+            counts: processed.map { $0.grid.t * $0.grid.h * $0.grid.w / merge })
+        let p = vision.processor
+        RuntimeReceipts.emit(
+            "m3vision stage=preprocess images=\(processed.count) grids="
+                + processed.map { "\($0.grid.t)x\($0.grid.h)x\($0.grid.w)" }.joined(separator: ",")
+                + " image_tokens=\(expansion.tokens.filter { $0 == vision.imageTokenId }.count)"
+                + " prompt_tokens=\(expansion.tokens.count)")
+        return LMInput(
+            text: .init(tokens: MLXArray(expansion.tokens), tokenIds: expansion.tokens),
+            image: MiniMaxM3ImagePreprocessor.processedImage(
+                processed, rowWidth: 3 * p.temporalPatchSize * p.patchSize * p.patchSize),
+            mediaTokenIds: [vision.imageTokenId],
+            cacheScopeSalt: cacheScopeSalt(from: additionalContext),
+            cachePrefixTokenCounts: MiniMaxM3VisionPrompt.remapBoundaries(
+                boundaries.all, rawToExpanded: expansion.rawToExpanded),
+            cacheStablePrefixTokenCounts: MiniMaxM3VisionPrompt.remapBoundaries(
+                boundaries.stable, rawToExpanded: expansion.rawToExpanded),
+            toolSchemas: input.tools)
     }
 
     private func mergedAdditionalContext(
@@ -1485,7 +1686,7 @@ public final class LLMModelFactory: ModelFactory {
             || (priorFormat.lowercased() == "jangtq4")
         if !isMxtqStampAlready {
             configDict["weight_format"] = "mxtq"
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[Load] sidecar codebook present (\(sniffed)-bit) — forced weight_format \"mxtq\" (was: \"\(priorFormat)\"); fix the bundle's startup metadata\n".utf8))
         }
         if configDict["mxtq_bits"] == nil {
@@ -1529,6 +1730,10 @@ public final class LLMModelFactory: ModelFactory {
         tokenizerLoader: any TokenizerLoader
     ) async throws -> ModelContext {
         let modelDirectory = configuration.modelDirectory
+        if DecisionBundle.declaresDecisionModel(at: modelDirectory) {
+            throw DecisionRuntimeError.invalid("This is a decision model; use the System One decision runtime, not chat generation")
+        }
+
 
         // Load config.json once and decode for both base config and model-specific config
         let configurationURL = modelDirectory.appending(component: "config.json")
@@ -1540,6 +1745,55 @@ public final class LLMModelFactory: ModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        // Admit custom v2 banks before generic quantization or legacy sidecar
+        // merging. The partition excludes only verified custom tensor names.
+        struct FactoryRoutingConfiguration: Decodable {
+            let model_type: String?
+        }
+        if let route = try? JSONDecoder.json5().decode(FactoryRoutingConfiguration.self, from: configData),
+            route.model_type == "glm5_next"
+        {
+            // This family is constructed by the VLM factory, including text-only
+            // requests. Preserve its detailed admission error instead of an
+            // unrelated LLM quantization error winning factory fallback.
+            throw ModelFactoryError.unsupportedModelType("glm5_next")
+        }
+        if let route = try? JSONDecoder.json5().decode(FactoryRoutingConfiguration.self, from: configData),
+            (route.model_type == "qwen4_exp" || route.model_type == "qwen3_5_moe"),
+            JANGHModelPreparation.declaresCustomFormat(configuration: configData, sidecar: nil)
+        {
+            // Qwen routed JANGH bundles are admitted by the VLM factory, including text-only requests.
+            // Without this, the LLM factory's strict quantization decode rejects `mode: jangtq2`
+            // and that unrelated error wins the factory fallback.
+            throw ModelFactoryError.unsupportedModelType(route.model_type ?? "")
+        }
+        let k2JANGHPreparation = try K2HorizonJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let k2JANGHPreparation { configData = k2JANGHPreparation.ordinaryConfiguration }
+        let jangHPreparation = try NaiveN05JANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let jangHPreparation { configData = jangHPreparation.banks.ordinaryConfiguration }
+
+        let flintJANGHPreparation = try FlintJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let flintJANGHPreparation { configData = flintJANGHPreparation.banks.ordinaryConfiguration }
+        let lfmJANGHPreparation = try LFM2MoEJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let lfmJANGHPreparation { configData = lfmJANGHPreparation.banks.ordinaryConfiguration }
+        let nemotronJANGHPreparation = try NemotronHJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let nemotronJANGHPreparation {
+            configData = nemotronJANGHPreparation.banks.ordinaryConfiguration
+        }
+        // DeepSeek-V4.1 JANGHT (JANGT trellis routed experts, mxfp8 projections; plan keyed by checkpoint path).
+        let dsv41JANGHPreparation = try DeepseekV41JANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let dsv41JANGHPreparation { configData = dsv41JANGHPreparation.ordinaryConfiguration }
+        // MiniMax-M3 / M3.1 JANGHT (JANGT trellis routed experts; mxfp8 / affine trunk keyed by live module path).
+        let miniMaxM3JANGHPreparation = try MiniMaxM3JANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let miniMaxM3JANGHPreparation { configData = miniMaxM3JANGHPreparation.ordinaryConfiguration }
+
         // JANGTQ: merge `weight_format`, `mxtq_bits`, `mxtq_seed` from
         // jang_config.json into config.json so per-type creator closures can
         // dispatch on them (e.g. minimax_m2 → MiniMaxJANGTQModel). The real
@@ -1547,7 +1801,7 @@ public final class LLMModelFactory: ModelFactory {
         // config.json — without this merge the factory never sees "mxtq" and
         // falls through to the standard non-TQ model path.
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if let jangData = try? Data(contentsOf: jangConfigURL),
+        if flintJANGHPreparation == nil, jangHPreparation == nil, k2JANGHPreparation == nil, lfmJANGHPreparation == nil, nemotronJANGHPreparation == nil, dsv41JANGHPreparation == nil, miniMaxM3JANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
             var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
             let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
@@ -1689,7 +1943,7 @@ public final class LLMModelFactory: ModelFactory {
                     || (priorFormat.lowercased() == "jangtq4")
                 if !isMxtqStampAlready {
                     configDict["weight_format"] = "mxtq"
-                    FileHandle.standardError.write(
+                    RuntimeDiagnostics.write(
                         Data("[Load] sidecar codebook present (\(sniffed)-bit) — forced weight_format \"mxtq\" (was: \"\(priorFormat)\"); fix the bundle's jang_config.json\n".utf8))
                 }
                 if configDict["mxtq_bits"] == nil {
@@ -1747,9 +2001,11 @@ public final class LLMModelFactory: ModelFactory {
                 configData = merged
             }
         }
-        configData = Self.mergeJANGTQSidecarStartupMetadata(
-            configData,
-            modelDirectory: modelDirectory)
+        if flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil && miniMaxM3JANGHPreparation == nil {
+            configData = Self.mergeJANGTQSidecarStartupMetadata(
+                configData,
+                modelDirectory: modelDirectory)
+        }
 
         let baseConfig: BaseConfiguration
         do {
@@ -1939,10 +2195,32 @@ public final class LLMModelFactory: ModelFactory {
             }
         } else {
             do {
-                model = try await typeRegistry.createModel(
-                    configuration: configData, modelType: baseConfig.modelType,
-                    requesting: configuration.requestedModalities)
+                if let flintJANGHPreparation {
+                    model = try flintJANGHPreparation.construct(requesting: configuration.requestedModalities)
+                } else if let lfmJANGHPreparation {
+                    model = try lfmJANGHPreparation.construct(requesting: configuration.requestedModalities)
+                } else if let k2JANGHPreparation {
+                    model = try k2JANGHPreparation.construct(requesting: configuration.requestedModalities)
+                } else if let nemotronJANGHPreparation {
+                    let languageModel = try nemotronJANGHPreparation.makeLanguageModel()
+                    try NemotronLiLiCorrAttachment.attachIfRequested(
+                        to: languageModel, bundle: modelDirectory)
+                    model = languageModel
+                } else if let jangHPreparation {
+                    model = try jangHPreparation.construct(requesting: configuration.requestedModalities)
+                } else if let dsv41JANGHPreparation {
+                    model = try dsv41JANGHPreparation.construct(
+                        configurationData: configData, requesting: configuration.requestedModalities)
+                } else if let miniMaxM3JANGHPreparation {
+                    model = try miniMaxM3JANGHPreparation.construct(requesting: configuration.requestedModalities)
+                } else {
+                    model = try await typeRegistry.createModel(
+                        configuration: configData, modelType: baseConfig.modelType,
+                        requesting: configuration.requestedModalities)
+                }
             } catch {
+                // A rejected custom bank must never fall back to an ordinary model.
+                if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil || miniMaxM3JANGHPreparation != nil { throw error }
                 // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
                 // or the config couldn't be decoded for that type).
                 // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
@@ -1965,10 +2243,17 @@ public final class LLMModelFactory: ModelFactory {
                     throw error
                 }
             }
+
         }
 
         if let mimo = model as? MiMoV26TextModel {
             try mimo.configure(modelDirectory: modelDirectory)
+        }
+        // DeepSeek-V4.1: resolve + validate the disk-resident Engram tables from the bundle
+        // (config.json runtime.engram_dir, default <bundle>/engram). Throws at load when a V4.1
+        // bundle's tables are missing instead of decoding garbage. No-op for DSV4-0731.
+        if let dsv4 = model as? DeepseekV4Model {
+            try dsv4.configureBundle(modelDirectory: modelDirectory)
         }
 
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
@@ -1985,7 +2270,9 @@ public final class LLMModelFactory: ModelFactory {
             configurationData: configData,
             generationConfig: generationConfig,
             jangStopTokenIds: earlyJangConfig?.chat?.stopTokenIds)
-        if baseConfig.modelType == "deepseek_v4" {
+        if baseConfig.modelType == "deepseek_v4"
+            || DeepseekV4ReasoningPolicy.isDeepseekV41(modelType: baseConfig.modelType)
+        {
             // DSV4's Python runtime treats EOS plus both role-boundary
             // sentinels as hard stops: {1, 128803, 128804}. The public
             // bundle's config/generation_config omit 128804
@@ -2077,7 +2364,7 @@ public final class LLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
+                        ? ParserResolution.templateReasoningStampName(resolvedReasoning.parser)
                         : reasoningStampFromModelType(baseConfig.modelType))
             } else if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
@@ -2090,7 +2377,7 @@ public final class LLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
+                        ? ParserResolution.templateReasoningStampName(resolvedReasoning.parser)
                         : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
@@ -2123,13 +2410,16 @@ public final class LLMModelFactory: ModelFactory {
         // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            quantization: jangConfig != nil ? baseConfig.quantizationContainer?.quantization : nil,
+            quantization: jangConfig != nil || flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil
+                || miniMaxM3JANGHPreparation != nil
+                ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
             // loadWeights treats config.json's explicit per-layer dict as
             // declared evidence, then validates it against exact manifests,
             // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: jangConfig,
+            jangConfig: flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil
+                && miniMaxM3JANGHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP,
             bonsaiTransform: bonsaiPlan)
 
@@ -2171,7 +2461,17 @@ public final class LLMModelFactory: ModelFactory {
                 generationConfig: generationConfig,
                 chatConfig: jangConfig?.chat,
                 chatTemplate: chatTemplate),
-            templateReadsEnableThinking: BailingThinkingTemplateContext.templateReadsEnableThinking(chatTemplate))
+            templateReadsEnableThinking: BailingThinkingTemplateContext.templateReadsEnableThinking(chatTemplate),
+            k2ReasoningDeclaration: K2HorizonTemplateContract.fixedReasoningDeclaration(
+                metadata: K2HorizonTemplateContract.matches(baseConfig.modelType)
+                    ? (try? Data(contentsOf: jangConfigURL)) : nil,
+                modelType: baseConfig.modelType),
+            deepseekV41Vision: (model as? DeepseekV4Model)?.v41Vision?.config,
+            miniMaxM3Vision: ((model as? MiniMaxM3Model)?.vision?.config).map {
+                MiniMaxM3VisionPromptConfiguration(
+                    processor: MiniMaxM3ImageProcessorConfiguration.load(directory: modelDirectory),
+                    imageTokenId: $0.imageTokenId)
+            })
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

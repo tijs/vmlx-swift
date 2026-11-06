@@ -45,12 +45,11 @@ private struct NativeMTPCacheCheckpoint {
     }
 }
 
-/// Process-wide memo of the hybrid safety-warmup verdict, keyed by model
-/// instance. The 16-cycle probe otherwise re-runs on every request even
-/// though its outcome is a property of the model, not the prompt — census
-/// showed 84% of requests burning the probe just to land in AR fallback
-/// again. Only the *warmup* verdict is memoized; adaptive acceptance-ratio
-/// fallbacks stay per-request because they are content-dependent.
+/// Process-wide memo of successful hybrid warmup, keyed by model instance.
+/// Acceptance is content-dependent, even when it is near zero. A failed
+/// request keeps its own AR fallback but cannot disable later requests.
+/// A successful memo only avoids repeating the legacy warmup; verifier commit
+/// correctness and the reversible wall-cost governor keep their own gates.
 enum NativeMTPHybridWarmupMemo {
     private struct Entry {
         weak var model: AnyObject?
@@ -106,9 +105,10 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
     /// Draft depth actually in effect at the start of generation (`depth=`).
     ///
     /// This is the REQUESTED depth after the policy cap, not the raw request:
-    /// the iterator clamps to `VMLX_MTP_DEPTH_CAP` (default `3` since the
-    /// staged verifier's measured D3 win — see the cap-site comment; the D2
-    /// ceiling era is over). A host that asks past the cap sees the clamped
+    /// the iterator clamps to the runtime's top rung (`NativeMTPDepthPolicy.runtimeTopRung`;
+    /// `VMLX_MTP_DEPTH_CAP` overrides it for diagnostics).
+    /// This bound is separate from the request's adaptive policy.
+    /// A host that asks past the cap sees the clamped
     /// value here — which is the point of surfacing it, since that gap is
     /// otherwise invisible without reading stderr.
     public let depth: Int
@@ -170,6 +170,11 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
     public let arSafetyTrips: Int
     public let arSafetyResumes: Int
 
+    /// The top rung of this generation's adaptive ladder (`NativeMTPDepthPolicy.runtimeTopRung`, or a lower
+    /// explicit limit / fixed depth): the real ceiling, so a host can show it instead of a guessed constant.
+    /// `nil` when built by a caller that does not know it.
+    public let adaptiveCeiling: Int?
+
     /// Verifier mode used for this generation (`verifierMode=`).
     public let verifierMode: String
 
@@ -192,7 +197,8 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
         verifierMode: String,
         cacheMode: String,
         arSafetyTrips: Int = 0,
-        arSafetyResumes: Int = 0
+        arSafetyResumes: Int = 0,
+        adaptiveCeiling: Int? = nil
     ) {
         self.depth = depth
         self.activeDepth = activeDepth
@@ -210,6 +216,7 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
         self.cacheMode = cacheMode
         self.arSafetyTrips = arSafetyTrips
         self.arSafetyResumes = arSafetyResumes
+        self.adaptiveCeiling = adaptiveCeiling
     }
 }
 
@@ -224,7 +231,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let speculativeSampler: SpeculativeSamplingController
     let maxTokens: Int?
     let depth: Int
-    private var currentDepth: Int
+    private var currentDepth: Int {
+        didSet {
+            if currentDepth != oldValue {
+                arSafetyMeanLoss.reset(afterCycle: verifyCalls)
+            }
+        }
+    }
     /// True when this iterator warm-started from restored cache rows. The
     /// aligned head cache starts cold in that state, so early acceptance
     /// windows under-read — the adaptive controller widens its first
@@ -237,10 +250,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let originalInput: LMInput
     let cacheInitParameters: GenerateParameters
     var promptCacheSnapshot: [KVCache]?
+    // Owned exact checkpoints captured during text prefill, not reconstructed after decode.
+    var prefillBoundarySnapshots: [Int: [KVCache]] = [:]
+    var spilledHybridStripBoundary: Int?
     let mediaSalt: String?
 
     var tokenCount = 0
     var promptPrefillTime: TimeInterval = 0
+    // Returning nil ends the sequence, but must not erase a verifier error
+    // or let a direct caller resume a partially committed speculative cycle.
+    private(set) var generationFailure: GenerationFailure?
+    private var iterationTerminated = false
 
     /// `VMLX_LOGITS_NAN_TRACE=1` diagnostic (see ``NaNLogitsTrace``);
     /// `nil` when the flag is off. Probes the backbone (target) logits at
@@ -252,9 +272,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
     private var pendingTokens: [Int] = []
     private var pendingIndex = 0
+    /// Copy drafts (NativeMTPCopyProposer.swift): the request's suffix-match proposer, fed every confirmed
+    /// token; `copyFed` = how much of the current `pendingTokens` buffer it has seen.
+    private var copyProposer: NativeMTPCopyProposer?
+    private var copyFed = 0
+    /// The drafts now in `drafts` are a copy window (kept out of the head/depth controller's statistics).
+    private var draftsAreCopy = false
     private var nextMain: MLXArray?
     private var drafts: [MLXArray] = []
     private var draftProbabilities: [MLXArray] = []
+    /// Sampled requests with a top-k filter: batched lossless acceptance on the host from one
+    /// readback per cycle (SpeculativeTopKAcceptance.swift). `nil` = greedy or no top-k.
+    private let topKAcceptance: SpeculativeTopKAcceptance.Filter?
+    private var hostRNG: SpeculativeHostRNG
 
     // MARK: - Verify prefetch
     //
@@ -276,7 +306,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private struct PendingVerify {
         let verifier: NativeMTPForwardResult
         let requested: [MLXArray]
-        let requestedInputIds: [Int32]
+        /// The requested ids as one lazy int32 array; read back at consume.
+        let requestedInputArray: MLXArray
         let depth: Int
         let checkpoint: NativeMTPCacheCheckpoint
         /// Signalled when the background `asyncEval` has finished SCHEDULING
@@ -291,6 +322,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static let prefetchQueue = DispatchQueue(
         label: "vmlx.mtp.verify-prefetch", qos: .userInitiated)
     private var pendingVerify: PendingVerify?
+    /// The next paused-AR step, built and submitted before the current token was read back.
+    private var arLookahead: (output: NativeMTPForwardResult, token: MLXArray)?
+    private(set) var arLookaheadCount = 0
+    /// `true` while the next AR step is already in the cache (one row past the last emitted token).
+    var hasPendingARLookahead: Bool { arLookahead != nil }
     private(set) var verifyPrefetchSubmitCount = 0
     private(set) var verifyPrefetchConsumedCount = 0
     private(set) var verifyPrefetchAbandonedCount = 0
@@ -307,6 +343,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// Context ceiling for prefetch eligibility — see the regime gate in
     /// `maybePrefetchNextVerify`. Default matches the qwen4_exp QSA
     /// indexer budget.
+    private static let verifyPrefetchContextCapExplicit =
+        ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH_MAX_CTX"] != nil
     private static let verifyPrefetchMaxContext: Int = {
         if let raw = ProcessInfo.processInfo
             .environment["VMLX_MTP_VERIFY_PREFETCH_MAX_CTX"],
@@ -325,6 +363,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var prefixCommitCount = 0
     private(set) var rollbackRepairCount = 0
     private(set) var mtpCacheRefreshCount = 0
+    /// Head-cache rows written by prompt priming (`NativeMTPPromptPrimer`).
+    private(set) var promptPrimedRows = 0
 
     // MARK: - Aligned head cache
     //
@@ -364,6 +404,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// before the next commit so an unverified draft can never persist.
     private var headChainPairs = 0
 
+    private var canAlignHeadCache: Bool {
+        Self.alignedHeadCacheEnabled && mtpCache.allSatisfy { $0.isTrimmable }
+    }
+
     /// Static so callers can trim without holding a mutating borrow on
     /// `self` across the surrounding expression (the caches are reference
     /// types, so the rows really are dropped).
@@ -393,9 +437,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// permanently. A changed regime can recover within the selected ceiling.
     private var adaptiveDemotedFromCount: [Int: Int] = [:]
     private var upperProbeNotBeforeCycle: [Int: Int] = [:]
-    /// Resolved promotion ceiling: fixed requests never exceed their chosen
-    /// depth; explicitly adaptive requests may explore to their bounded cap.
-    private let adaptiveDepthCeiling: Int
+    /// Resolved promotion ceiling: fixed requests never exceed their chosen depth; adaptive requests may
+    /// explore to the runtime's top rung (`NativeMTPDepthPolicy.runtimeTopRung`) or a lower explicit limit.
+    let adaptiveDepthCeiling: Int
+    /// Cost-model depth owner for explicitly adaptive requests (NativeMTPDepthChooser.swift).
+    private var depthChooser: NativeMTPDepthChooser?
+    private var depthChooserLastStamp: (cycle: Int, time: TimeInterval)?
+    /// After an AR-safety demotion the chooser stays at or below that depth until the safety
+    /// window has refilled, so the next cycle cannot simply undo the demotion.
+    private var depthChooserHold: (depth: Int, untilCycle: Int)?
     private(set) var seedMainForwardTime: TimeInterval = 0
     private(set) var verifyMainForwardTime: TimeInterval = 0
     private(set) var replayMainForwardTime: TimeInterval = 0
@@ -447,6 +497,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let wall: TimeInterval
         let verifyTotal: TimeInterval
     }
+    private var arSafetyMeanLoss = RepeatedMeanLossState()
     private var arSafetyRing: [ARSafetySample] = []
     private var arSafetyEmittedTotal = 0
     /// Wall of one TRUE single-token AR step measured after eval — the first
@@ -459,15 +510,39 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// AR's own context growth (context-fair baseline).
     private var arSafetyFirstVerifySec: TimeInterval?
     private var arSafetyPaused = false
+    /// The last token `next()` returned. When the consumer stops on it (a stop token it does not
+    /// append) and a verify had already committed its row, it labels the cache's extra row.
+    private var lastReturnedTokenId: Int?
     /// Live AR step cost at the CURRENT context, EMA over paused steps.
     private var arSafetyLiveStepSec: TimeInterval?
+    /// Wall clock at the end of the previous AR step when the step before this one was also AR, so a
+    /// paused stretch is costed per emitted token INCLUDING the consumer's time between `next()` calls,
+    /// the same yardstick as the MTP windows (wall per emitted token). See `generateAutoregressiveToken`.
+    private var lastARStepWallEnd: TimeInterval?
     private var arSafetyTokensSincePause = 0
+    /// Wall time and tokens of the current paused AR stretch (see `arSafetyAfterARStep`).
+    private var arSafetyStretchWall: TimeInterval = 0
+    private var arSafetyStretchTokens = 0
     private var arSafetyResumeInterval = NativeMTPTokenIterator.arSafetyResumeIntervalStart
     private var arSafetyProbeCyclesRemaining = 0
     private var arSafetyProbeStartedAt: TimeInterval?
     private var arSafetyProbeStartedEmitted = 0
     private var arSafetyLastMeasuredToken = 0
     private var arSafetyCalibrationRemaining = 0
+    /// SPEED-CRITICAL (2026-10-14 Allosaurus/Flash-Next regression): the depth that was speculating
+    /// when a CALIBRATION pause (not a loss) stopped it. Calibration resumes HERE, with no probe
+    /// judgement. Before this, every 256-token calibration re-entered through a depth-1 resume
+    /// probe; a depth-1 probe can commit at most 2 tokens per verify, so a code regime running
+    /// 4-6 committed/verify (~7 ms/token vs AR ~20 ms on Allosaurus) "lost" the probe, the resume
+    /// interval doubled, and every long in-app reply ran ~94 % AR (27-35 tok/s instead of ~100).
+    /// Do NOT route calibration back through `probe: true`.
+    private var arSafetyCalibrationResumeDepth: Int?
+    /// Time the CONSUMER held the iterator between `next()` calls (detokenize, parsers, UI, SSE).
+    /// AR steps are timed inside the iterator (forward + sample), so the MTP side of every
+    /// MTP-vs-AR comparison must exclude this too or MTP is charged for the app's per-token work
+    /// and AR is not. See `arSafetyClockNow()`. SPEED-CRITICAL — keep both sides on one clock.
+    private var consumerWaitTotal: TimeInterval = 0
+    private var lastTokenReturnedAt: TimeInterval?
     /// True while a kept re-entry is speculating: a trip in that state backs
     /// the resume interval off further instead of resetting it.
     private var arSafetyReentered = false
@@ -476,6 +551,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// Judged every verify cycle over the last `arSafetyWindow` cycles once
     /// `arSafetyWarmupCycles` have run: earliest trip = cycle 16 (~0.65 s at
     /// d3), a later drop is caught within ~8 cycles (~0.3 s).
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // SPEED-CRITICAL GOVERNOR. This block decides whether Flash-Next / Allosaurus / every
+    // native-MTP model speculates in the APP. It has regressed in-app MTP speed repeatedly while
+    // RunBench still looked fine (short 300-token rows never reach the 256-token calibration).
+    // Before changing any constant or the calibration / probe / pause logic below:
+    //   1. RunBench Allosaurus adaptive with BENCH_SPEED_MAXTOK=1500 BENCH_SPEED_SAMPLED=1
+    //      BENCH_SPEED_FILLER=4000, base vs change, alternating, GPU clock logged;
+    //   2. an in-app long code reply (>1000 tokens) on the release app;
+    // and record both in the commit. Reference (2026-10-14, cc6d96cd3): easy code 83-85 vs
+    // 60 tok/s before; prose must stay at AR speed (46-47). See the PR #593 description.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
     private static let arSafetyWindow = 8
     private static let arSafetyWarmupCycles = 8
     private static let arSafetyMargin = 1.25
@@ -543,7 +629,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
         depth requestedDepth: Int,
-        cacheCoordinator: CacheCoordinator? = nil
+        cacheCoordinator: CacheCoordinator? = nil,
+        prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil
     ) throws {
         guard model.nativeMTPAvailable else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
@@ -575,7 +662,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             effectiveParameters.maxKVSize = policy.maxKVSize
         }
         guard let nativeMTPParameters = effectiveParameters.nativeMTPEffectiveParameters(
-            for: input)
+            for: input, model: model)
         else {
             throw NativeMTPRuntimeError.unsupportedSampling(
                 "native MTP is enabled only for text-only requests with no active penalties or suppress/reasoning-budget processors, and requires either an unbounded KV window or a prompt plus declared output ceiling that fits wholly inside the configured window; sampled requests run the exact-pq accept path")
@@ -590,17 +677,27 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.processor = effectiveParameters.processor()
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
+        self.topKAcceptance = SpeculativeTopKAcceptance.Filter(
+            temperature: effectiveParameters.temperature, topP: effectiveParameters.topP,
+            topK: effectiveParameters.topK, minP: effectiveParameters.minP)
+        self.hostRNG = SpeculativeHostRNG(seed: effectiveParameters.randomSeed)
         self.maxTokens = effectiveParameters.maxTokens
-        // One resolved policy governs initialization, recovery and promotion.
-        // The environment bounds exploration but cannot raise a fixed request.
-        let depthCap =
-            ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
-            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 5
+        // One resolved policy governs initialization, recovery and promotion. The runtime's top rung
+        // (`VMLX_MTP_DEPTH_CAP` diagnostic lever, else the model's verifier capability) bounds exploration;
+        // it cannot raise a fixed request.
+        let depthCap = NativeMTPDepthPolicy.runtimeTopRung(model: model)
         let resolvedDepth = try effectiveParameters.nativeMTPDepthPolicy.resolve(
             requestedDepth: requestedDepth, runtimeCap: depthCap)
         self.adaptiveDepthCeiling = resolvedDepth.maximumDepth
         self.depth = resolvedDepth.initialDepth
         self.currentDepth = resolvedDepth.initialDepth
+        if case .adaptive = effectiveParameters.nativeMTPDepthPolicy, NativeMTPDepthChooser.enabled,
+            resolvedDepth.maximumDepth > 1
+        {
+            self.depthChooser = NativeMTPDepthChooser(
+                initialDepth: resolvedDepth.initialDepth, maximumDepth: resolvedDepth.maximumDepth,
+                costs: NativeMTPDepthCostTable.shared(for: model as AnyObject))
+        }
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
         let promptTokenStart = NativeMTPClock.now()
         let promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -610,18 +707,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.restoredPrefixStart = input.cachePrefixTokenCounts.contains { $0 > 0 }
         self.originalInput = input
         self.cacheInitParameters = effectiveParameters
-        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
+        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters, model: model)
         self.materializeSyncTime += promptTokenElapsed
 
         if usesHybridMambaCache,
-            let remembered = NativeMTPHybridWarmupMemo.verdict(for: model)
+            NativeMTPHybridWarmupMemo.verdict(for: model) == true
         {
-            if remembered {
-                hybridSafetyWarmupComplete = true
-            } else {
-                forceAutoregressiveFallback = true
-                adaptiveFallbackReason = "hybrid_warmup_memo"
-            }
+            hybridSafetyWarmupComplete = true
         }
 
         let requestsAffineKV: Bool = {
@@ -633,6 +725,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             coordinator.setPagedIncompatible(true)
         }
 
+        MemoryStageTrace.log("request-start", tokens: promptTokenIds.count, detail: "native-mtp")
+        prefillProgressHandler?(PrefillProgress(
+            stage: .cacheLookup, completedUnitCount: 0,
+            totalUnitCount: promptTokenIds.count, detail: "native-mtp"))
         var inputForPrepare = input
         var cacheLookupTokenIds = promptTokenIds
         var cacheLookupUsesPostPrepareAlias = false
@@ -644,6 +740,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             cacheLookupTokenIds = effectiveTokens
             cacheLookupUsesPostPrepareAlias = true
         }
+        // Per-boundary salts (as TokenIterator): a prefix that ends before a chat's newest image is keyed
+        // by the media before it, so a turn that adds media restores everything up to that media and
+        // encodes only the new item. Before this the native-MTP path probed with the whole prompt's salt
+        // and dropped any restore whose suffix held media: on Ornith 122B the image turn of an in-app
+        // chat re-prefilled 15.5k tokens (TTFT 3.1 s on the AR path -> 14.2 s on MTP).
+        let cacheSaltPlan = CacheBoundarySaltPlan.make(
+            requestSalt: mediaSalt, input: input, lookupTokenIds: cacheLookupTokenIds,
+            model: model, parameters: effectiveParameters)
         if let coordinator = cacheCoordinator,
            !cacheLookupTokenIds.isEmpty,
             (!input.requiresPostPrepareCacheKey || cacheLookupUsesPostPrepareAlias)
@@ -669,16 +773,28 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let requiresDiskBackedRestore =
                 cacheRequiresDiskBackedCoordinatorRestore(self.cache)
             let result: CacheFetchResult
-            if requiresDiskBackedRestore,
-               input.cacheRestorePolicy == .freshRequiredToolSelection
+            if requiredToolSelectionSkipsDiskBackedRestore(
+                model: model, cache: self.cache, restorePolicy: input.cacheRestorePolicy)
             {
                 result = .miss
             } else {
+                // Same fetch as the AR lanes (TokenIterator, BatchEngine):
+                // a disk-backed topology may not consume the EXACT prompt
+                // boundary, so the coordinator serves the N-1 seed the
+                // store persisted one token short and this request prefills
+                // the last token. Without the flag the exact row was
+                // restored in full (a whole-conversation disk read plus
+                // its eval) and then thrown away by `unsafeFullHit` below,
+                // and the whole prompt was prefilled cold — on every
+                // exact-prompt retry of a hybrid chat (Allosaurus after a
+                // tool call), MTP on only.
                 result = coordinator.fetch(
                     tokens: cacheLookupTokenIds,
                     mediaSalt: mediaSalt,
+                    skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts,
-                    chainId: parameters.cacheChainId
+                    chainId: parameters.cacheChainId,
+                    mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix
                 )
             }
             switch result {
@@ -708,27 +824,40 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 // cache is separate), so an entry that does not fit it fits
                 // neither, and is reported the same way.
                 if let diskArrays, !restored {
-                    let diskRestored = restoreFromDiskArrays(
-                                diskArrays, into: &self.cache, requirePromptBoundary: true)
+                    // Under `MLXCacheIOLock`, as the AR lanes restore: the
+                    // restore's Metal evals (TQ component `.item()` reads,
+                    // asType conversions, the materializing eval) must not
+                    // interleave with other cache-adjacent GPU submitters —
+                    // serving layers tokenize the NEXT request's input under
+                    // this lock while this producer restores.
+                    let diskRestored = MLXCacheIOLock.withSerializedMLXCacheIO {
+                        () -> Int in
+                        let count = restoreFromDiskArrays(
+                            diskArrays, into: &self.cache, requirePromptBoundary: true)
+                        if count > 0 {
+                            let cacheHasArraysState = self.cache.contains {
+                                String(describing: type(of: $0)).contains("Arrays")
+                            }
+                            if let ssm = ssmStates,
+                                TQDiskSerializer.formatVersion(of: diskArrays) < 2
+                                    || cacheHasArraysState
+                            {
+                                restoreSSMStates(
+                                    ssm, into: self.cache, boundary: matchedTokens)
+                            }
+                            MLX.eval(self.cache)
+                        }
+                        return count
+                    }
                     if diskRestored > 0 {
                         restoredTokenCount = diskRestored
-                        let cacheHasArraysState = self.cache.contains {
-                            String(describing: type(of: $0)).contains("Arrays")
-                        }
-                        if let ssm = ssmStates,
-                           TQDiskSerializer.formatVersion(of: diskArrays) < 2
-                            || cacheHasArraysState
-                        {
-                            restoreSSMStates(
-                                ssm, into: self.cache, boundary: matchedTokens)
-                        }
-                        MLX.eval(self.cache)
                         restored = true
-                    } else if detail == .disk {
+                    } else if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
-                            reason: "payload does not fit the runtime cache")
+                            reason: "payload does not fit the runtime cache",
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                 }
 
@@ -740,11 +869,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: "native-mtp")
                 {
-                    if detail == .disk {
+                    if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
-                            reason: "restored offsets do not match the boundary")
+                            reason: "restored offsets do not match the boundary",
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                     restored = false
                     retainedDiskRestore = false
@@ -755,10 +885,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     if cacheLookupUsesPostPrepareAlias {
                         self.promptTokenIds = cacheLookupTokenIds
                     }
-                    let requiresDiskBackedRestore =
-                        cacheRequiresDiskBackedCoordinatorRestore(self.cache)
-                    let unsafePartial =
+                    let suffixHoldsMedia =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
+                    let unsafePartial = cacheHitSuffixRequiresMediaRollback(
+                        input: input, remainingTokens: remainingTokens,
+                        matchedTokens: matchedTokens, plan: cacheSaltPlan)
+                    // Fail-closed backstop only: with `skipExactDiskBoundary`
+                    // above, a disk-backed topology is never served its
+                    // exact prompt boundary from disk, so this now covers
+                    // an exact hit from another tier alone.
                     let unsafeFullHit = remainingTokens.isEmpty && requiresDiskBackedRestore
                     if unsafePartial || unsafeFullHit {
                         self.cache = model.newCache(parameters: effectiveParameters)
@@ -781,6 +916,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             inputForPrepare = LMInput(text: LMInput.Text(tokens: lastToken))
                             retainedDiskRestore = diskArrays != nil
                         }
+                    } else if suffixHoldsMedia {
+                        // Restore up to the newest media and prefill from there, encoding only the
+                        // media in the suffix (same as TokenIterator).
+                        inputForPrepare = mediaCarryingSuffixInput(
+                            from: input, remainingTokens: remainingTokens,
+                            matchedTokens: matchedTokens, itemSpans: cacheSaltPlan.itemSpans)
+                        retainedDiskRestore = diskArrays != nil
                     } else {
                         let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
                             .expandedDimensions(axis: 0)
@@ -793,8 +935,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             matchedTokenCount: matchedTokens,
                             preferredDiskBoundaries: originalInput
                                 .cacheStablePrefixTokenCounts,
-                            skipExactDiskBoundary: false,
-                            mediaSalt: mediaSalt)
+                            skipExactDiskBoundary: coordinator.requiresRecurrentSSMCompanion,
+                            mediaSalt: mediaSalt,
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                 }
             case .miss:
@@ -812,14 +955,50 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         let start = NativeMTPClock.now()
         try Task.checkCancellation()
-        let prepared = try model.prepare(
-            inputForPrepare,
-            cache: self.cache,
-            windowSize: effectiveParameters.prefillStepSize)
+        let totalPromptCount = self.promptTokenIds.count
+        let restoredCount = Swift.max(0, totalPromptCount - inputForPrepare.text.tokens.size)
+        if restoredCount > 0 {
+            prefillProgressHandler?(PrefillProgress(
+                stage: .cacheRestore, completedUnitCount: restoredCount,
+                totalUnitCount: totalPromptCount, detail: "native-mtp"))
+        }
+        prefillProgressHandler?(PrefillProgress(
+            stage: .prefill, completedUnitCount: restoredCount,
+            totalUnitCount: totalPromptCount, detail: "native-mtp"))
+        // Prompt priming (recursive heads only; a block drafter reads the target cache instead).
+        let usesBlockDrafts = (model as? any NativeMTPBlockDraftModel)?.nativeMTPUsesBlockDrafts ?? false
+        let primer = NativeMTPPromptPrimer.enabled && model is any NativeMTPPromptPrimingModel
+            && !usesBlockDrafts && !inputForPrepare.hasMediaContent
+            ? NativeMTPPromptPrimer(model: model, cache: mtpCache) : nil
+        // A restored suffix of a media chat continues at the FULL prompt's M-RoPE positions (as
+        // TokenIterator does); without this the suffix was positioned from the suffix alone.
+        if let positioned = model as? any RestoredPrefixPositionModel {
+            positioned.prepareRestoredPrefixPositions(
+                fullInput: input,
+                restoredTokenCount: Swift.max(
+                    0, input.text.tokens.size - inputForPrepare.text.tokens.size))
+        }
+        let prepared = try NativeMTPPromptPrimer.$current.withValue(primer) {
+            try prepareCapturingCacheBoundaries(
+                inputForPrepare, windowSize: effectiveParameters.prefillStepSize,
+                prefillProgressHandler: prefillProgressHandler)
+        }
         self.promptPrefillTime = NativeMTPClock.now() - start
-        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+        MemoryStageTrace.log("prefill-complete", tokens: promptTokenIds.count, detail: "native-mtp")
+        if retainsPromptSnapshotForStores {
+            self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+        }
+        spillHybridStripBoundaryAfterPrefill()
+        MemoryStageTrace.log(
+            "prompt-snapshot", tokens: promptTokenIds.count,
+            detail: promptCacheSnapshot == nil ? "native-mtp none" : "native-mtp retained")
 
         let firstToken: MLXArray
+        prefillProgressHandler?(
+            PrefillProgress(
+                stage: .prefill,
+                completedUnitCount: Swift.max(restoredCount, self.promptTokenIds.count - 1),
+                totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-seed"))
         switch prepared {
         case .tokens(let tokens):
             processor?.prompt(input.text.tokens)
@@ -827,6 +1006,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let backbone = model.nativeBackboneForward(
                 Self.sequenceInput(tokens.tokens),
                 cache: self.cache)
+            primer?.fold(hidden: backbone.hiddenStates, tokens: Self.sequenceInput(tokens.tokens))
             firstToken = Self.sampleLast(
                 logits: backbone.logits,
                 sampler: sampler,
@@ -868,12 +1048,34 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             self.materializeSyncTime += NativeMTPClock.now() - syncStart
         }
 
+        // The final prompt row is lazy until the first token is evaluated.
+        // Report completion here, not when prepare merely returns its graph.
+        prefillProgressHandler?(PrefillProgress(
+            stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+            totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-complete"))
         let firstID = recordMaterializeSync {
             firstToken.item(Int.self)
         }
         pendingTokens.append(firstID)
+        if let primer {
+            prefillProgressHandler?(
+                PrefillProgress(
+                    stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+                    totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-head-prime"))
+            let primeStart = NativeMTPClock.now()
+            primer.finish(firstToken: firstToken)
+            promptPrimedRows = primer.foldedRows
+            self.mtpDraftTime += NativeMTPClock.now() - primeStart
+            RuntimeDiagnostics.write(Data(String(
+                format: "[NativeMTP] prompt_priming rows=%d prompt_positions=%d sec=%.3f\n",
+                primer.foldedRows, primer.receivedPositions, NativeMTPClock.now() - primeStart).utf8))
+        }
 
         let bridgeStart = NativeMTPClock.now()
+        prefillProgressHandler?(
+            PrefillProgress(
+                stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+                totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-bridge"))
         try Task.checkCancellation()
         let bridge = model.nativeBackboneForward(Self.tokenInput(firstToken), cache: self.cache)
         let secondToken = Self.sampleLast(
@@ -892,18 +1094,27 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         nextMain = secondToken
         pendingTokens.append(recordMaterializeSync { secondToken.item(Int.self) })
         let draftStart = NativeMTPClock.now()
+        prefillProgressHandler?(
+            PrefillProgress(
+                stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+                totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-initial-drafts"))
         try Task.checkCancellation()
         let draftBatch = Self.makeDrafts(
             model: model,
             hidden: Self.lastHidden(bridge.hiddenStates),
             nextToken: secondToken,
             mtpCache: mtpCache,
+            targetCache: self.cache,
             depth: self.currentDepth,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
             processor: processor)
         drafts = draftBatch.tokens
+        draftsAreCopy = false
         draftProbabilities = draftBatch.probabilities
+        // Keep the confirmed bridge; deeper head rows are speculative.
+        headChainPairs = canAlignHeadCache
+            ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
         self.mtpDraftTime += NativeMTPClock.now() - draftStart
@@ -937,13 +1148,25 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     mutating func next() -> Int? {
+        guard !iterationTerminated else { return nil }
+        if Task.isCancelled {
+            iterationTerminated = true
+            return nil
+        }
+        if let returnedAt = lastTokenReturnedAt {
+            // Everything between the previous return and this call belonged to the consumer.
+            consumerWaitTotal += Swift.max(0, NativeMTPClock.now() - returnedAt)
+            lastTokenReturnedAt = nil
+        }
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
 
         if pendingIndex >= pendingTokens.count {
+            feedCopyProposer()
             pendingTokens.removeAll(keepingCapacity: true)
             pendingIndex = 0
+            copyFed = 0
             do {
                 if forceAutoregressiveFallback || arSafetyPaused
                     || (!Self.arSafetyDisabled && arSafetySeedStepSec == nil)
@@ -952,7 +1175,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 } else {
                     try verifyCycle()
                 }
+            } catch is CancellationError {
+                iterationTerminated = true
+                return nil
             } catch {
+                generationFailure = GenerationFailure(
+                    stage: .decoding,
+                    cause: (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                )
+                iterationTerminated = true
                 return nil
             }
         }
@@ -961,26 +1192,86 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let token = pendingTokens[pendingIndex]
         pendingIndex += 1
         tokenCount += 1
+        lastReturnedTokenId = token
+        lastTokenReturnedAt = NativeMTPClock.now()
         return token
+    }
+
+    /// The AR-safety governor's clock: wall time minus the time the consumer held the iterator.
+    /// `generateAutoregressiveToken` times AR as forward + sample INSIDE the iterator; the MTP
+    /// ring and resume probes must use the same basis. SPEED-CRITICAL: do not swap this back to
+    /// `NativeMTPClock.now()` in the governor — in the app (reasoning parser, tool parser,
+    /// detokenizer, UI stream) that charged MTP alone for per-token host work and paused it.
+    private func arSafetyClockNow() -> TimeInterval {
+        NativeMTPClock.now() - consumerWaitTotal
+    }
+
+    private var retainsPromptSnapshotForStores: Bool {
+        guard cacheCoordinator?.canPersistBoundaries == true, originalInput.cachePromptIntent != .auxiliary else {
+            return false
+        }
+        guard let coordinator = cacheCoordinator, coordinator.isHybrid,
+              !canTrimPromptCache(cache) else { return true }
+        return TokenIterator.hybridStripBoundaryIndex(
+            coordinator: coordinator, promptTokenIds: promptTokenIds,
+            input: originalInput, cache: cache) == nil
+    }
+
+    private mutating func spillHybridStripBoundaryAfterPrefill() {
+        guard !retainsPromptSnapshotForStores,
+              originalInput.cachePromptIntent != .auxiliary,
+              !originalInput.requiresPostPrepareCacheKey,
+              let coordinator = cacheCoordinator,
+              let boundary = TokenIterator.hybridStripBoundaryIndex(
+                coordinator: coordinator, promptTokenIds: promptTokenIds,
+                input: originalInput, cache: cache),
+              let snapshot = prefillBoundarySnapshots[boundary],
+              storeCapturedHybridBoundary(
+                snapshot, tokens: Array(promptTokenIds.prefix(boundary)),
+                coordinator: coordinator, mediaSalt: mediaSalt,
+                chainId: cacheInitParameters.cacheChainId,
+                kvBits: cacheInitParameters.kvBits,
+                kvMode: cacheInitParameters.kvMode,
+                kvGroupSize: cacheInitParameters.kvGroupSize,
+                quantizedKVStart: cacheInitParameters.quantizedKVStart)
+        else { return }
+        spilledHybridStripBoundary = boundary
+        prefillBoundarySnapshots.removeValue(forKey: boundary)
+        MemoryStageTrace.log("strip-spilled", tokens: boundary, detail: "native-mtp accepted")
     }
 
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        MemoryStageTrace.log(
+            "decode-end", tokens: promptTokenIds.count + generatedTokenIds.count, detail: "native-mtp")
+        defer {
+            MemoryStageTrace.log(
+                "stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count,
+                detail: "native-mtp")
+        }
+        // A paused-AR lookahead past the last emitted token wrote one extra row; finish it so no snapshot races
+        // its pending graph. The post-answer store below trims that row or skips (offset != tokens).
+        if let lookahead = arLookahead {
+            MLX.eval(lookahead.token)
+            arLookahead = nil
+        }
         // A prefetched verify that was never consumed left speculative rows
         // in the attention lanes; roll it back before any boundary snapshot
         // can capture them.
         abandonPendingVerify()
+        defer { prefillBoundarySnapshots.removeAll() }
         // Compiled traces capture the cache array; they must not outlive
         // the generation they were built for.
         releaseCompiledVerify()
-        if let coordinator = cacheCoordinator,
+        if let coordinator = cacheCoordinator, coordinator.canPersistBoundaries,
            !promptTokenIds.isEmpty,
            // Auxiliary (title/suggestion/summary) prompts never store a
            // boundary — see `CachePromptIntent.auxiliary`.
            originalInput.cachePromptIntent != .auxiliary,
-           let promptCacheSnapshot
+           let promptCacheSnapshot = promptCacheSnapshot
+                ?? (retainsPromptSnapshotForStores ? nil : cache)
         {
             // Shared with the solo and batched engines — see the note there.
             let sharedPromptStripBoundary = TokenIterator.hybridStripBoundaryIndex(
@@ -1030,7 +1321,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 // because this helper runs once per boundary. (MTP was the fourth
                 // store path; the first three were guarded and this one was missed.)
                 guard CacheStoreBudget.canStore(snapshot) else { return }
-                let cacheSnapshot = snapshot.map { $0.copy() }
+                // Every caller supplies an owned prefill/boundary snapshot or
+                // a post-answer copy. Copying it again doubles terminal KV RAM.
+                let cacheSnapshot = snapshot
                 MLX.eval(cacheSnapshot)
                 let tCopy = Date()
                 let requiresDiskBackedRestore =
@@ -1117,15 +1410,27 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 where boundary > 0 && boundary < promptTokenIds.count {
                     let isStableBoundary = originalInput
                         .cacheStablePrefixTokenCounts.contains(boundary)
+                    // Same canonical-boundary policy as the solo TokenIterator
+                    // loop: with a proven cross-turn strip boundary, the
+                    // non-stable message boundaries are either unproducible
+                    // for a path-dependent hybrid (no re-derive is allowed
+                    // for them, so `cacheSnapshotForBoundary` returns nil) or
+                    // the canonical boundary itself, which the stripped store
+                    // below persists. Storing it here as well copied and
+                    // evaluated the whole prompt cache a second time and ran
+                    // the full disk-store transaction again for an entry the
+                    // writer then deduplicated (one extra store + one skip
+                    // per turn in the app trace).
+                    if usesCanonicalHybridBoundary, !isStableBoundary {
+                        continue
+                    }
                     let storeBoundary = isStableBoundary
                         && coordinator.requiresRecurrentSSMCompanion && boundary > 1
                         ? boundary - 1
                         : boundary
                     let boundaryTokens = Array(promptTokenIds.prefix(storeBoundary))
                     if isStableBoundary,
-                       coordinator.hasValidatedDiskEntry(
-                        tokens: boundaryTokens,
-                        mediaSalt: mediaSalt)
+                       validateStableDiskBoundary(tokens: boundaryTokens, coordinator: coordinator)
                     {
                         continue
                     }
@@ -1160,7 +1465,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                    (coordinator.isHybrid
                        || cacheHasStandaloneRotatingWindowState(cache)),
                    !originalInput.hasMediaContent,
-                   let stripAt = sharedPromptStripBoundary
+                   let stripAt = sharedPromptStripBoundary,
+                   spilledHybridStripBoundary != stripAt
                 {
                     // NOTE: intentionally NOT gated on
                     // `!cachePrefixTokenCounts.contains(stripAt)` — see the solo
@@ -1186,14 +1492,58 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
 
             if !isReusablePrefixWarmup,
-               includeGeneratedBoundary,
-               !generatedTokenIds.isEmpty,
-               !cache.isEmpty
+                includeGeneratedBoundary,
+                generationFailure == nil,
+                !iterationTerminated,
+                !generatedTokenIds.isEmpty,
+                !cache.isEmpty
             {
                 let postAnswerTokens = promptTokenIds + generatedTokenIds
                 let postAnswerSnapshot = cache.map { $0.copy() }
                 let offsets = postAnswerSnapshot.map(\.offset)
-                if let offset = offsets.first,
+                let leafOffsets = Set(cacheBoundaryLeafOffsets(postAnswerSnapshot))
+                // A verify that accepted the stop token as a draft committed its row, so every
+                // layer sits one past prompt + generated, and the consumer never appended that
+                // token. Recurrent (GDN) state cannot be trimmed back, so the store used to be
+                // dropped, and a media chat on this path then stored nothing for the turn. Key
+                // the row by the stop token, as TokenIterator keys its forwarded stop token.
+                let stopRowToken: Int? =
+                    leafOffsets == [postAnswerTokens.count + 1]
+                        && tokenCount == generatedTokenIds.count + 1
+                    ? lastReturnedTokenId : nil
+                // A stop can occur before the end of an accepted verifier queue. Its
+                // remaining accepted tokens have already reached recurrent state;
+                // only the queue's final bonus/correction token is unforwarded.
+                // Preserve that exact state/key pairing instead of guessing a tail
+                // or trimming recurrent state. Keep the existing trimmable path.
+                let forwardedStopTail =
+                    stopRowToken == nil && !canTrimPromptCache(postAnswerSnapshot)
+                    ? Self.verifiedForwardedStopTail(
+                        promptTokenCount: promptTokenIds.count,
+                        generatedTokenIds: generatedTokenIds,
+                        returnedTokenCount: tokenCount,
+                        lastReturnedTokenId: lastReturnedTokenId,
+                        pendingTokens: pendingTokens, pendingIndex: pendingIndex,
+                        leafOffsets: Array(leafOffsets)) : nil
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    RuntimeDiagnostics.write(
+                        Data(
+                            ("[vmlx][cache/post-answer] native-mtp prompt=\(promptTokenIds.count) "
+                                + "generated=\(generatedTokenIds.count) returned=\(tokenCount) "
+                                + "offsets=\(leafOffsets.sorted()) stopRow=\(stopRowToken != nil) "
+                                + "forwardedStopTail=\(forwardedStopTail?.count ?? 0)\n").utf8))
+                }
+                if let stopRowToken {
+                    store(
+                        tokens: postAnswerTokens + [stopRowToken],
+                        snapshot: postAnswerSnapshot,
+                        label: "post-answer")
+                } else if let forwardedStopTail {
+                    store(
+                        tokens: postAnswerTokens + forwardedStopTail,
+                        snapshot: postAnswerSnapshot,
+                        label: "post-answer")
+                } else if let offset = offsets.first,
                    offsets.allSatisfy({ $0 == offset })
                 {
                     if offset == postAnswerTokens.count {
@@ -1218,6 +1568,31 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         finalizeGenerationStats(generatedTokenIds: generatedTokenIds)
+    }
+
+    /// Recover only already-forwarded accepted tokens after a consumer stop.
+    /// The final queued bonus/correction has not been forwarded and is excluded.
+    /// This is a persistence-key decision, never an output-token transformation.
+    static func verifiedForwardedStopTail(
+        promptTokenCount: Int, generatedTokenIds: [Int], returnedTokenCount: Int,
+        lastReturnedTokenId: Int?, pendingTokens: [Int], pendingIndex: Int,
+        leafOffsets: [Int]
+    ) -> [Int]? {
+        guard promptTokenCount >= 0,
+            returnedTokenCount == generatedTokenIds.count + 1,
+            let offset = leafOffsets.first, leafOffsets.allSatisfy({ $0 == offset }),
+            pendingIndex > 0, pendingIndex <= pendingTokens.count,
+            pendingTokens[pendingIndex - 1] == lastReturnedTokenId
+        else { return nil }
+
+        let tailCount = offset - promptTokenCount - generatedTokenIds.count
+        let start = pendingIndex - 1
+        guard tailCount > 1,
+            start <= generatedTokenIds.count,
+            pendingTokens.prefix(start).elementsEqual(generatedTokenIds.suffix(start)),
+            tailCount == pendingTokens.count - 1 - start
+        else { return nil }
+        return Array(pendingTokens[start ..< start + tailCount])
     }
 
     /// CPU-only stats snapshot + stderr summary, split out of
@@ -1299,12 +1674,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             verifierMode: verifierMode,
             cacheMode: "private-mtp+verifier-prefix-commit",
             arSafetyTrips: arSafetyTrips,
-            arSafetyResumes: arSafetyResumes)
+            arSafetyResumes: arSafetyResumes,
+            adaptiveCeiling: adaptiveDepthCeiling)
         let line = String(
             format:
-                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d]\n",
+                "[NativeMTP] depth=%d activeDepth=%d adaptiveCeiling=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d] arLookahead=%d\n",
             depth,
             currentDepth,
+            adaptiveDepthCeiling,
             verifyCalls,
             generatedTokenIds.count,
             autoregressiveFallbackTokenCount,
@@ -1351,8 +1728,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             arSafetyPaused ? 1 : 0,
             adaptiveDepthPromotionCount,
             adaptiveWallClockDemotes,
-            adaptiveAcceptanceDemotes)
-        FileHandle.standardError.write(Data(line.utf8))
+            adaptiveAcceptanceDemotes,
+            arLookaheadCount)
+        RuntimeDiagnostics.write(Data(line.utf8))
     }
 
     /// Compile the fixed-shape staged verify forward. Built AFTER the
@@ -1370,7 +1748,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // rebound somewhere and every replay silently degrades to a
             // rebuild.
             if ProcessInfo.processInfo.environment["VMLX_MTP_PHASE_TIMERS"] == "1" {
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data("[NativeMTP] compiled verify TRACE build rows=\(rows)\n".utf8))
             }
             return CompiledDecodeTrace.withActive {
@@ -1408,6 +1786,213 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         return result
     }
 
+    /// Retain exact recurrent checkpoints while the original text prefill
+    /// crosses them. Replaying the whole prefix after generation delayed each
+    /// tool call even when writing the resulting SSD record took milliseconds.
+    /// Media and opaque post-prepare token layouts retain their existing path.
+    private mutating func prepareCapturingCacheBoundaries(
+        _ input: LMInput, windowSize: Int,
+        prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil
+    ) throws -> PrepareResult {
+        // Observe the existing prepare calls without changing their segmentation
+        // or adding evaluations. Each segment reports local counts; translate
+        // those to the request's absolute prompt position after cache restore.
+        let total = promptTokenIds.count
+        let initialOffset = Swift.max(0, total - input.text.tokens.size)
+        func prepareReporting(_ part: LMInput, offset: Int) throws -> PrepareResult {
+            let report: PrefillProgressReporter.Handler?
+            if let prefillProgressHandler {
+                let accumulator = SoloPrefillProgressAccumulator(
+                    handler: prefillProgressHandler,
+                    completedBeforePrefill: offset, totalPromptUnits: total)
+                report = { accumulator.report(completedInPrepare: $0) }
+            } else {
+                report = nil
+            }
+            return try PrefillProgressReporter.withHandler(report) {
+                try model.prepare(part, cache: cache, windowSize: windowSize)
+            }
+        }
+        guard let coordinator = cacheCoordinator,
+            coordinator.canPersistBoundaries,
+            originalInput.cachePromptIntent != .auxiliary,
+            !originalInput.hasMediaContent,
+            !originalInput.requiresPostPrepareCacheKey,
+            !input.hasMediaContent,
+            !input.requiresPostPrepareCacheKey,
+            usesHybridMambaCache,
+            !cache.contains(where: { $0 is HybridPoolCache })
+        else {
+            return try prepareReporting(input, offset: initialOffset)
+        }
+
+        let size = input.text.tokens.size
+        let restored = promptTokenIds.count - size
+        guard size > 0, restored >= 0,
+            cache.allSatisfy({ $0.offset == restored }),
+            input.text.tokenIds.map({ $0.count == size }) ?? true,
+            input.text.mask.map({ $0.size == size }) ?? true
+        else {
+            return try prepareReporting(input, offset: initialOffset)
+        }
+
+        // Match TokenIterator.prepare's segmentation: the canonical chat
+        // boundary is captured while the head prefill crosses it, and so are
+        // the stable system/tool seeds that sit INSIDE that head (the AR
+        // iterator's `prepareStableBoundarySegments(captureStoreSeedsOnly:)`).
+        // Only the seed the terminal store actually consumes is captured —
+        // N-1 for recurrent topologies, exactly as `storeCacheAfterGeneration`
+        // computes `storeBoundary` — so no single-row forward is introduced.
+        // Stable boundaries AFTER the canonical one keep their [N-1, N] tail
+        // capture. Before this the earlier seeds were left to the
+        // post-generation reconstruction, which replays each prefix through
+        // the model from token zero: measured in the app on Nemotron 3.5
+        // Super-VL (MTP lane) as 2.9 s for the 2,228-token system seed plus
+        // 5.7 s for the 4,315-token tool seed — an 8.6 s stall between the
+        // last streamed token and the end of the first turn of every chat,
+        // which the AR lane had already stopped paying on 2026-10-13.
+        let stripAt = TokenIterator.hybridStripBoundaryIndex(
+            coordinator: coordinator, promptTokenIds: promptTokenIds,
+            input: originalInput, cache: cache)
+        let canonical = stripAt.flatMap { $0 >= restored ? $0 : nil }
+        let stableStart = canonical ?? restored
+        var wanted = Set(
+            originalInput.cacheStablePrefixTokenCounts
+                .filter { $0 > stableStart && $0 < promptTokenIds.count }
+                .flatMap { [$0 - 1, $0] }
+        ).filter { $0 > stableStart }
+        // Seeds inside the head, before the canonical boundary. A seed that
+        // is already durable on disk is not captured: the store loop skips
+        // it, so a retained copy would only hold KV bytes through decode.
+        wanted.formUnion(Self.storeSeedsInsidePrefillHead(
+            stablePrefixTokenCounts: originalInput.cacheStablePrefixTokenCounts,
+            promptTokenCount: promptTokenIds.count,
+            restored: restored,
+            headEnd: stableStart,
+            requiresRecurrentSSMCompanion: coordinator.requiresRecurrentSSMCompanion,
+            isDurable: { count in
+                coordinator.hasDurableDiskEntry(
+                    tokens: Array(promptTokenIds.prefix(count)), mediaSalt: mediaSalt)
+            }))
+        // Keep segmentation independent of whether an SSD entry already
+        // exists, just as the AR iterator does.
+        if let canonical { wanted.insert(canonical) }
+        guard !wanted.isEmpty else {
+            return try prepareReporting(input, offset: initialOffset)
+        }
+
+        let flat = input.text.tokens.reshaped([-1])
+        let mask = input.text.mask?.reshaped([-1])
+        let batchedMask = (input.text.mask?.ndim ?? 1) >= 2
+        func segment(_ start: Int, _ end: Int) -> LMInput {
+            let segmentMask = mask.map { values in
+                let sliced = values[start..<end]
+                return batchedMask ? sliced[.newAxis, 0...] : sliced
+            }
+            return LMInput(
+                tokens: flat[start..<end][.newAxis, 0...],
+                mask: segmentMask,
+                tokenIds: input.text.tokenIds.map { Array($0[start..<end]) },
+                cacheScopeSalt: input.cacheScopeSalt,
+                cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+                cacheStablePrefixTokenCounts: input.cacheStablePrefixTokenCounts,
+                cachePromptIntent: input.cachePromptIntent,
+                cacheRestorePolicy: input.cacheRestorePolicy,
+                toolSchemas: input.toolSchemas,
+                canonicalRequiredToolContext: input.canonicalRequiredToolContext)
+        }
+
+        var consumed = 0
+        for boundary in wanted.sorted() {
+            try Task.checkCancellation()
+            let end = boundary - restored
+            if end > consumed {
+                let head = segment(consumed, end)
+                try withError { error in
+                    let result = try prepareReporting(head, offset: restored + consumed)
+                    try error.check()
+                    if case .tokens(let remaining) = result, remaining.tokens.size > 0 {
+                        _ = model.nativeBackboneForward(
+                            Self.sequenceInput(remaining.tokens), cache: cache)
+                        try error.check()
+                    }
+                    MLX.eval(cache)
+                    try error.check()
+                }
+                consumed = end
+                prefillProgressHandler?(PrefillProgress(
+                    stage: .prefill, completedUnitCount: boundary,
+                    totalUnitCount: total, detail: "native-mtp-boundary"))
+            }
+            if cache.allSatisfy({ $0.offset == boundary }) {
+                // Materialize OWNED copies before subsequent prefill/decode
+                // mutates recurrent state or needs unique buffer ownership.
+                prefillBoundarySnapshots[boundary] = makePromptBoundaryCacheSnapshot(from: cache)
+            }
+        }
+        try Task.checkCancellation()
+        return try prepareReporting(segment(consumed, size), offset: restored + consumed)
+    }
+
+    /// The stable-boundary seeds the terminal store will ask for that lie
+    /// strictly inside the prefill head `(restored, headEnd)`, so that the
+    /// head prefill can snapshot them in passing instead of replaying each
+    /// prefix after generation.
+    ///
+    /// One seed per stable boundary: N-1 when the topology needs a recurrent
+    /// seed (the same `storeBoundary` rule as `storeCacheAfterGeneration`),
+    /// otherwise N. Seeds at or before `restored` cannot be captured (prefill
+    /// never crosses them again); seeds at or after `headEnd` belong to the
+    /// canonical/tail capture. A seed already durable on disk is excluded —
+    /// the store loop skips it.
+    static func storeSeedsInsidePrefillHead(
+        stablePrefixTokenCounts: [Int],
+        promptTokenCount: Int,
+        restored: Int,
+        headEnd: Int,
+        requiresRecurrentSSMCompanion: Bool,
+        isDurable: (Int) -> Bool
+    ) -> Set<Int> {
+        Set(
+            stablePrefixTokenCounts
+                .filter { $0 > 0 && $0 < promptTokenCount }
+                .map { requiresRecurrentSSMCompanion && $0 > 1 ? $0 - 1 : $0 }
+        ).filter { seed in
+            seed > restored && seed < headEnd && !isDurable(seed)
+        }
+    }
+
+    /// Reloading a model drops the disk cache's in-process validation records.
+    /// Validate the exact older checkpoint before replaying its entire prefix.
+    /// Scratch restoration never changes the live target or drafter state.
+    private func validateStableDiskBoundary(
+        tokens: [Int], coordinator: CacheCoordinator
+    ) -> Bool {
+        if coordinator.hasValidatedDiskEntry(tokens: tokens, mediaSalt: mediaSalt) {
+            return true
+        }
+        // Only native in-file recurrent state is covered here. Separate
+        // companions keep their existing production/validation path.
+        guard !Task.isCancelled,
+            coordinator.requiresRecurrentSSMCompanion,
+            !coordinator.requiresSeparateRecurrentPayload,
+            let disk = coordinator.diskCache,
+            case .arrays(let arrays, _) = disk.fetchCandidate(tokens: tokens, mediaSalt: mediaSalt)
+        else { return false }
+        var scratch = model.newCache(parameters: cacheInitParameters)
+        let restored = restoreFromDiskArrays(arrays, into: &scratch)
+        guard restored == tokens.count,
+            validateRestoredCacheBoundary(
+                scratch, matchedTokens: tokens.count, restoredTokens: restored,
+                detail: "native-mtp-stable-validation")
+        else {
+            // Candidate validation never counted an accepted cache hit.
+            _ = disk.markRestoreRejected(tokens: tokens, mediaSalt: mediaSalt, countedHit: false)
+            return false
+        }
+        return coordinator.hasValidatedDiskEntry(tokens: tokens, mediaSalt: mediaSalt)
+    }
+
     private func cacheSnapshotForBoundary(
         tokens: [Int],
         promptSnapshot: [KVCache],
@@ -1416,13 +2001,22 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         guard !tokens.isEmpty, tokens.count < promptTokenIds.count else {
             return nil
         }
-        let trimCount = promptTokenIds.count - tokens.count
-        let trimmed = promptSnapshot.map { $0.copy() }
-        if canTrimPromptCache(trimmed),
-           trimPromptCache(trimmed, numTokens: trimCount) == trimCount
+        if let captured = prefillBoundarySnapshots[tokens.count],
+            !captured.isEmpty,
+            captured.allSatisfy({ $0.offset == tokens.count })
         {
-            MLX.eval(trimmed)
-            return trimmed
+            return captured
+        }
+        guard let boundaryInput = originalInput.inputForCacheBoundary(
+            tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
+        let keepsMedia = !originalInput.hasMediaContent || boundaryInput.hasMediaContent
+        let trimCount = promptTokenIds.count - tokens.count
+        if keepsMedia, canTrimPromptCache(promptSnapshot) {
+            let trimmed = promptSnapshot.map { $0.copy() }
+            if trimPromptCache(trimmed, numTokens: trimCount) == trimCount {
+                MLX.eval(trimmed)
+                return trimmed
+            }
         }
 
         // `allowDiskBackedRederive` bypasses the disk-backed skip-guard for the
@@ -1435,7 +2029,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             if Self.traceEnabled {
                 let line =
                     "[NativeMTPTrace] skipped history-boundary cache rederive after trim miss for disk-backed cache topology\n"
-                FileHandle.standardError.write(Data(line.utf8))
+                RuntimeDiagnostics.write(Data(line.utf8))
             }
             return nil
         }
@@ -1445,15 +2039,6 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         do {
-            let boundaryTokens = MLXArray(tokens.map { Int32($0) })
-                .reshaped(1, tokens.count)
-            let boundaryInput = LMInput(
-                text: LMInput.Text(tokens: boundaryTokens),
-                image: originalInput.image,
-                video: originalInput.video,
-                audio: originalInput.audio,
-                mediaTokenIds: originalInput.mediaTokenIds,
-                cacheScopeSalt: originalInput.cacheScopeSalt)
             let boundaryCache = model.newCache(parameters: cacheInitParameters)
             switch try model.prepare(
                 boundaryInput,
@@ -1475,6 +2060,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private mutating func verifyCycle() throws {
+        lastARStepWallEnd = nil
         guard let primary = nextMain, !drafts.isEmpty else {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
@@ -1488,8 +2074,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // The mode string is passed task-locally around the verify forward
         // ONLY; it must never leak into prefill/seed/sequential forwards.
         let explicitHybridMode = Self.nativeMTPHybridVerifySetting(verifierModeSetting)
+        // Sampled requests take the staged verify too: the staged commit only needs the
+        // accepted row count, which the sampled acceptance produces exactly like greedy does.
+        // Before 2026-10-07 every sampled hybrid request (= every default app request, the
+        // bundle sampler is T=1.0) went through serial verifier repair.
         let stagedCapable = usesHybridMambaCache
-            && speculativeSampler.isGreedy
+            && (speculativeSampler.isGreedy || Self.sampledStagedVerifyEnabled)
             && processor == nil
             && model is DFlash2StagedVerifyRollbackModel
         let stagedVerify = stagedCapable
@@ -1548,7 +2138,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let requestedInputIds: [Int32]
         if let consumedPrefetch {
             requested = consumedPrefetch.requested
-            requestedInputIds = consumedPrefetch.requestedInputIds
+            requestedInputIds = recordMaterializeSync {
+                consumedPrefetch.requestedInputArray.asArray(Int32.self)
+            }
         } else {
             requested = [primary] + drafts
             // ONE batched materialization for every id this cycle needs. The old
@@ -1571,11 +2163,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 cache,
                 verifierMode: verifierModeSetting)
         let canCommitVerifierCache = Self.canCommitVerifierCache(cache)
-        let requiresSequentialRepair = Self.requiresSequentialVerifierRepair(
+        let requiresSequentialRepair = !stagedVerify && Self.requiresSequentialVerifierRepair(
             cache,
             speculativeSampler: speculativeSampler,
             verifierMode: verifierModeSetting)
-        let needsBatchedVerifierRecovery = speculativeSampler.isGreedy && processor == nil
+        let needsBatchedVerifierRecovery = (speculativeSampler.isGreedy || stagedVerify)
+            && processor == nil
         let checkpoint: NativeMTPCacheCheckpoint?
         if let consumedPrefetch {
             // The forward already ran at submit time; a checkpoint taken now
@@ -1641,7 +2234,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         chunkVerifierCount += 1
 
         let sampleStart = NativeMTPClock.now()
-        guard let verifyDecision = Self.verifyDrafts(
+        let fastSampled = sampledTopKDecision(logits: verifier.logits, draftTokenIds:
+            requestedInputIds.dropFirst().map(Int.init))
+        guard let verifyDecision = fastSampled ?? Self.verifyDrafts(
             logits: verifier.logits,
             drafts: drafts,
             draftTokenIds: requestedInputIds.dropFirst().map(Int.init),
@@ -1764,7 +2359,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let nextID = recordMaterializeSync { nextVerifiedToken.item(Int.self) }
             let line =
                 "[NativeMTPTrace] call=\(verifyCalls) emitted=\(tokenCount) requested=\(requestedIDs) drafts=\(draftIDs) target=\(verifyDecision.targetTokenIds) accepted=\(accepted) next=\(nextID)\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
 
         for (index, token) in drafts.prefix(accepted).enumerated() {
@@ -1870,7 +2465,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 ?? verifier.hiddenStates[0..., drafts.count ..< (drafts.count + 1), 0...]
             // Full accept: commit (h0,d1) … (h_{k-1},dk), (hk,bonus). The
             // bonus pair is the one the old retained cache always dropped.
-            if Self.alignedHeadCacheEnabled, repairedHiddenForNextMTP == nil {
+            if canAlignHeadCache, repairedHiddenForNextMTP == nil {
                 Self.trimHeadChain(mtpCache, rows: headChainPairs)
                 headChainPairs = 0
                 // Copy out of `self` first: recordMaterializeSync is
@@ -1929,7 +2524,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // confirmed pairs with backbone hiddens. Recreating the cache
             // here is what the old path did, and it is exactly the context
             // loss that held acceptance down.
-            if Self.alignedHeadCacheEnabled, repairedHiddenForNextMTP == nil, committedCache {
+            if canAlignHeadCache, repairedHiddenForNextMTP == nil, committedCache {
                 Self.trimHeadChain(mtpCache, rows: headChainPairs)
                 headChainPairs = 0
                 let ids = Array(requestedInputIds.dropFirst().prefix(accepted))
@@ -1950,11 +2545,36 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         nextMain = nextToken
         // Policy may clear proposals or replace their cache. Consume this
         // cycle's accepted drafts and commit target state BEFORE that mutation.
-        updateDepthAfterCommittedCycle(accepted: accepted)
+        updateDepthAfterCommittedCycle(
+            accepted: accepted,
+            preserveConfirmedHead: Self.canPreserveHeadOnAdaptiveDemotion(
+                alignedAndTrimmable: canAlignHeadCache && !mtpCache.isEmpty,
+                targetCommitted: committedCache,
+                targetCacheCompatible: Self.supportsHeadPreservingBlockDemotion(cache),
+                hasConfirmedPairs: alignedCommitHidden != nil && alignedCommitTokens != nil,
+                speculativeRows: headChainPairs,
+                requiresRepair: repairedHiddenForNextMTP != nil))
         if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
+            draftsAreCopy = false
             draftProbabilities.removeAll(keepingCapacity: true)
             return
+        }
+        if draftsAreCopy {
+            copyProposer?.observe(drafted: drafts.count, accepted: accepted)
+        }
+        // Copy window for the next cycle (greedy staged verify only). With a proposal the head still drafts
+        // ONE level: that forward commits this cycle's confirmed pairs to the aligned head cache (later head
+        // drafts need that context); its single draft is then superseded by the copies.
+        var copyWindow: [Int] = []
+        if stagedVerify, speculativeSampler.isGreedy || topKAcceptance != nil, processor == nil,
+            NativeMTPCopyProposer.enabled
+        {
+            if copyProposer == nil { copyProposer = NativeMTPCopyProposer(prompt: promptTokenIds) }
+            feedCopyProposer()
+            let queued = pendingTokens.count - pendingIndex
+            let room = (maxTokens ?? Int.max / 2) - tokenCount - queued - 1
+            copyWindow = copyProposer?.propose(room: room) ?? []
         }
         let draftStart = NativeMTPClock.now()
         let draftBatch = Self.makeDrafts(
@@ -1962,16 +2582,25 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             hidden: alignedCommitHidden ?? hiddenForNextMTP,
             nextToken: alignedCommitTokens ?? nextToken,
             mtpCache: mtpCache,
-            depth: currentDepth,
+            targetCache: cache,
+            depth: copyWindow.isEmpty ? currentDepth : 1,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
             processor: processor)
-        drafts = draftBatch.tokens
-        draftProbabilities = draftBatch.probabilities
+        if copyWindow.isEmpty {
+            drafts = draftBatch.tokens
+            draftProbabilities = draftBatch.probabilities
+            draftsAreCopy = false
+        } else {
+            let dtype = nextToken.dtype
+            drafts = copyWindow.map { MLXArray([Int32($0)]).asType(dtype) }
+            draftProbabilities = []
+            draftsAreCopy = true
+        }
         // Levels beyond the first append speculative rows to the head
         // cache; record how many so the next cycle trims them before
         // committing confirmed pairs over the top.
-        headChainPairs = Self.alignedHeadCacheEnabled
+        headChainPairs = canAlignHeadCache
             ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
@@ -2001,8 +2630,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // indexer-engagement region. Threshold matches qwen4_exp's
         // indexer_budget (block 4 × top-512 = 2048); tunable for other
         // topologies via VMLX_MTP_VERIFY_PREFETCH_MAX_CTX.
+        // The gate exists for the QSA indexer lanes only: a cache without a QSA layer (Ornith / Qwen 3.5
+        // MoE, every app chat starting above 2048 tokens of system prompt + tools) has nothing for the
+        // background scheduling thread to fence against, and gating it disabled prefetch for every real
+        // conversation. `VMLX_MTP_VERIFY_PREFETCH_MAX_CTX` still caps any family when set explicitly.
         let contextOffset = cache.lazy.map(\.offset).max() ?? 0
-        if contextOffset + drafts.count + 1 > Self.verifyPrefetchMaxContext {
+        if Self.verifyPrefetchContextCapExplicit || cache.contains(where: { $0 is QSAKVCache }),
+            contextOffset + drafts.count + 1 > Self.verifyPrefetchMaxContext
+        {
             return
         }
         // Nothing left in the token budget to overlap against.
@@ -2010,19 +2645,32 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
         let requested = [primary] + drafts
-        let requestedInputIds = recordMaterializeSync {
-            stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
-        }
-        let input = MLXArray(requestedInputIds).reshaped(1, requested.count)
+        // Lazy ids: the verify graph is built on the drafts' arrays instead of their host values,
+        // so building it overlaps the draft forward on the GPU instead of waiting for it (a host
+        // drain per cycle). The ids are read back once, at consume, after the verify was scheduled.
+        let requestedArray = stacked(requested.map { $0.reshaped(-1).asType(.int32) })
+        let input = requestedArray.reshaped(1, requested.count)
         let checkpointStart = NativeMTPClock.now()
         let checkpoint = NativeMTPCacheCheckpoint(cache)
         cacheSnapshotRestoreTime += NativeMTPClock.now() - checkpointStart
         let verifyStart = NativeMTPClock.now()
-        let verifier = NativeMTPVerifierStatePolicy.withVerifierMode(
-            NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
-        ) {
-            model.nativeBackboneMTPVerifyForward(input, cache: cache)
+        // Native MLX operations may omit an explicit stream. Core 0.32's
+        // implicit default belongs to the calling OS thread, whereas this
+        // graph is scheduled on prefetchQueue below. Bind native operations
+        // to Swift's cross-thread stream while constructing AND scheduling
+        // the graph; otherwise hybrid verify can trap on the worker thread.
+        let stream = MLX.Stream()
+        let capturedModel = model
+        let capturedCache = cache
+        var preparedVerifier: NativeMTPForwardResult!
+        stream.runWith {
+            preparedVerifier = NativeMTPVerifierStatePolicy.withVerifierMode(
+                NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
+            ) {
+                capturedModel.nativeBackboneMTPVerifyForward(input, cache: capturedCache)
+            }
         }
+        let verifier = preparedVerifier!
         // Schedule the verify graph on a background thread. Scheduling — not
         // just executing — a big graph blocks the caller once mlx-core's
         // MAX_ACTIVE_TASKS throttle engages, so an inline asyncEval here
@@ -2035,7 +2683,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let box = SendableBox((logits, hidden))
         Self.prefetchQueue.async {
             let (logits, hidden) = box.consume()
-            asyncEval(logits, hidden)
+            stream.runWith { asyncEval(logits, hidden) }
             scheduled.signal()
         }
         let verifyElapsed = NativeMTPClock.now() - verifyStart
@@ -2045,7 +2693,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         pendingVerify = PendingVerify(
             verifier: verifier,
             requested: requested,
-            requestedInputIds: requestedInputIds,
+            requestedInputArray: requestedArray,
             depth: currentDepth,
             checkpoint: checkpoint,
             scheduled: scheduled)
@@ -2080,9 +2728,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     // MARK: - AR-safety governor
 
     /// The pure decision: does a windowed MTP ms/token lose to the
-    /// context-scaled AR baseline? Mirrors the Python engine's
-    /// `_native_mtp_windowed_ar_verdict` exactly so both runtimes trip on the
-    /// same arithmetic. nil = MTP holds. Guards: zero/negative deltas never
+    /// context-scaled AR baseline? The legacy verify-time scaling is retained;
+    /// measured-reference repeated-loss confirmation is handled separately.
+    /// nil = MTP holds. Guards: zero/negative deltas never
     /// divide; `firstVerifyMs <= 0` disables context scaling (baseline stays
     /// the seed AR step).
     struct ARSafetyVerdict: Equatable {
@@ -2113,6 +2761,63 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         return ARSafetyVerdict(mtpMsPerToken: mtpMsPerToken, arBaselineMs: baseline)
     }
 
+    /// Confirms two disjoint mean-losing windows against an unchanged measured
+    /// AR reference. An isolated outlier still receives the median veto. This
+    /// state belongs to one iterator; it never changes request/profile identity.
+    struct RepeatedMeanLossState {
+        private struct Reference: Equatable {
+            let arMs: Double
+            let margin: Double
+            let depth: Int
+        }
+        private var reference: Reference?
+        private(set) var pendingEndCycle: Int?
+        private var minimumStartCycle = 0
+
+        mutating func reset(afterCycle: Int = 0) {
+            reference = nil
+            pendingEndCycle = nil
+            minimumStartCycle = afterCycle
+        }
+
+        mutating func confirm(
+            endCycle: Int, windowCycles: Int, emitted: Int, wallMs: Double,
+            medianMs: Double, arMs: Double, margin: Double, depth: Int,
+            measured: Bool = true, scaled: Bool = false, probe: Bool = false
+        ) -> Bool {
+            guard measured, !scaled, !probe, arMs > 0, margin > 0,
+                windowCycles > 0, emitted > 0, wallMs > 0,
+                arMs.isFinite, margin.isFinite, wallMs.isFinite, medianMs.isFinite
+            else {
+                reference = nil
+                pendingEndCycle = nil
+                return false
+            }
+            let nextReference = Reference(arMs: arMs, margin: margin, depth: depth)
+            if reference != nextReference {
+                reference = nextReference
+                pendingEndCycle = nil
+            }
+            let startCycle = endCycle - windowCycles
+            // A depth transition may leave the legacy timing ring populated.
+            // Never use its mixed-depth samples to confirm a mean-only loss.
+            guard startCycle >= minimumStartCycle else { return false }
+            let threshold = arMs * margin
+            let meanLoses = wallMs - Double(emitted) * threshold > 0
+            if let pending = pendingEndCycle {
+                // Overlapping windows are not independent observations, even
+                // if one has temporarily become cheap as the stall rolls out.
+                guard startCycle >= pending else { return false }
+                pendingEndCycle = nil
+                return meanLoses
+            }
+            if meanLoses && medianMs <= threshold {
+                pendingEndCycle = endCycle
+            }
+            return false
+        }
+    }
+
     private var arSafetyWindowForRequest: Int {
         // A restored prefix starts with a cold aligned-head cache, but the
         // 8-cycle warmup already excludes those cycles from the judgement
@@ -2121,8 +2826,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     /// Median per-cycle ms/token over the ring. A single stalled cycle
-    /// (allocator hiccup, page-in) can push the window MEAN over the margin;
-    /// the median must agree before a trip counts as a sustained loss.
+    /// (allocator hiccup, page-in) can push the window MEAN over the margin.
+    /// Median agreement permits an immediate trip; independently repeated mean
+    /// losses against measured AR can also confirm a sustained loss.
     static func medianCycleMsPerToken(_ ring: [ARSafetySample]) -> Double? {
         var perCycle: [Double] = []
         perCycle.reserveCapacity(Swift.max(ring.count - 1, 0))
@@ -2141,7 +2847,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private mutating func arSafetyAfterVerifyCycle(accepted: Int) {
         guard !Self.arSafetyDisabled, !forceAutoregressiveFallback else { return }
         arSafetyEmittedTotal += accepted + 1
-        let now = NativeMTPClock.now()
+        let now = arSafetyClockNow()
         arSafetyRing.append(ARSafetySample(
             emitted: arSafetyEmittedTotal, wall: now, verifyTotal: targetVerifyTime))
         let window = arSafetyWindowForRequest
@@ -2165,7 +2871,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let arMs = (arSafetyLiveStepSec ?? arSafetySeedStepSec ?? 0) * 1000
             arSafetyProbeStartedAt = nil
             if arMs <= 0 || mtpMs * Self.arSafetyReentryHysteresis >= arMs {
-                arSafetyDemoteOrPause(reason: String(
+                // SPEED-CRITICAL: a lost probe PAUSES directly. The probe runs at the start depth
+                // (see `arSafetyStartSpeculating`); demoting it 3→2→1 instead would keep a losing
+                // regime (prose at T=1) speculating through the whole ladder — measured 2026-10-14:
+                // 191 verify cycles at ~AR cost in a 448-token prose reply, 38 vs 43 tok/s.
+                arSafetyPause(reason: String(
                     format: "ar_safety_probe_lost(mtp=%.1fms/tok live_ar=%.1fms)",
                     mtpMs, arMs))
                 if arSafetyPaused {
@@ -2180,7 +2890,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 arSafetySeedStepSec = arSafetyLiveStepSec ?? arSafetySeedStepSec
                 arSafetyFirstVerifySec = nil
                 adaptiveFallbackReason = nil
-                FileHandle.standardError.write(Data(String(
+                RuntimeDiagnostics.write(Data(String(
                     format: "[NativeMTP] ar_safety resumed: mtp=%.1fms/tok live_ar=%.1fms depth=%d\n",
                     mtpMs, arMs, currentDepth).utf8))
             }
@@ -2189,6 +2899,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         // Refresh real AR periodically; calibration does not reset failed-probe
         // spacing. This is bounded measurement overhead, not a free speed floor.
+        // SPEED-CRITICAL: `loss: false` makes this a measurement that resumes the current depth
+        // unjudged (`arSafetyCalibrationResumeDepth`). Never make calibration re-enter through a
+        // resume probe or count as a loss — that is what kept long Flash-Next/Allosaurus replies on AR.
         if arSafetySeedStepSec != nil, tokenCount - arSafetyLastMeasuredToken >= 256 {
             arSafetyPause(reason: "ar_safety_calibration", loss: false)
             return
@@ -2206,21 +2919,30 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         if let live = arSafetyLiveStepSec,
             tokenCount - arSafetyLastMeasuredToken < 512 {
             let arMs = live * 1000
-            if mtpMs > arMs, median > arMs {
+            let confirmedMeanLoss = arSafetyMeanLoss.confirm(
+                endCycle: verifyCalls, windowCycles: window, emitted: emitted,
+                wallMs: wallMs, medianMs: median, arMs: arMs, margin: 1,
+                depth: currentDepth)
+            if (mtpMs > arMs && median > arMs) || confirmedMeanLoss {
                 arSafetyDemoteOrPause(reason: String(
                     format: "ar_safety_fresh_loss(mtp=%.1fms/tok median=%.1fms live_ar=%.1fms depth=%d)",
-                    mtpMs, median, arMs, currentDepth))
+                    mtpMs, median, arMs, currentDepth)
+                    + (confirmedMeanLoss ? " confirmed_mean_loss=true" : ""))
             }
-        } else if let verdict = Self.windowedARVerdict(
-            arStepMs: seed * 1000,
-            firstVerifyMs: (arSafetyFirstVerifySec ?? 0) * 1000,
-            windowCycles: window, deltaEmitted: emitted, deltaWallMs: wallMs,
-            deltaVerifyMs: (newest.verifyTotal - oldest.verifyTotal) * 1000,
-            margin: Self.arSafetyMargin),
-            median > verdict.arBaselineMs * Self.arSafetyMargin {
-            arSafetyDemoteOrPause(reason: String(
-                format: "ar_safety_windowed(mtp=%.1fms/tok ar=%.1fms depth=%d)",
-                verdict.mtpMsPerToken, verdict.arBaselineMs, currentDepth))
+        } else {
+            // Seed-only/context-scaled references cannot confirm mean losses.
+            arSafetyMeanLoss.reset(afterCycle: verifyCalls)
+            if let verdict = Self.windowedARVerdict(
+                arStepMs: seed * 1000,
+                firstVerifyMs: (arSafetyFirstVerifySec ?? 0) * 1000,
+                windowCycles: window, deltaEmitted: emitted, deltaWallMs: wallMs,
+                deltaVerifyMs: (newest.verifyTotal - oldest.verifyTotal) * 1000,
+                margin: Self.arSafetyMargin),
+                median > verdict.arBaselineMs * Self.arSafetyMargin {
+                arSafetyDemoteOrPause(reason: String(
+                    format: "ar_safety_windowed(mtp=%.1fms/tok ar=%.1fms depth=%d)",
+                    verdict.mtpMsPerToken, verdict.arBaselineMs, currentDepth))
+            }
         }
     }
 
@@ -2239,9 +2961,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let previous = currentDepth
         recordDepthLoss()
         currentDepth -= 1
+        if depthChooser != nil {
+            depthChooserHold = (currentDepth, verifyCalls + Self.arSafetyWindow + 1)
+            depthChooserLastStamp = nil
+        }
         adaptiveDepthDownshiftCount += 1
         adaptiveWallClockDemotes += 1
         arSafetyRing.removeAll(keepingCapacity: true)
+        arSafetyMeanLoss.reset(afterCycle: verifyCalls)
         adaptiveWindow.removeAll(keepingCapacity: true)
         lastAdaptiveCycleTimestamp = nil
         arSafetyFirstVerifySec = nil
@@ -2251,7 +2978,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpCache = model.makeNativeMTPCache()
         mtpCacheRefreshCount += 1
         headChainPairs = 0
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[NativeMTP] ar_safety depth=\(previous)->\(currentDepth) reason=\(reason)\n".utf8))
     }
     private mutating func arSafetyPause(reason: String, loss: Bool = true) {
@@ -2264,16 +2991,22 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 arSafetyResumeInterval * 2, Self.arSafetyResumeIntervalMax)
         }
         arSafetyTokensSincePause = 0
+        arSafetyStretchWall = 0
+        arSafetyStretchTokens = 0
         arSafetyCalibrationRemaining = loss ? 0 : 2
+        // A calibration is a measurement, not a verdict: remember the winning depth and resume it.
+        arSafetyCalibrationResumeDepth = loss ? nil : currentDepth
         arSafetyProbeCyclesRemaining = 0
         arSafetyProbeStartedAt = nil
         arSafetyRing.removeAll(keepingCapacity: true)
+        arSafetyMeanLoss.reset(afterCycle: verifyCalls)
         adaptiveWindow.removeAll(keepingCapacity: true)
         lastAdaptiveCycleTimestamp = nil
         adaptiveFallbackReason = reason
         drafts.removeAll(keepingCapacity: true)
+        draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
-        FileHandle.standardError.write(Data("[NativeMTP] ar_safety paused: \(reason)\n".utf8))
+        RuntimeDiagnostics.write(Data("[NativeMTP] ar_safety paused: \(reason)\n".utf8))
     }
 
     /// After every AR step: capture the seed AR cost on the very first
@@ -2299,7 +3032,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
         guard arSafetyPaused else { return }
-        arSafetyLiveStepSec = arSafetyLiveStepSec.map { 0.7 * $0 + 0.3 * stepSec } ?? stepSec
+        // Live AR cost = the paused stretch's wall time per emitted token. Per-step samples are not
+        // comparable with each other under the one-token lookahead: the stretch's first step waits for
+        // two steps' work (~46 ms on Ornith 122B) and the last one before a resume probe has no lookahead
+        // and only reads back work the previous step already ran (~2.7 ms). An EMA of those samples ended
+        // every stretch on the cheap one, read AR at ~17 ms against a real ~23.6 ms/token, and paused MTP
+        // that won the reply overall (Ornith 122B sampled: MTP 44.5 vs AR 42.3 tok/s while every probe
+        // was scored a loss). The stretch total is exact wherever in it the work is waited on.
+        arSafetyStretchWall += stepSec
+        arSafetyStretchTokens += 1
+        if arSafetyStretchTokens >= 2 {
+            arSafetyLiveStepSec = arSafetyStretchWall / Double(arSafetyStretchTokens)
+        } else if arSafetyLiveStepSec == nil {
+            arSafetyLiveStepSec = stepSec
+        }
         arSafetyLastMeasuredToken = tokenCount
         arSafetyTokensSincePause += 1
         if arSafetyCalibrationRemaining > 0 {
@@ -2309,11 +3055,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             guard arSafetyTokensSincePause >= arSafetyResumeInterval else { return }
         }
         arSafetyPaused = false
+        if let resumeDepth = arSafetyCalibrationResumeDepth {
+            // SPEED-CRITICAL: calibration resumes at the depth it interrupted, unjudged. The
+            // windowed trip test (now against the freshly measured AR) still protects AR speed.
+            arSafetyCalibrationResumeDepth = nil
+            adaptiveFallbackReason = nil
+            arSafetyStartSpeculating(
+                hidden: hidden, nextToken: nextToken, probe: false, resumeDepth: resumeDepth)
+            return
+        }
         arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: true)
     }
 
     private mutating func arSafetyStartSpeculating(
-        hidden: MLXArray, nextToken: MLXArray, probe: Bool
+        hidden: MLXArray, nextToken: MLXArray, probe: Bool, resumeDepth: Int? = nil
     ) {
         // Same re-prime the depth controller uses on every depth change: a
         // fresh head cache, drafts from the current hidden. Drafts are only
@@ -2321,10 +3076,16 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // cache can only cost acceptance, never correctness.
         mtpCache = model.makeNativeMTPCache()
         mtpCacheRefreshCount += 1
-        currentDepth = probe ? 1 : depth
+        // SPEED-CRITICAL: a resume probe runs at the configured START depth, never depth 1. A
+        // depth-1 probe commits at most 2 tokens per verify, so it cannot show a high-acceptance
+        // regime (code, tool JSON, repetitive text) beating AR and the regime stayed on AR for the
+        // rest of the reply (2026-10-14, Allosaurus in-app 27-35 tok/s). A losing probe at the start
+        // depth costs ~6 cycles once per back-off interval; a wrongly lost probe costs the reply.
+        currentDepth = resumeDepth.map { Swift.max(1, Swift.min($0, Swift.max(depth, adaptiveDepthCeiling))) } ?? depth
         arSafetyRing.removeAll(keepingCapacity: true)
+        arSafetyMeanLoss.reset(afterCycle: verifyCalls)
         arSafetyProbeCyclesRemaining = probe ? Self.arSafetyProbeWindow : 0
-        arSafetyProbeStartedAt = probe ? NativeMTPClock.now() : nil
+        arSafetyProbeStartedAt = probe ? arSafetyClockNow() : nil
         arSafetyProbeStartedEmitted = arSafetyEmittedTotal
         arSafetyFirstVerifySec = nil
         headChainPairs = 0
@@ -2334,30 +3095,64 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             hidden: hidden,
             nextToken: nextToken,
             mtpCache: mtpCache,
+            targetCache: cache,
             depth: currentDepth,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
             processor: processor)
         drafts = draftBatch.tokens
+        draftsAreCopy = false
         draftProbabilities = draftBatch.probabilities
-        headChainPairs = Self.alignedHeadCacheEnabled
+        headChainPairs = canAlignHeadCache
             ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
         mtpDraftTime += NativeMTPClock.now() - draftStart
     }
 
-    private mutating func updateDepthAfterCommittedCycle(accepted: Int) {
+    /// Block commit's Boolean does not certify hybrid companion state.
+    /// Admit only concrete nonempty, entirely trimmable target caches here.
+    static func supportsHeadPreservingBlockDemotion(_ cache: [KVCache]) -> Bool {
+        !cache.isEmpty && cache.allSatisfy { $0.isTrimmable }
+    }
+
+    /// Valid only after real target commit and speculative-head trim. This
+    /// carries no authority into AR pause/re-entry or failed repair paths.
+    static func canPreserveHeadOnAdaptiveDemotion(
+        alignedAndTrimmable: Bool, targetCommitted: Bool, targetCacheCompatible: Bool,
+        hasConfirmedPairs: Bool, speculativeRows: Int, requiresRepair: Bool
+    ) -> Bool {
+        alignedAndTrimmable && targetCommitted && targetCacheCompatible && hasConfirmedPairs
+            && speculativeRows == 0 && !requiresRepair
+    }
+
+    private mutating func feedCopyProposer() {
+        guard copyProposer != nil, copyFed < pendingTokens.count else { return }
+        copyProposer!.append(pendingTokens[copyFed...])
+        copyFed = pendingTokens.count
+    }
+
+    private mutating func updateDepthAfterCommittedCycle(
+        accepted: Int, preserveConfirmedHead: Bool
+    ) {
+        if draftsAreCopy {
+            // A copy window says nothing about the head's per-depth acceptance; it still counts
+            // toward measured MTP-vs-AR throughput. Its wall time must not be billed to a head depth.
+            arSafetyAfterVerifyCycle(accepted: accepted)
+            lastAdaptiveCycleTimestamp = nil
+            depthChooserLastStamp = nil
+            return
+        }
         let previousDepth = currentDepth
         let previousTrips = arSafetyTrips
         arSafetyAfterVerifyCycle(accepted: accepted)
         // A loss/recovery decision owns the cycle. Do not immediately undo it
         // through the acceptance controller on the same committed tokens.
         guard currentDepth == previousDepth, arSafetyTrips == previousTrips else { return }
-        recordAdaptiveCycle(accepted: accepted)
+        recordAdaptiveCycle(accepted: accepted, preserveConfirmedHead: preserveConfirmedHead)
     }
 
-    private mutating func recordAdaptiveCycle(accepted: Int) {
+    private mutating func recordAdaptiveCycle(accepted: Int, preserveConfirmedHead: Bool) {
         // While the AR-safety governor holds the request in AR (or is
         // probing a resume) the depth controller must not also act: one
         // decision per window, one owner.
@@ -2370,6 +3165,42 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // steady-state cost, so complete warmup by cycle count alone.
             if !hybridSafetyWarmupComplete, verifyCalls >= Self.hybridWarmupCycleCount {
                 hybridSafetyWarmupComplete = true
+            }
+            return
+        }
+        if var chooser = depthChooser, stagedVerifierCommitCount > 0, speculativeSampler.isGreedy,
+            !forceAutoregressiveFallback
+        {
+            let now = NativeMTPClock.now()
+            let period = depthChooserLastStamp.flatMap { last in
+                last.cycle == verifyCalls - 1 ? now - last.time : nil
+            }
+            depthChooserLastStamp = (verifyCalls, now)
+            var ceiling = adaptiveDepthCeiling
+            if let hold = depthChooserHold {
+                if verifyCalls < hold.untilCycle {
+                    ceiling = Swift.min(ceiling, hold.depth)
+                } else {
+                    depthChooserHold = nil
+                }
+            }
+            let cycleDepth = currentDepth
+            chooser.observe(
+                cycleDepth: cycleDepth, accepted: accepted, seconds: period, ceiling: ceiling)
+            depthChooser = chooser
+            let next = chooser.depth
+            if next != currentDepth {
+                if next < currentDepth {
+                    adaptiveDepthDownshiftCount += 1
+                    adaptiveWallClockDemotes += 1
+                    if !preserveConfirmedHead {
+                        mtpCache = model.makeNativeMTPCache()
+                        mtpCacheRefreshCount += 1
+                    }
+                } else {
+                    adaptiveDepthPromotionCount += 1
+                }
+                currentDepth = next
             }
             return
         }
@@ -2414,21 +3245,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 hybridSafetyWarmupComplete = true
                 NativeMTPHybridWarmupMemo.record(true, for: model)
             } else {
-                // The memo's contract is "a property of the model, not the
-                // prompt" — but this floor is an acceptance criterion, and
-                // acceptance is content. Memoize the failure only when it is
-                // catastrophic (below even the depth-1 floor), which is the
-                // broken/mismatched-head case the memo exists for. A miss
-                // above that line means THIS prompt drafted badly (prose
-                // warms up around 1.0, code above 3.0 on the same model);
-                // fall back for this request and let the next one re-probe,
-                // or a prose first turn locks every later code turn out of
-                // MTP for the whole residency.
-                if Self.warmupFailureIsModelProperty(
-                    averageAccepted: averageAccepted, depth: currentDepth
-                ) {
-                    NativeMTPHybridWarmupMemo.record(false, for: model)
-                }
+                // This criterion counts accepted proposals, not numerical
+                // cache stability or artifact integrity. Even zero acceptance
+                // can be prompt-dependent. Keep failure local to this request
+                // and let the next request run its own guarded warmup.
                 // A marginal miss at depth >= 2 that clears the DEPTH-1 floor
                 // proves depth-1 speculation is safe — downshift and keep
                 // speculating rather than AR-flooding the whole turn. The
@@ -2522,8 +3342,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 adaptiveWindow.removeAll(keepingCapacity: true)
                 lastAdaptiveCycleTimestamp = nil
                 windowsSinceUpperProbe = 0
-                mtpCache = model.makeNativeMTPCache()
-                mtpCacheRefreshCount += 1
+                if !preserveConfirmedHead {
+                    mtpCache = model.makeNativeMTPCache()
+                    mtpCacheRefreshCount += 1
+                }
                 return
             }
         }
@@ -2540,8 +3362,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
-            mtpCache = model.makeNativeMTPCache()
-            mtpCacheRefreshCount += 1
+            if !preserveConfirmedHead {
+                mtpCache = model.makeNativeMTPCache()
+                mtpCacheRefreshCount += 1
+            }
             return
         }
 
@@ -2553,8 +3377,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
-            mtpCache = model.makeNativeMTPCache()
-            mtpCacheRefreshCount += 1
+            if !preserveConfirmedHead {
+                mtpCache = model.makeNativeMTPCache()
+                mtpCacheRefreshCount += 1
+            }
             return
         }
 
@@ -2569,8 +3395,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
-            mtpCache = model.makeNativeMTPCache()
-            mtpCacheRefreshCount += 1
+            if !preserveConfirmedHead {
+                mtpCache = model.makeNativeMTPCache()
+                mtpCacheRefreshCount += 1
+            }
             return
         }
 
@@ -2631,9 +3459,53 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         forceAutoregressiveFallback = true
         adaptiveFallbackReason = reason
         drafts.removeAll(keepingCapacity: true)
+        draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
         mtpCache = model.makeNativeMTPCache()
         mtpCacheRefreshCount += 1
+    }
+
+    /// `VMLX_NATIVE_MTP_AR_LOOKAHEAD=0` restores the synchronous paused-AR step (A/B and diagnosis).
+    static let arLookaheadEnabled: Bool = {
+        let raw = RuntimeEnvironment.value("VMLX_NATIVE_MTP_AR_LOOKAHEAD")?.lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    /// One AR step: forward + lazily sampled token, submitted (not waited on).
+    private mutating func buildAutoregressiveStep(
+        _ input: MLXArray
+    ) -> (output: NativeMTPForwardResult, token: MLXArray) {
+        let output: NativeMTPForwardResult
+        if let arModel = model as? any NativeMTPAutoregressiveBackboneModel {
+            output = arModel.nativeAutoregressiveBackboneForward(Self.tokenInput(input), cache: cache)
+        } else {
+            output = model.nativeBackboneForward(Self.tokenInput(input), cache: cache)
+        }
+        let sample = Self.sampleLast(
+            logits: output.logits,
+            sampler: sampler,
+            speculativeSampler: speculativeSampler,
+            processor: &processor)
+        asyncEval(sample.token, output.hiddenStates)
+        targetForwardCount += 1
+        verifyMainForwardCount += 1
+        verifyInputTokenCount += 1
+        return (output, sample.token)
+    }
+
+    /// Whether the AR step about to complete is certainly followed by another AR step, so the next one may be
+    /// built before this token is read back. Mirrors `arSafetyAfterARStep`'s resume rule exactly: a step that
+    /// may hand over to speculation (resume probe, end of a calibration, the seed steps) never has a lookahead,
+    /// because speculation starts from that step's own hidden state and an already-built AR step cannot be taken
+    /// back. Logit processors keep the synchronous step (they may need the concrete token).
+    private func nextStepStaysAutoregressive() -> Bool {
+        guard Self.arLookaheadEnabled, processor == nil, nanTrace == nil else { return false }
+        // This step emits token `tokenCount + 1`; a lookahead would compute `tokenCount + 2`.
+        if let maxTokens, tokenCount + 2 > maxTokens { return false }
+        if forceAutoregressiveFallback { return true }
+        guard !Self.arSafetyDisabled, arSafetyPaused, arSafetySeedStepSec != nil else { return false }
+        if arSafetyCalibrationRemaining > 0 { return arSafetyCalibrationRemaining > 1 }
+        return arSafetyTokensSincePause + 1 < arSafetyResumeInterval
     }
 
     private mutating func generateAutoregressiveToken() throws {
@@ -2642,48 +3514,53 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
 
+        // SPEED-CRITICAL (Allosaurus 0.2, 2026-10-18): one-token lookahead while the governor holds AR, as the
+        // plain AR iterator does. A decode step is host-bound (15.8 of 17.8 ms build + encode); the synchronous
+        // step then idled the host through the GPU tail (last layers, LM head, sampling) on every token. Paused
+        // stretches ran ~10 % slower per token than MTP Off (in-app 48 GB essay: 23.3 vs 21.2 ms/token), so a
+        // reply the governor correctly kept on AR still lost to Off. With the lookahead, the next forward is built
+        // on the lazily sampled token while the GPU finishes this one. If the reply stops during a lookahead the
+        // cache holds that one extra row; the post-answer store trims it or skips (offset check) — never stores it.
         let verifyStart = NativeMTPClock.now()
-        let output: NativeMTPForwardResult
-        if let arModel = model as? any NativeMTPAutoregressiveBackboneModel {
-            output = arModel.nativeAutoregressiveBackboneForward(
-                Self.tokenInput(primary), cache: cache)
-        } else {
-            output = model.nativeBackboneForward(Self.tokenInput(primary), cache: cache)
-        }
-        MLX.eval(output.logits, output.hiddenStates)
+        let current = arLookahead ?? buildAutoregressiveStep(primary)
+        arLookahead = nil
+        let output = current.output
         let elapsed = NativeMTPClock.now() - verifyStart
         targetVerifyTime += elapsed
         verifyMainForwardTime += elapsed
-        targetForwardCount += 1
-        verifyMainForwardCount += 1
-        verifyInputTokenCount += 1
+        if nextStepStaysAutoregressive() {
+            arLookahead = buildAutoregressiveStep(current.token)
+            arLookaheadCount += 1
+        }
 
         let sampleStart = NativeMTPClock.now()
-        let sample = Self.sampleLast(
-            logits: output.logits,
-            sampler: sampler,
-            speculativeSampler: speculativeSampler,
-            processor: &processor)
-        recordMaterializeSync {
-            MLX.eval(sample.token)
-        }
+        let token = current.token
+        let tokenID = recordMaterializeSync { token.item(Int.self) }
         samplingTime += NativeMTPClock.now() - sampleStart
-
-        let tokenID = recordMaterializeSync { sample.token.item(Int.self) }
         nanTrace?.observe(
             output.logits[0..., -1, 0...], site: "mtp", step: tokenCount, role: "ar",
             sampled: { tokenID })
         pendingTokens.append(tokenID)
         autoregressiveFallbackTokenCount += 1
-        nextMain = sample.token
+        nextMain = token
         // Any drafts made before this AR step were built for the previous
         // position; they are stale now.
         drafts.removeAll(keepingCapacity: true)
+        draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
+        // Cost the AR token like an MTP window: wall clock per emitted token, consumer included. The
+        // in-step time alone excludes the consumer's per-token work (detokenize / stream / UI, ~5 ms a
+        // token in Osaurus) and, with the lookahead, most of the GPU time that overlaps it, so it read
+        // ~20 % cheaper than AR really is and the governor paused MTP that was winning (Ornith 122B, app
+        // sampling: MTP 43.0 vs AR 39.4 tok/s over the whole reply while the governor reported MTP losing).
+        // The first AR step after a verify cycle has no AR predecessor and keeps the in-step time.
+        let stepEnd = NativeMTPClock.now()
+        let stepSec = lastARStepWallEnd.map { stepEnd - $0 } ?? (stepEnd - verifyStart)
+        lastARStepWallEnd = stepEnd
         arSafetyAfterARStep(
-            stepSec: NativeMTPClock.now() - verifyStart,
+            stepSec: stepSec,
             hidden: Self.lastHidden(output.hiddenStates),
-            nextToken: sample.token)
+            nextToken: token)
     }
 
     private mutating func verifyCycleSequential(primary: MLXArray) throws {
@@ -2695,6 +3572,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         var hiddenForNextMTP: MLXArray?
         var targetTokenIds: [Int] = []
         targetTokenIds.reserveCapacity(drafts.count + 1)
+        let alignHeadHistory = canAlignHeadCache && !mtpCache.isEmpty
+        var confirmedHidden: [MLXArray] = []
+        if alignHeadHistory { confirmedHidden.reserveCapacity(drafts.count + 1) }
 
         verifyCalls += 1
         sequentialVerifierCount += 1
@@ -2726,7 +3606,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 }
             }
 
-            hiddenForNextMTP = Self.lastHidden(verifier.hiddenStates)
+            let committedHidden = Self.lastHidden(verifier.hiddenStates)
+            hiddenForNextMTP = committedHidden
+            if alignHeadHistory { confirmedHidden.append(committedHidden) }
 
             if speculativeSampler.isGreedy {
                 let sampleStart = NativeMTPClock.now()
@@ -2759,8 +3641,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     bonusCount += 1
                 } else {
                     rejectedCount += 1
-                    mtpCache = model.makeNativeMTPCache()
-                    mtpCacheRefreshCount += 1
+                    if !alignHeadHistory {
+                        mtpCache = model.makeNativeMTPCache()
+                        mtpCacheRefreshCount += 1
+                    }
                 }
                 break
             }
@@ -2787,7 +3671,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     accepted += 1
                     let acceptedDraft = drafts[index]
                     processor?.didSample(token: acceptedDraft)
-                    pendingTokens.append(recordMaterializeSync { acceptedDraft.item(Int.self) })
+                    let acceptedID = recordMaterializeSync { acceptedDraft.item(Int.self) }
+                    targetTokenIds.append(acceptedID)
+                    pendingTokens.append(acceptedID)
                     currentInput = acceptedDraft
                     continue
                 }
@@ -2800,11 +3686,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 }
                 processor?.didSample(token: correction)
                 nextToken = correction
-                pendingTokens.append(recordMaterializeSync { correction.item(Int.self) })
+                let correctionID = recordMaterializeSync { correction.item(Int.self) }
+                targetTokenIds.append(correctionID)
+                pendingTokens.append(correctionID)
                 rejectedCount += 1
                 residualCorrectionCount += 1
-                mtpCache = model.makeNativeMTPCache()
-                mtpCacheRefreshCount += 1
+                if !alignHeadHistory {
+                    mtpCache = model.makeNativeMTPCache()
+                    mtpCacheRefreshCount += 1
+                }
                 break
             }
 
@@ -2814,7 +3704,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             processor?.didSample(token: bonus)
             nextToken = bonus
-            pendingTokens.append(recordMaterializeSync { bonus.item(Int.self) })
+            let bonusID = recordMaterializeSync { bonus.item(Int.self) }
+            targetTokenIds.append(bonusID)
+            pendingTokens.append(bonusID)
             bonusCount += 1
             break
         }
@@ -2833,28 +3725,53 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let nextID = recordMaterializeSync { nextToken.item(Int.self) }
             let line =
                 "[NativeMTPTrace] call=\(verifyCalls) emitted=\(tokenCount) requested=\(requestedIDs) drafts=\(draftIDs) target=\(targetTokenIds) accepted=\(accepted) next=\(nextID) sequential=1\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
+        }
+
+        var alignedCommitHidden: MLXArray?
+        var alignedCommitTokens: MLXArray?
+        if alignHeadHistory {
+            // Sequential verification confirmed every collected pair, including
+            // the correction or bonus. Keep that history across rejection.
+            Self.trimHeadChain(mtpCache, rows: headChainPairs)
+            headChainPairs = 0
+            alignedCommitHidden = concatenated(confirmedHidden, axis: 1)
+            alignedCommitTokens = MLXArray(targetTokenIds.map(Int32.init))
+                .reshaped(1, targetTokenIds.count)
         }
 
         nextMain = nextToken
-        updateDepthAfterCommittedCycle(accepted: accepted)
+        updateDepthAfterCommittedCycle(
+            accepted: accepted,
+            preserveConfirmedHead: Self.canPreserveHeadOnAdaptiveDemotion(
+                alignedAndTrimmable: alignHeadHistory && !mtpCache.isEmpty,
+                targetCommitted: true,
+                targetCacheCompatible: true, // Direct S1 target forwards, not a block commit.
+                hasConfirmedPairs: alignedCommitHidden != nil && alignedCommitTokens != nil,
+                speculativeRows: headChainPairs,
+                requiresRepair: false))
         if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
+            draftsAreCopy = false
             draftProbabilities.removeAll(keepingCapacity: true)
             return
         }
         let draftStart = NativeMTPClock.now()
         let draftBatch = Self.makeDrafts(
             model: model,
-            hidden: hiddenForNextMTP,
-            nextToken: nextToken,
+            hidden: alignedCommitHidden ?? hiddenForNextMTP,
+            nextToken: alignedCommitTokens ?? nextToken,
             mtpCache: mtpCache,
+            targetCache: cache,
             depth: currentDepth,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
             processor: processor)
         drafts = draftBatch.tokens
+        draftsAreCopy = false
         draftProbabilities = draftBatch.probabilities
+        headChainPairs = alignHeadHistory
+            ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
         mtpDraftTime += NativeMTPClock.now() - draftStart
@@ -2874,6 +3791,73 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let probabilities: [MLXArray]
         let forwardCount: Int
         let materializeSyncTime: TimeInterval
+    }
+
+    static var sampledStagedVerifyEnabled: Bool {
+        ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_SAMPLED_STAGED"] != "0"
+    }
+
+    /// Sampled acceptance for the whole verify slab from ONE readback (top-k requests only).
+    /// Copy windows have no draft distribution: they are deterministic proposals, q = one-hot.
+    private mutating func sampledTopKDecision(logits: MLXArray, draftTokenIds: [Int])
+        -> VerifyDecision?
+    {
+        guard !speculativeSampler.isGreedy, processor == nil, let filter = topKAcceptance,
+            draftsAreCopy || draftProbabilities.count == drafts.count
+        else { return nil }
+        let rows = drafts.count + 1
+        let (ids, logprobs) = SpeculativeTopKAcceptance.topK(
+            logits: logits[0..., 0 ..< rows, 0...], filter: filter)
+        var qKept: MLXArray? = nil
+        var qDraft: MLXArray? = nil
+        if !draftsAreCopy, !drafts.isEmpty {
+            let q = concatenated(
+                draftProbabilities.map { $0.reshaped(1, -1) }, axis: 0)  // [D, V]
+            qKept = takeAlong(q, ids[0 ..< drafts.count, 0...], axis: -1)
+            let d = MLXArray(draftTokenIds.map(Int32.init)).reshaped(-1, 1)
+            qDraft = takeAlong(q, d, axis: -1)
+        }
+        let syncStart = NativeMTPClock.now()
+        MLX.eval([ids, logprobs] + [qKept, qDraft].compactMap { $0 })
+        let idRows = ids.asArray(Int32.self)
+        let lpRows = logprobs.asArray(Float.self)
+        let qKeptHost = qKept?.asType(.float32).asArray(Float.self)
+        let qDraftHost = qDraft?.asType(.float32).asArray(Float.self)
+        let syncTime = NativeMTPClock.now() - syncStart
+        let k = ids.dim(1)
+        var p: [[(id: Int, p: Double)]] = []
+        var qAtKept: [[Double]] = []
+        var qAtDraft: [Double] = []
+        for r in 0 ..< rows {
+            let lo = r * k
+            let dist = SpeculativeTopKAcceptance.distribution(
+                ids: idRows[lo ..< lo + k], logprobs: lpRows[lo ..< lo + k], filter: filter)
+            p.append(dist)
+            guard r < drafts.count else { continue }
+            if let qKeptHost, let qDraftHost {
+                // qKept is aligned with the UNSORTED top-k ids; map by id.
+                var byID: [Int: Double] = [:]
+                for j in 0 ..< k { byID[Int(idRows[lo + j])] = Double(qKeptHost[lo + j]) }
+                qAtKept.append(dist.map { byID[$0.id] ?? 0 })
+                qAtDraft.append(Double(qDraftHost[r]))
+            } else {
+                let draft = draftTokenIds[r]
+                qAtKept.append(dist.map { $0.id == draft ? 1 : 0 })
+                qAtDraft.append(1)
+            }
+        }
+        let decision = SpeculativeTopKAcceptance.acceptChain(
+            drafts: Array(draftTokenIds.prefix(drafts.count)), p: p, qAtKept: qAtKept,
+            qAtDraft: qAtDraft, rng: &hostRNG)
+        let next = decision.tokenIds[decision.accepted]
+        let dtype = drafts.first?.dtype ?? .int32
+        return VerifyDecision(
+            accepted: decision.accepted,
+            nextToken: MLXArray([Int32(next)]).asType(dtype),
+            targetTokenIds: decision.tokenIds,
+            acceptanceProbabilitySum: decision.acceptanceProbabilitySum,
+            acceptanceProbabilityCount: decision.acceptanceProbabilityCount,
+            materializeSyncTime: syncTime)
     }
 
     private static func verifyDrafts(
@@ -2987,11 +3971,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             let syncStart = NativeMTPClock.now()
             MLX.eval(correction)
+            let correctionID = correction.item(Int.self)
             materializeSyncTime += NativeMTPClock.now() - syncStart
             return VerifyDecision(
                 accepted: accepted,
                 nextToken: correction,
-                targetTokenIds: [],
+                // Only accepted proposals and the actual residual correction
+                // belong to the sampled target path. Never sample future rows.
+                targetTokenIds: Array(draftTokenIds.prefix(accepted)) + [correctionID],
                 acceptanceProbabilitySum: probabilitySum,
                 acceptanceProbabilityCount: probabilityCount,
                 materializeSyncTime: materializeSyncTime)
@@ -3000,11 +3987,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let bonus = speculativeSampler.sampleFromTarget(probabilities: targetProbabilities[drafts.count])
         let syncStart = NativeMTPClock.now()
         MLX.eval(bonus)
+        let bonusID = bonus.item(Int.self)
         materializeSyncTime += NativeMTPClock.now() - syncStart
         return VerifyDecision(
             accepted: accepted,
             nextToken: bonus,
-            targetTokenIds: [],
+            targetTokenIds: draftTokenIds + [bonusID],
             acceptanceProbabilitySum: probabilitySum,
             acceptanceProbabilityCount: probabilityCount,
             materializeSyncTime: materializeSyncTime)
@@ -3044,28 +4032,6 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// deliberately relaxed here to the D1-breakeven scale).
     private static let hybridWarmupMinimumAverageAcceptedPerDraft = 0.55
 
-    /// Whether a warmup miss is bad enough to blame the MODEL rather than the
-    /// prompt — i.e. safe to memoize in `NativeMTPHybridWarmupMemo`. Below the
-    /// depth-1 floor no depth could ever clear warmup, which only a broken or
-    /// mismatched MTP head produces; anything above is content variance and
-    /// must stay per-request.
-    /// Catastrophic means "the head is broken or mismatched" — a verdict that
-    /// really is a property of the model and safe to memoize for the whole
-    /// residency. The pass floor scales with depth (`0.55 * depth`), so the
-    /// catastrophic line must scale too: it is HALF the depth's own floor,
-    /// which at depth 2 is the historical 0.55 exactly. The old bare constant
-    /// made EVERY depth-1 warmup miss "catastrophic" (floor 0.55, line 0.55),
-    /// so one depth-1 probe at 0.44 — an ordinary content miss — recorded a
-    /// failed-model verdict and hard-disabled MTP at every depth until the
-    /// container died. Observed live: `adaptiveFallback=hybrid_warmup_memo`,
-    /// `verifyCalls=0` on every subsequent turn including depth 2.
-    static func warmupFailureIsModelProperty(
-        averageAccepted: Double, depth: Int
-    ) -> Bool {
-        averageAccepted
-            < hybridWarmupMinimumAverageAcceptedPerDraft * Double(Swift.max(depth, 1)) / 2
-    }
-
     private static func nativeMTPHybridVerifySetting(_ verifierMode: String? = nil) -> String? {
         let env = ProcessInfo.processInfo.environment
         return verifierMode
@@ -3078,11 +4044,37 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         hidden: MLXArray,
         nextToken: MLXArray,
         mtpCache: [KVCache],
+        targetCache: [KVCache],
         depth: Int,
         sampler: LogitSampler,
         speculativeSampler: SpeculativeSamplingController,
         processor: LogitProcessor?
     ) -> DraftBatch {
+        // Block drafters (LiLiCorr) propose the whole path in one call. The
+        // path is deterministic, so the verifier gets point masses: greedy
+        // needs only the ids; sampled acceptance takes q = one-hot, which makes
+        // accept = p(token) and the residual = p without that token (exact).
+        if let blockModel = model as? any NativeMTPBlockDraftModel, blockModel.nativeMTPUsesBlockDrafts {
+            let anchor = nextToken.reshaped(-1)[(-1)...]
+            let block = blockModel.nativeMTPBlockDraft(
+                nextToken: anchor, depth: depth, targetCache: targetCache
+            ).asType(nextToken.dtype)
+            let tokens = (0 ..< depth).map { block[$0 ..< ($0 + 1)] }
+            var probabilities: [MLXArray] = []
+            if !speculativeSampler.isGreedy {
+                let ids = NativeMTPPointMass.vocabularyIds(blockModel.nativeMTPBlockDraftVocabularySize)
+                probabilities = tokens.map {
+                    (ids .== $0.asType(.int32).reshaped(1, 1)).asType(.float32)
+                }
+            }
+            let syncStart = NativeMTPClock.now()
+            asyncEval(block)
+            return DraftBatch(
+                tokens: tokens,
+                probabilities: probabilities,
+                forwardCount: 1,
+                materializeSyncTime: NativeMTPClock.now() - syncStart)
+        }
         var tokens: [MLXArray] = []
         tokens.reserveCapacity(depth)
         var probabilities: [MLXArray] = []
@@ -3096,10 +4088,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         for _ in 0 ..< depth {
             let out = model.nativeMTPForward(
                 hiddenStates: hidden,
-                nextTokenIds: tokenInput(token),
+                nextTokenIds: Self.tokenInput(token),
                 cache: mtpCache)
             forwardCount += 1
-            let draft = sampleLast(
+            let draft = Self.sampleLast(
                 logits: out.logits,
                 sampler: sampler,
                 speculativeSampler: speculativeSampler,
@@ -3115,7 +4107,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             if !speculativeSampler.isGreedy {
                 probabilities.append(draft.probabilities)
             }
-            hidden = lastHidden(out.hiddenStates)
+            hidden = Self.lastHidden(out.hiddenStates)
             token = draft.token
         }
 
@@ -3324,5 +4316,71 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static func sequenceInput(_ tokens: MLXArray) -> MLXArray {
         if tokens.ndim == 2 { return tokens }
         return tokens[.newAxis, 0...]
+    }
+}
+
+#if DEBUG
+// Qualification adapter only. No serving call sites. Synthetic costs enter the
+// actual stateful governor; this does not simulate target/cache computation.
+extension NativeMTPTokenIterator {
+    struct GovernorTestSnapshot {
+        let depth: Int
+        let paused: Bool
+        let pendingTokens: [Int]
+        let pendingLossEnd: Int?
+        let probeCycles: Int
+        let trips: Int
+        let resumes: Int
+    }
+
+    var testingGovernorSnapshot: GovernorTestSnapshot {
+        .init(depth: currentDepth, paused: arSafetyPaused, pendingTokens: pendingTokens,
+              pendingLossEnd: arSafetyMeanLoss.pendingEndCycle,
+              probeCycles: arSafetyProbeCyclesRemaining, trips: arSafetyTrips,
+              resumes: arSafetyResumes)
+    }
+
+    mutating func testingSeedMeasuredGovernor(depth: Int, now: TimeInterval) {
+        verifyCalls = Self.arSafetyWarmupCycles
+        currentDepth = depth
+        arSafetyMeanLoss.reset(afterCycle: verifyCalls)
+        arSafetySeedStepSec = 0.025
+        arSafetyLiveStepSec = 0.025
+        arSafetyLastMeasuredToken = tokenCount
+        arSafetyEmittedTotal = 0
+        arSafetyRing = [.init(emitted: 0, wall: now, verifyTotal: targetVerifyTime)]
+        arSafetyPaused = false
+        arSafetyProbeCyclesRemaining = 0
+    }
+
+    mutating func testingFeedGovernorCycle(now: TimeInterval) {
+        verifyCalls += 1
+        NativeMTPClock.$testingNow.withValue(now) {
+            arSafetyAfterVerifyCycle(accepted: 0)
+        }
+    }
+
+    mutating func testingMeasuredARStep(now: TimeInterval) throws {
+        guard let token = nextMain else { throw NativeMTPRuntimeError.verifierProducedNoTokens }
+        NativeMTPClock.$testingNow.withValue(now) {
+            arSafetyAfterARStep(stepSec: 0.025, hidden: MLXArray.zeros([1, 1, 4]), nextToken: token)
+        }
+    }
+}
+#endif
+
+/// `[1, V]` int32 vocabulary ids for point-mass rows, built once per width.
+enum NativeMTPPointMass {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cached: (width: Int, ids: MLXArray)?
+
+    static func vocabularyIds(_ width: Int) -> MLXArray {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached, cached.width == width { return cached.ids }
+        let ids = MLXArray(Int32(0) ..< Int32(width)).reshaped(1, width)
+        MLX.eval(ids)
+        cached = (width, ids)
+        return ids
     }
 }

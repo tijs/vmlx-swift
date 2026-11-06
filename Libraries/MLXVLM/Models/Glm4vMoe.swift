@@ -37,7 +37,9 @@
 //    _apply_rotary_embedding), and glm4v/language.py (for the even_odd contrast).
 //
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -337,7 +339,6 @@ private enum Glm4vMoeLanguage {
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
             let (inds, scores) = gate(x)
-            JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
             var y = switchMLP(x, inds)
             y = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
             if let sharedExperts {

@@ -194,9 +194,15 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `functions.name:0<|tool_call_argument_begin|>{"key": "value"}`
     case kimiK2 = "kimi_k2"
 
+    case k2Horizon = "k2_horizon"
+
     /// MiniMax M2 format with invoke/parameter tags.
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
+
+    /// MiniMax-M3 / M3.1: the namespace-token-prefixed `<tool_call>` envelope with tag-named arguments.
+    /// Example: `]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name="f">\n]<]minimax[>[<k>v]<]minimax[>[</k>…`
+    case minimaxM3 = "minimax_m3"
 
     /// MiniCPM5: `<function name="f"><param name="x">v</param></function>`.
     case minicpm5 = "minicpm5_xml_function"
@@ -214,6 +220,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<｜DSML｜tool_calls><｜DSML｜invoke name="f"><｜DSML｜parameter name="k" string="true">v</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>`
     /// (markers use fullwidth vertical bar U+FF5C, not ASCII `|`).
     case dsml
+
+    /// DeepSeek-V4.1 DSML: the 0731 envelope with leading-space tag names
+    /// (`<｜DSML｜ calls>` / `<｜DSML｜ invoke name="f">` /
+    /// `<｜DSML｜ parameter name="k" string="true">v</｜DSML｜ parameter>`), per
+    /// the bundle's `encoding/encoding.py`. Selected only for
+    /// `deepseek_v41*` model types / `dsml_v41` stamps.
+    case dsmlV41 = "dsml_v41"
 
     /// ZAYA XML function format. The inner function/parameter syntax is the
     /// same as Qwen/Nemotron XML function calls, but Zyphra wraps calls in
@@ -265,10 +278,14 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return GemmaFunctionParser()
         case .gemma4:
             return Gemma4ToolCallParser()
+        case .k2Horizon:
+            return K2HorizonToolCallParser()
         case .kimiK2:
             return KimiK2ToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
+        case .minimaxM3:
+            return MiniMaxM3ToolCallParser()
         case .minicpm5:
             return MiniCPM5ToolCallParser()
         case .mistral:
@@ -277,6 +294,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return Llama3ToolCallParser()
         case .dsml:
             return DSMLToolCallParser()
+        case .dsmlV41:
+            return DSMLToolCallParser(dialect: .deepseekV41)
         case .zayaXml:
             return XMLFunctionParser(
                 startTag: "<zyphra_tool_call>",
@@ -296,7 +315,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// formats because the parser only accepts explicit protocol envelopes.
     public var parsesToolCallsFromReasoningChannel: Bool {
         switch self {
-        case .dsml, .minicpm5:
+        case .gemma4:
+            // Gemma's template closes the thought channel before tool transport.
+            // INVARIANT: quoted tool history inside thought is not executable.
+            // Feeding it to the shared processor both executes examples and
+            // contaminates its buffer before the real content-channel call.
+            return false
+        case .dsml, .dsmlV41, .minicpm5, .k2Horizon:
             // These contracts place complete reasoning inside
             // <think>...</think> before any tool call. Tool-shaped examples or
             // malformed protocol text inside reasoning_content are therefore
@@ -349,6 +374,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         let normalized = normalizedAlias(type)
         let compact = compactAlias(type)
 
+        if compact == "k2horizon" { return .k2Horizon }
+
         // Llama family (need secondary signal for Llama 3 vs 1/2).
         // Kept byte-compatible with upstream ml-explore/mlx-swift-lm.
         if compact == "llama" {
@@ -375,6 +402,14 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // LFM2 family (lfm2, lfm2_moe, lfm2_5, lfm25, etc.)
         if compact.hasPrefix("lfm2") {
             return .lfm2
+        }
+
+        // LFM3 family (lfm3, lfm3_vl, lfm3_omni, lfm3_audio) left LFM2's
+        // pythonic `<|tool_call_start|>[f(a=1)]` for the XML-function envelope:
+        // <tool_call>\n<function=name>\n<parameter=key>\nvalue\n</parameter>…
+        // Routing it to `.lfm2` would leak every call into visible content.
+        if compact.hasPrefix("lfm3") {
+            return .xmlFunction
         }
 
         // GLM/GLM-style families (glm4, glm4_moe, glm5, glm47, GPT-OSS).
@@ -411,6 +446,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         }
         if compact.hasPrefix("gemma3") || compact == "gemma" {
             return .gemma
+        }
+
+        // MiniMax-M3 / M3.1 (minimax_m3, minimax_m3_vl): their own envelope, checked before the M2 family.
+        if compact.hasPrefix("minimaxm3") {
+            return .minimaxM3
         }
 
         // MiniMax family (minimax, minimax_m2)
@@ -523,6 +563,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // NOTE: intentionally narrower than `"deepseek"` prefix —
         // DSV3 / DSV3.2 / Kimi K2.x use the Kimi/GLM4-style tool
         // format, not DSML. We only trigger DSML on explicit `_v4`.
+        // DeepSeek-V4.1 (`deepseek_v41`, `deepseek_v41_text`) renames the DSML
+        // tags; check it before the V4 prefix that would also match it.
+        if normalized.hasPrefix("deepseek_v41") || compact.hasPrefix("deepseekv41") {
+            return .dsmlV41
+        }
         if normalized.hasPrefix("deepseek_v4") || compact.hasPrefix("deepseekv4") {
             return .dsml
         }
@@ -571,6 +616,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             if direct == .xmlFunction, let modelType, infer(from: modelType) == .mimo {
                 return .mimo
             }
+            // A generic `dsml` stamp on a DeepSeek-V4.1 bundle needs the V4.1 tag names.
+            if direct == .dsml, let modelType, infer(from: modelType) == .dsmlV41 {
+                return .dsmlV41
+            }
             return direct
         }
 
@@ -593,9 +642,14 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // DSV4 must resolve before the generic DeepSeek/GLM parser family.
         // V3-style DeepSeek aliases use the GLM arg_key/arg_value format, but
         // V4 Flash/Pro uses DSML.
+        if normalized.hasPrefix("deepseek_v41") || compact.hasPrefix("deepseekv41") {
+            return .dsmlV41
+        }
         if normalized.hasPrefix("deepseek_v4")
             || compact.hasPrefix("deepseekv4")
         {
+            // A bare `dsml`-family stamp on a V4.1 bundle still needs the V4.1 tags.
+            if let modelType, infer(from: modelType) == .dsmlV41 { return .dsmlV41 }
             return .dsml
         }
 
@@ -672,7 +726,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // MiniMax — JANG converter stamps `minimax`; older artifacts use
         // the canonical `minimax_m2`. Future M2.5 variants use
         // `minimax_m2_5` per the converter.
+        // A family-level `minimax` stamp on a MiniMax-M3 bundle names the M3 envelope.
         case "minimax", "minimax_m2_5":
+            if n == "minimax", let modelType, infer(from: modelType) == .minimaxM3 { return .minimaxM3 }
             return .minimaxM2
         case "minicpm5":
             return .minicpm5
@@ -708,13 +764,20 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // `<|tool_call_start|>` / `<|tool_call_end|>`.
         case "lfm2", "lfm2_5":
             return .lfm2
+        // LFM3 — XML-function envelope (`<tool_call><function=…><parameter=…>`).
+        case "lfm3", "lfm3_vl", "lfm3_omni", "lfm3_audio":
+            return .xmlFunction
         // KimiK2 — `functions.name:0<|tool_call_argument_begin|>{…}`.
+        case "k2_horizon", "k2horizon":
+            return .k2Horizon
         case "kimi", "kimik2", "kimi_k2":
             return .kimiK2
         // DSV4 DSML — authoritative stamp from
         // `jang_config.chat.tool_calling.parser`. `deepseek_v4`
         // alias catches bundles that stamp the model_family rather
         // than the parser.
+        case "dsml_v41", "deepseek_v41", "deepseekv41":
+            return .dsmlV41
         case "dsml", "deepseek_v4", "deepseekv4":
             return .dsml
         // ZAYA / Zyphra XML wrapper around the standard XML function body.
