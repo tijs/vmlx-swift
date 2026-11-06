@@ -7,7 +7,7 @@
 // imply that RDMA devices, a connected peer or collectives are ready.
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
-#if TARGET_OS_OSX && __has_include(<infiniband/verbs.h>)
+#if TARGET_OS_OSX && defined(MLX_USE_JACCL) && __has_include(<infiniband/verbs.h>)
 #define VMLX_BUILD_JACCL 1
 #else
 #define VMLX_BUILD_JACCL 0

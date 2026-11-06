@@ -1695,7 +1695,7 @@ public func split(_ array: MLXArray, axis: Int = 0, stream: StreamOrDevice = .de
     var vec = mlx_vector_array_new()
     mlx_split(&vec, array.ctx, 2, axis.int32, stream.ctx)
     defer { mlx_vector_array_free(vec) }
-    let pieces = splitPieces(mlx_vector_array_values(vec), expected: 2)
+    let pieces = mlx_vector_array_values(vec, count: 2)
     return (pieces[0], pieces[1])
 }
 

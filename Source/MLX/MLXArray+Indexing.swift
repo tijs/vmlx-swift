@@ -3,6 +3,8 @@
 import Cmlx
 import Foundation
 
+private let log = MLXLogger(label: "MLXArray+Indexing")
+
 private func int32Range(_ count: Int) -> [Int32] {
     Array(0 ..< Int32(count))
 }
@@ -360,6 +362,14 @@ extension MLXArray {
 
             // conform the shapes to each other
             arrayIndices = MLX.broadcast(arrays: arrayIndices)
+
+            guard !arrayIndices.isEmpty else {
+                // if we get to this point it means that there is an error
+                // handler that will catch the error
+                MLX.log.error("broadcast failed in subscript set")
+                _invalidateInternal()
+                return
+            }
 
             // the shape of the broadcast value
             let broadcastShape =
@@ -1215,7 +1225,17 @@ func scatterArguments(
     }
 
     // Broadcast the update to the indices and slices
-    arrayIndices = broadcast(arrays: arrayIndices)
+    arrayIndices = broadcast(arrays: arrayIndices, stream: stream)
+
+    guard !arrayIndices.isEmpty else {
+        // if we get to this point it means that there is an error
+        // handler that will catch the error
+        MLX.log.error("broadcast failed in scatterArguments")
+        // Keep the fork's invalid-state propagation: a failed assignment must
+        // not leave the caller's previous array looking successfully updated.
+        return ([], .mlxNone, [])
+    }
+
     let updateShapeBroadcast =
         arrayIndices[0].shape + sliceShapes + src.shape.dropFirst(nonNewAxisOperationCount)
     update = broadcast(update, to: updateShapeBroadcast, stream: stream)

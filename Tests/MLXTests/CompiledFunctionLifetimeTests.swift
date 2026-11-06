@@ -32,9 +32,9 @@ class CompiledFunctionLifetimeTests: XCTestCase {
 
             // Populate the cached backend closures (the state-free fast path):
             // this is the exact path that formed the cycle.
-            let out = state.call([MLXArray(3)])
+            let out = state.call([MLXArray(3)], expected: 1)
             XCTAssertEqual(out[0].item(Int.self), 6)
-            let out2 = state.call([MLXArray(5)])
+            let out2 = state.call([MLXArray(5)], expected: 1)
             XCTAssertEqual(out2[0].item(Int.self), 10)
         }
         XCTAssertNil(

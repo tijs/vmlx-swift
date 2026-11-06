@@ -103,6 +103,7 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         .headerSearchPath("metal-cpp"),
 
         .define("MLX_USE_ACCELERATE"),
+        .define("MLX_USE_JACCL", .when(traits: ["JACCL"])),
         .define("ACCELERATE_NEW_LAPACK"),
         .define("_METAL_"),
         .define("SWIFTPM_BUNDLE", to: "\"mlx-swift_Cmlx\""),
@@ -353,6 +354,14 @@ let package = Package(
         .executable(name: "OmniAudioChunkStabilityBench", targets: ["OmniAudioChunkStabilityBench"]),
         .executable(name: "Qwen35TPProofRunner", targets: ["Qwen35TPProofRunner"]),
         .executable(name: "BonsaiPrismFWHTParity", targets: ["BonsaiPrismFWHTParity"]),
+    ],
+    traits: [
+        .trait(
+            name: "JACCL",
+            description:
+                "Builds the JACCL distributed backend (RDMA over Thunderbolt 5) on macOS. Disable it to leave the backend out of an app that does not run distributed MLX."
+        ),
+        .default(enabledTraits: ["JACCL"]),
     ],
     dependencies: [
         // for Complex type

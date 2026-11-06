@@ -2,13 +2,14 @@
 
 import Foundation
 import MLX
-import XCTest
+import Testing
 
 @testable import MLXNN
 
-class ModuleTests: XCTestCase {
+@Suite
+struct ModuleTests {
 
-    func testUpdateModuleSparseNestedArrayKeepsUntouchedLayers() throws {
+    @Test func updateModuleSparseNestedArrayKeepsUntouchedLayers() throws {
         try Device.withDefaultDevice(.cpu) {
             class Block: Module { @ModuleInfo var projection = Linear(4, 4) }
             class Container: Module { let layers = [Block(), Block(), Block()] }
@@ -19,14 +20,14 @@ class ModuleTests: XCTestCase {
             try model.update(
                 modules: ModuleChildren.unflattened([("layers.1.projection", replacement)]),
                 verify: .all)
-            XCTAssertTrue(model.layers[0].projection === first)
-            XCTAssertTrue(model.layers[1].projection === replacement)
-            XCTAssertTrue(model.layers[2].projection === last)
-            XCTAssertTrue(Dictionary(uniqueKeysWithValues: model.namedModules())["layers.1.projection"] === replacement)
+            #expect(model.layers[0].projection === first)
+            #expect(model.layers[1].projection === replacement)
+            #expect(model.layers[2].projection === last)
+            #expect(Dictionary(uniqueKeysWithValues: model.namedModules())["layers.1.projection"] === replacement)
         }
     }
 
-    func testUpdateModuleSparseArrayReplacementKeepsLeadingModule() throws {
+    @Test func updateModuleSparseArrayReplacementKeepsLeadingModule() throws {
         try Device.withDefaultDevice(.cpu) {
             class Container: Module { @ModuleInfo var layers = [Linear(4, 4), Linear(4, 4)] }
             let model = Container()
@@ -34,14 +35,12 @@ class ModuleTests: XCTestCase {
             let replacement = Linear(4, 4)
             try model.update(
                 modules: ModuleChildren.unflattened([("layers.1", replacement)]), verify: .all)
-            XCTAssertEqual(model.layers.count, 2)
-            XCTAssertTrue(model.layers[0] === first)
-            XCTAssertTrue(model.layers[1] === replacement)
+            #expect(model.layers.count == 2)
+            #expect(model.layers[0] === first)
+            #expect(model.layers[1] === replacement)
         }
     }
 
-    override class func setUp() {
-    }
 
     func newTestModule() -> Module {
         class ChildTestModule: Module {
@@ -83,7 +82,7 @@ class ModuleTests: XCTestCase {
         return TestModule()
     }
 
-    func testModuleDescription() {
+    @Test func moduleDescription() {
         let m = newTestModule()
 
         let expected =
@@ -98,10 +97,10 @@ class ModuleTests: XCTestCase {
             """
 
         let d = m.description
-        XCTAssertEqual(d, expected)
+        #expect(d == expected)
     }
 
-    func testNested() {
+    @Test func nested() {
         let m = newTestModule()
         let v = m.filterMap(filter: Module.filterAll)
 
@@ -155,18 +154,18 @@ class ModuleTests: XCTestCase {
             ]
             """
 
-        XCTAssertEqual(v.count, 6)
+        #expect(v.count == 6)
         let d = v.description
-        XCTAssertEqual(d, expected)
+        #expect(d == expected)
     }
 
-    func testModuleItems() {
+    @Test func moduleItems() {
         let m = newTestModule()
 
         // all the ivars from TestModule
         let t = m.items()
 
-        XCTAssertEqual(t.count, 6)
+        #expect(t.count == 6)
 
         for (k, v) in t {
             switch (k, v) {
@@ -177,16 +176,16 @@ class ModuleTests: XCTestCase {
             case ("alternateNameArray", .array): break
             case ("alternateNameDict", .dictionary): break
             default:
-                XCTFail("Unexpected: \(k) = \(v)))")
+                Issue.record("Unexpected: \(k) = \(v)))")
             }
         }
     }
 
-    func testModuleParameters() {
+    @Test func moduleParameters() {
         let m = newTestModule()
 
         let p = m.parameters()
-        XCTAssertEqual(p.count, 5)
+        #expect(p.count == 5)
 
         for (k, v) in p {
             switch (k, v) {
@@ -197,12 +196,12 @@ class ModuleTests: XCTestCase {
             case ("d", .dictionary): break
             case ("alternateChild", .dictionary): break
             default:
-                XCTFail("Unexpected: \(k) = \(v)))")
+                Issue.record("Unexpected: \(k) = \(v)))")
             }
         }
     }
 
-    func testTupleParameters() {
+    @Test func tupleParameters() {
         // make sure tuples of MLXArray work
         class Test: Module {
             let tuple: (MLXArray, MLXArray)
@@ -217,18 +216,18 @@ class ModuleTests: XCTestCase {
         let t = Test()
         let p = t.parameters()
 
-        XCTAssertEqual(p.count, 2)
+        #expect(p.count == 2)
         switch p["array"] {
         case .array(let items):
-            XCTAssertEqual(items.count, 2)
+            #expect(items.count == 2)
         default:
-            XCTFail("should be a .array with 2 MLXArray: \(String(describing: p["item"]))")
+            Issue.record("should be a .array with 2 MLXArray: \(String(describing: p["item"]))")
         }
         switch p["tuple"] {
         case .array(let items):
-            XCTAssertEqual(items.count, 2)
+            #expect(items.count == 2)
         default:
-            XCTFail("should be a .array with 2 MLXArray: \(String(describing: p["item"]))")
+            Issue.record("should be a .array with 2 MLXArray: \(String(describing: p["item"]))")
         }
 
         // update the second item on the array
@@ -238,10 +237,10 @@ class ModuleTests: XCTestCase {
 
         // make sure it was written
         if let v1 = t.parameters()["array"]?.flattenedValues() {
-            XCTAssertEqual(v1.count, 2)
-            XCTAssertEqual(v1[1].item(Int.self), 7)
+            #expect(v1.count == 2)
+            #expect(v1[1].item(Int.self) == 7)
         } else {
-            XCTFail("unable to read array")
+            Issue.record("unable to read array")
         }
 
         // update the second item on the tuple
@@ -251,14 +250,14 @@ class ModuleTests: XCTestCase {
 
         // make sure it was written
         if let v2 = t.parameters()["tuple"]?.flattenedValues() {
-            XCTAssertEqual(v2.count, 2)
-            XCTAssertEqual(v2[1].item(Int.self), 11)
+            #expect(v2.count == 2)
+            #expect(v2[1].item(Int.self) == 11)
         } else {
-            XCTFail("unable to read tuple")
+            Issue.record("unable to read tuple")
         }
     }
 
-    func testTupleModules() {
+    @Test func tupleModules() {
         class Layer1: Module {
             let x: MLXArray
 
@@ -287,7 +286,7 @@ class ModuleTests: XCTestCase {
         let t = Test()
 
         // top level + 2 + 2
-        XCTAssertEqual(t.modules().count, 5)
+        #expect(t.modules().count == 5)
 
         // update the second item on the array
         var u1 = ModuleParameters()
@@ -299,10 +298,10 @@ class ModuleTests: XCTestCase {
 
         // make sure it was written
         if let v1 = t.parameters()["array"]?.flattenedValues() {
-            XCTAssertEqual(v1.count, 2)
-            XCTAssertEqual(v1[1].item(Int.self), 7)
+            #expect(v1.count == 2)
+            #expect(v1[1].item(Int.self) == 7)
         } else {
-            XCTFail("unable to read array")
+            Issue.record("unable to read array")
         }
 
         // update the second item on the tuple
@@ -315,17 +314,17 @@ class ModuleTests: XCTestCase {
 
         // make sure it was written
         if let v2 = t.parameters()["tuple"]?.flattenedValues() {
-            XCTAssertEqual(v2.count, 2)
-            XCTAssertEqual(v2[1].item(Int.self), 11)
+            #expect(v2.count == 2)
+            #expect(v2[1].item(Int.self) == 11)
         } else {
-            XCTFail("unable to read tuple")
+            Issue.record("unable to read tuple")
         }
 
         print(t.parameters())
         print(t.parameters().flattened())
     }
 
-    func testOptionInfos() {
+    @Test func optionInfos() {
         class Layer1: Module {
             @ParameterInfo var x: MLXArray?
         }
@@ -341,28 +340,27 @@ class ModuleTests: XCTestCase {
 
         let t = Test()
 
-        XCTAssertNil(t.b)
-        XCTAssertNotNil(t.a)
-        XCTAssertNil(t.a.x)
+        #expect(t.b == nil)
+        #expect(t.a.x == nil)
     }
 
-    func testChildren() {
+    @Test func children() {
         let m = newTestModule()
 
         let c = m.children()
-        XCTAssertEqual(c.count, 2)
+        #expect(c.count == 2)
 
         for (k, v) in c {
             switch (k, v) {
             case ("alternateChild", .value): break
             case ("d", .dictionary): break
             default:
-                XCTFail("Unexpected: \(k) = \(v)))")
+                Issue.record("Unexpected: \(k) = \(v)))")
             }
         }
     }
 
-    func testSequentialBuilder() {
+    @Test func sequentialBuilder() {
         let b = Bool.random()
         let s = Sequential {
             Tanh()
@@ -375,10 +373,10 @@ class ModuleTests: XCTestCase {
                 Linear(10, 20)
             }
         }
-        XCTAssertEqual(s.layers.count, 5)
+        #expect(s.layers.count == 5)
     }
 
-    func testInit() {
+    @Test func propertyWrapperInit() {
         // ensure that different types of vars and init work
 
         class Test: Module {
@@ -398,10 +396,10 @@ class ModuleTests: XCTestCase {
         let t = Test()
 
         // 2 + 2 * 2 (Linear)
-        XCTAssertEqual(t.parameters().flattenedValues().count, 6)
+        #expect(t.parameters().flattenedValues().count == 6)
 
         // self + 2 Linears
-        XCTAssertEqual(t.modules().count, 3)
+        #expect(t.modules().count == 3)
     }
 
     func newStructureModule() -> Module {
@@ -438,32 +436,32 @@ class ModuleTests: XCTestCase {
         return StructureModel()
     }
 
-    func testLeafModules() {
+    @Test func leafModules() {
         let m = newStructureModule()
         let modules = m.leafModules()
         let v = Dictionary(uniqueKeysWithValues: modules.flattened())
 
-        XCTAssertEqual(v.count, 6)
-        XCTAssertEqual(
-            Set(v.keys),
-            Set([
-                "child", "interior2.children.1", "leaf", "interior2.children.0", "interior1.child",
-                "nonWrappedChild",
-            ]))
+        #expect(v.count == 6)
+        #expect(
+            Set(v.keys)
+                == Set([
+                    "child", "interior2.children.1", "leaf", "interior2.children.0",
+                    "interior1.child",
+                    "nonWrappedChild",
+                ]))
     }
 
-    func testChildren2() {
+    @Test func children2() {
         let m = newStructureModule()
         // only the modules attached to the top level
         let modules = m.children()
         let v = Dictionary(uniqueKeysWithValues: modules.flattened())
 
-        XCTAssertEqual(v.count, 5)
-        XCTAssertEqual(
-            Set(v.keys), Set(["child", "interior2", "leaf", "interior1", "nonWrappedChild"]))
+        #expect(v.count == 5)
+        #expect(Set(v.keys) == Set(["child", "interior2", "leaf", "interior1", "nonWrappedChild"]))
     }
 
-    func testVisitModule() {
+    @Test func visitModule() {
         let m = newStructureModule()
         var collect = [String: String]()
 
@@ -471,12 +469,12 @@ class ModuleTests: XCTestCase {
             collect[key] = String(describing: type(of: m))
         }
 
-        XCTAssertEqual(collect.count, 9)
-        XCTAssertEqual(collect[""], "StructureModel")
-        XCTAssertEqual(collect["interior2.children.1"], "Linear")
+        #expect(collect.count == 9)
+        #expect(collect[""] == "StructureModel")
+        #expect(collect["interior2.children.1"] == "Linear")
     }
 
-    func testUpdateParametersCallsChildOverride() throws {
+    @Test func updateParametersCallsChildOverride() throws {
         // a child's update(parameters:verify:path:modulePath:) override runs
         // when the update starts at an ancestor
         class RecordingLinear: Linear {
@@ -504,13 +502,13 @@ class ModuleTests: XCTestCase {
                 "child.weight": weight, "list.0.weight": weight,
             ]))
 
-        XCTAssertEqual(m.child.updateCount, 1)
-        XCTAssertEqual(m.list[0].updateCount, 1)
-        assertEqual(m.child.weight, weight)
-        assertEqual(m.list[0].weight, weight)
+        #expect(m.child.updateCount == 1)
+        #expect(m.list[0].updateCount == 1)
+        expectEqual(m.child.weight, weight)
+        expectEqual(m.list[0].weight, weight)
     }
 
-    func testUpdateModuleSameType() throws {
+    @Test func updateModuleSameType() throws {
         // set a single module with same type
         let m = newStructureModule()
         var u = NestedDictionary<String, Module>()
@@ -520,13 +518,13 @@ class ModuleTests: XCTestCase {
         let modules = m.children()
         if let child = modules["child"], let child = child.unwrap() as? Linear {
             // make sure it was updated
-            XCTAssertEqual(child.shape.0, 4)
+            #expect(child.shape.0 == 4)
         } else {
-            XCTFail("child is nil or not Linear")
+            Issue.record("child is nil or not Linear")
         }
     }
 
-    func testUpdateModuleSubType() throws {
+    @Test func updateModuleSubType() throws {
         // set a single module with a subtype
         let m = newStructureModule()
         var u = NestedDictionary<String, Module>()
@@ -536,13 +534,13 @@ class ModuleTests: XCTestCase {
         let modules = m.children()
         if let child = modules["child"], let child = child.unwrap() as? QuantizedLinear {
             // make sure it was updated
-            XCTAssertEqual(child.shape.0, 256)
+            #expect(child.shape.0 == 256)
         } else {
-            XCTFail("child is nil or not QuantizedLinear")
+            Issue.record("child is nil or not QuantizedLinear")
         }
     }
 
-    func testUpdateModuleArray() throws {
+    @Test func updateModuleArray() throws {
         // update an array of modules
         let m = newStructureModule()
         var u = NestedDictionary<String, Module>()
@@ -559,31 +557,28 @@ class ModuleTests: XCTestCase {
         if let interior2 = modules["interior2"], let interior2 = interior2.unwrap() as? Module {
             let modules = interior2.children()
             if let children = modules["children"], let children = children.unwrap() as? [Linear] {
-                XCTAssertEqual(children.count, 3)
-                XCTAssertEqual(children[0].shape.0, 5)
+                #expect(children.count == 3)
+                #expect(children[0].shape.0 == 5)
             } else {
-                XCTFail("children is nil or wrong type")
+                Issue.record("children is nil or wrong type")
             }
         } else {
-            XCTFail("interior2 is nil")
+            Issue.record("interior2 is nil")
         }
     }
 
-    func testUpdateModuleNotWrapped() throws {
+    @Test func updateModuleNotWrapped() throws {
         // a module that doesn't have @ModuleInfo
         let m = newStructureModule()
         var u = NestedDictionary<String, Module>()
         u["nonWrappedChild"] = .value(Linear(4, 4))
 
-        do {
+        #expect(throws: UpdateError.self) {
             try m.update(modules: u, verify: .all)
-            XCTFail("should have thrown")
-        } catch {
-            print("Expected: \(error)")
         }
     }
 
-    func testLinearUpdateParametersAllSet() throws {
+    @Test func linearUpdateParametersAllSet() throws {
         class M: Module {
             let a: Linear
             let b: Linear
@@ -607,10 +602,10 @@ class ModuleTests: XCTestCase {
                 ])),
             verify: .all)
         let wA = m.a.weight.asArray(Int.self)
-        XCTAssertEqual(wA, [0, 1])
+        #expect(wA == [0, 1])
         let wB = m.b.weight.asArray(Int.self)
-        XCTAssertEqual(wB, Array(0 ..< 12))
-        XCTAssertThrowsError(
+        #expect(wB == Array(0 ..< 12))
+        let error = #expect(throws: UpdateError.self) {
             try m.update(
                 parameters: .init(
                     item: .dictionary([
@@ -618,23 +613,22 @@ class ModuleTests: XCTestCase {
                         "b": .dictionary(["weight": .value(weightsB)]),
                     ])),
                 verify: .all)
-        ) { error in
-            guard let error = error as? UpdateError,
-                case .keyNotFound(let path, let modules) = error
-            else {
-                XCTFail("Expected to fail with UpdateError.keyNotFound, but got: \(error)")
-                return
-            }
-            // should be a.bias or b.bias (random order as it is a dict)
-            XCTAssertEqual(path.last, "bias")
-            XCTAssertEqual(modules, ["M", "Linear"])
         }
+        guard case .keyNotFound(let path, let modules)? = error else {
+            Issue.record(
+                "Expected to fail with UpdateError.keyNotFound, but got: \(String(describing: error))"
+            )
+            return
+        }
+        // should be a.bias or b.bias (random order as it is a dict)
+        #expect(path.last == "bias")
+        #expect(modules == ["M", "Linear"])
     }
 
-    func testLinearUpdateParametersVerifyAll() throws {
+    @Test func linearUpdateParametersVerifyAll() throws {
         let linear = Linear(1, 2, bias: false)
 
-        XCTAssertEqual(linear.weight.shape, [2, 1])
+        #expect(linear.weight.shape == [2, 1])
 
         let correctWeights = MLXArray(0 ..< 2).reshaped([2, 1])
 
@@ -642,49 +636,48 @@ class ModuleTests: XCTestCase {
             parameters: .init(item: .dictionary(["weight": .value(correctWeights)])),
             verify: .all)
 
-        XCTAssertEqual(linear.weight.shape, [2, 1])
+        #expect(linear.weight.shape == [2, 1])
 
         let transposedWeights = MLXArray(0 ..< 2).reshaped([1, 2])
-        XCTAssertThrowsError(
+        let error = #expect(throws: UpdateError.self) {
             try linear.update(
                 parameters: .init(item: .dictionary(["weight": .value(transposedWeights)])),
                 verify: .all)
-        ) { error in
-            guard let error = error as? UpdateError,
-                case .mismatchedSize(
-                    let
-                        path, let modules, expectedShape: let expectedShape,
-                    actualShape: let actualShape) =
-                    error
-            else {
-                XCTFail("Expected to fail with UpdateError.mismatchedSize, but got: \(error)")
-                return
-            }
-            XCTAssertEqual(expectedShape, [2, 1])
-            XCTAssertEqual(actualShape, [1, 2])
-            XCTAssertEqual(path, ["weight"])
-            XCTAssertEqual(
-                error.errorDescription,
-                "Mismatched parameter weight in Linear shape. Actual [1, 2], expected [2, 1]")
         }
+        guard
+            let error,
+            case .mismatchedSize(
+                let path, _, expectedShape: let expectedShape, actualShape: let actualShape) = error
+        else {
+            Issue.record(
+                "Expected to fail with UpdateError.mismatchedSize, but got: \(String(describing: error))"
+            )
+            return
+        }
+        #expect(expectedShape == [2, 1])
+        #expect(actualShape == [1, 2])
+        #expect(path == ["weight"])
+        #expect(
+            error.errorDescription
+                == "Mismatched parameter weight in Linear shape. Actual [1, 2], expected [2, 1]")
     }
 
-    func testLinearUpdateParametersVerifyNone() throws {
+    @Test func linearUpdateParametersVerifyNone() throws {
         let linear = Linear(1, 2, bias: false)
 
-        XCTAssertEqual(linear.weight.shape, [2, 1])
+        #expect(linear.weight.shape == [2, 1])
 
         let transposedWeights = MLXArray(0 ..< 2).reshaped([1, 2])
         try linear.update(
             parameters: .init(item: .dictionary(["weight": .value(transposedWeights)])),
             verify: .none)
 
-        XCTAssertEqual(
-            linear.weight.shape, [1, 2],
+        #expect(
+            linear.weight.shape == [1, 2],
             "In verify none mode, parameters can be updated with a different shape")
     }
 
-    func testDictionaryParameterUpdate() {
+    @Test func dictionaryParameterUpdate() {
         class Model: Module {
             var layers: [String: Linear] = ["a": Linear(2, 2)]
         }
@@ -696,10 +689,10 @@ class ModuleTests: XCTestCase {
 
         let weight = m.layers["a"]!.weight
         eval(weight)
-        XCTAssertEqual(weight[0, 0].item(Float.self), 1.0)
+        #expect(weight[0, 0].item(Float.self) == 1.0)
     }
 
-    func testQuantize() throws {
+    @Test func quantizeModel() throws {
         class C: Module {
             @ModuleInfo
             var child = Linear(256, 256)
@@ -713,11 +706,11 @@ class ModuleTests: XCTestCase {
         let m = M()
         quantize(model: m)
 
-        XCTAssertTrue(m.module.child is QuantizedLinear)
-        XCTAssertTrue(m.module.child.shape == (256, 256))
+        #expect(m.module.child is QuantizedLinear)
+        #expect(m.module.child.shape == (256, 256))
     }
 
-    func testAlreadyQuantized() throws {
+    @Test func alreadyQuantized() throws {
         // should not quantize an already quantize layer -- that would be silly
         class C: Module {
             @ModuleInfo
@@ -732,11 +725,11 @@ class ModuleTests: XCTestCase {
         let m = M()
         quantize(model: m)
 
-        XCTAssertTrue(m.module.child is QuantizedLinear)
-        XCTAssertTrue(m.module.child.shape == (256, 256))
+        #expect(m.module.child is QuantizedLinear)
+        #expect(m.module.child.shape == (256, 256))
     }
 
-    func testQuantizePredicate() throws {
+    @Test func quantizePredicate() throws {
         class C: Module {
             @ModuleInfo
             var child1 = Linear(256, 256)
@@ -761,11 +754,11 @@ class ModuleTests: XCTestCase {
                 }
             })
 
-        XCTAssertTrue(m.module.child1 is QuantizedLinear)
-        XCTAssertFalse(m.module.child2 is QuantizedLinear)
+        #expect(m.module.child1 is QuantizedLinear)
+        #expect(!(m.module.child2 is QuantizedLinear))
     }
 
-    func testNilParameters() {
+    @Test func nilParameters() {
         class M: Module {
             @ParameterInfo var a: MLXArray?
             let b: MLXArray?
@@ -779,10 +772,10 @@ class ModuleTests: XCTestCase {
         let m = M()
         let parameters = m.parameters()
 
-        XCTAssertTrue(parameters.isEmpty)
+        #expect(parameters.isEmpty)
     }
 
-    func testNilModules() {
+    @Test func nilModules() {
         class M: Module {
             @ModuleInfo var a: Linear?
             let b: Linear?
@@ -796,10 +789,10 @@ class ModuleTests: XCTestCase {
         let m = M()
         let children = m.children()
 
-        XCTAssertTrue(children.isEmpty)
+        #expect(children.isEmpty)
     }
 
-    func testBatchNormItems() {
+    @Test func batchNormItems() {
         // BatchNorm is interesting because:
         // - it has optional parameters
         // - it has optional parameters with keys
@@ -810,13 +803,12 @@ class ModuleTests: XCTestCase {
         n1.train(true)
 
         // it should have all the parameters present
-        XCTAssertEqual(
-            Set(n1.parameters().flattened().map { $0.0 }),
-            Set(["weight", "bias", "running_mean", "running_var"]))
+        #expect(
+            Set(n1.parameters().flattened().map { $0.0 })
+                == Set(["weight", "bias", "running_mean", "running_var"]))
 
         // only two of them are trainable
-        XCTAssertEqual(
-            Set(n1.trainableParameters().flattened().map { $0.0 }), Set(["weight", "bias"]))
+        #expect(Set(n1.trainableParameters().flattened().map { $0.0 }) == Set(["weight", "bias"]))
 
         _ = n1(MLXArray(0 ..< 4, [1, 1, 4]))
 
@@ -829,10 +821,10 @@ class ModuleTests: XCTestCase {
             let e: [Float] = [0, 0.1, 0.2, 0.3]
 
             for item in zip(a, e) {
-                XCTAssertEqual(item.0, item.1, accuracy: 0.01)
+                expectEqual(item.0, item.1, accuracy: 0.01)
             }
         default:
-            XCTFail("should be a .value(array)")
+            Issue.record("should be a .value(array)")
         }
 
         let v = parameters["running_var"]
@@ -842,14 +834,14 @@ class ModuleTests: XCTestCase {
             let e: [Float] = [0.9, 0.9, 0.9, 0.9]
 
             for item in zip(a, e) {
-                XCTAssertEqual(item.0, item.1, accuracy: 0.01)
+                expectEqual(item.0, item.1, accuracy: 0.01)
             }
         default:
-            XCTFail("should be a .value(array)")
+            Issue.record("should be a .value(array)")
         }
     }
 
-    func testUpdateModulesNil() {
+    @Test func updateModulesNil() {
         // test where a tuple is updated with a nil value, e.g. when
         // a triple with two Linear modules is quantized, the third value
         // will be nil but is not nullable.  The code should copy forward
@@ -871,11 +863,11 @@ class ModuleTests: XCTestCase {
 
         quantize(model: pm, groupSize: 64, bits: 8)
 
-        XCTAssertTrue(pm.mlp.0 is QuantizedLinear)
-        XCTAssertTrue(pm.mlp.2 is QuantizedLinear)
+        #expect(pm.mlp.0 is QuantizedLinear)
+        #expect(pm.mlp.2 is QuantizedLinear)
     }
 
-    func testCompositeLayer() throws {
+    @Test func compositeLayer() throws {
         // a test of making a LoRA layer as a composite -- it adapts
         // another layer but mixes their properties.  this is not
         // necessarily the way to implement LoRA (you can also use subclasses
@@ -958,17 +950,17 @@ class ModuleTests: XCTestCase {
         let linearProperties = linear.parameters()
         let loraProperties = lora.parameters()
 
-        XCTAssertEqual(linearProperties.count, 2)
-        XCTAssertEqual(loraProperties.count, 4)
+        #expect(linearProperties.count == 2)
+        #expect(loraProperties.count == 4)
 
         try lora.update(parameters: loraProperties.mapValues { $0 + 1 }, verify: .all)
 
         let trainable = lora.trainableParameters()
-        XCTAssertEqual(trainable.count, 2)
-        XCTAssertTrue(trainable["lora_a"] != nil)
+        #expect(trainable.count == 2)
+        #expect(trainable["lora_a"] != nil)
     }
 
-    func testModulesWithMLXArrayProperties() throws {
+    @Test func modulesWithMLXArrayProperties() throws {
         // https://github.com/ml-explore/mlx-swift-examples/issues/218
 
         class SuScaledRotaryEmbedding: Module {
@@ -982,16 +974,16 @@ class ModuleTests: XCTestCase {
         let rope = SuScaledRotaryEmbedding()
 
         // no parameters
-        XCTAssertEqual(rope.parameters().count, 0)
+        #expect(rope.parameters().count == 0)
 
         // but it can see the _freqs property
-        XCTAssertEqual(rope.items().count, 1)
+        #expect(rope.items().count == 1)
 
         // this should not throw because _freqs is not considered
         try rope.update(parameters: .init(), verify: .all)
     }
 
-    func testOptionalModuleUpdates() throws {
+    @Test func optionalModuleUpdates() throws {
         class M: Module {
             @ModuleInfo(key: "a") var a: Linear = Linear(1, 1)
             @ModuleInfo(key: "b") var b: Linear?
@@ -1004,33 +996,27 @@ class ModuleTests: XCTestCase {
             // Test setting a value for an optional module
             let u = ModuleChildren(values: ["b": .value(b)])
             try m.update(modules: u, verify: .noUnusedKeys)
-            XCTAssertEqual(m.children().count, 2)
+            #expect(m.children().count == 2)
         }
 
         do {
             // Test resetting the optional module to nil
             let u = ModuleChildren(values: ["b": .none])
             try m.update(modules: u, verify: .noUnusedKeys)
-            XCTAssertEqual(m.children().count, 1)
+            #expect(m.children().count == 1)
         }
 
         do {
             // Test that setting nil on a non-optional module throws an error
             let u = ModuleChildren(values: ["a": .none])
-            XCTAssertThrowsError(
+            #expect(throws: UpdateError.self) {
                 try m.update(modules: u, verify: .noUnusedKeys)
-            ) { error in
-                switch error {
-                case _ as UpdateError:
-                    XCTAssertEqual(m.children().count, 1)
-                default:
-                    XCTFail("Wrong error type")
-                }
             }
+            #expect(m.children().count == 1)
         }
     }
 
-    func testSequentialQuantization() {
+    @Test func sequentialQuantization() {
         let s = Sequential {
             Linear(64, 64)
             Linear(64, 64)
