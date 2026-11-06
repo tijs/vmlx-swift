@@ -617,6 +617,7 @@ let package = Package(
                 "CmlxDistributedShim",
                 "MLX",
                 "MLXNN",
+                "MLXRandom",
             ],
             path: "Libraries/MLXDistributedTP",
             exclude: ["README.md"]
