@@ -15,7 +15,7 @@ final class MLX0322IntegrationTests: XCTestCase {
         defer { mlx_string_free(version) }
         XCTAssertEqual(mlx_version(&version), 0)
         let actual = String(cString: mlx_string_data(version))
-        XCTAssertEqual(actual, "0.32.3")
+        XCTAssertEqual(actual, "0.32.4")
         print("MLX0322 linked_core_version=\(actual)")
     }
 
@@ -44,7 +44,7 @@ final class MLX0322IntegrationTests: XCTestCase {
     func testDefaultStreamSelectionAndDrain() {
         func checkCurrentDefault() {
             let expected = StreamOrDevice.default.stream
-            let selected = MLX.Stream()
+            let selected = MLX.Stream.defaultStream
             // Queue identity makes the negative control deterministic: an
             // unrelated queue may finish first, but cannot be our drain.
             XCTAssertEqual(selected, expected)
@@ -82,26 +82,37 @@ final class MLX0322IntegrationTests: XCTestCase {
     }
 
     func testRunWithRestoresTargetDeviceAndNestedDefaults() {
-        func nativeDefault(_ device: Device) -> MLX.Stream {
+        // Native defaults may be thread-local. Keep their C handles out of
+        // Stream's pool, whose entries must support use on any OS thread.
+        func nativeDefault(_ device: Device) -> mlx_stream {
             var result = mlx_stream_new()
             XCTAssertEqual(mlx_get_default_stream(&result, device.ctx), 0)
-            return Stream(result)
+            return result
+        }
+        func assertNativeDefault(_ device: Device, equals expected: mlx_stream) {
+            let actual = nativeDefault(device)
+            defer { mlx_stream_free(actual) }
+            XCTAssertTrue(mlx_stream_equal(actual, expected))
         }
         let oldCPU = nativeDefault(.cpu)
         let oldGPU = nativeDefault(.gpu)
+        defer {
+            mlx_stream_free(oldCPU)
+            mlx_stream_free(oldGPU)
+        }
         let cpu = Stream(Device.cpu)
         let gpu = Stream(Device.gpu)
         cpu.runWith {
-            XCTAssertEqual(nativeDefault(.cpu), cpu)
-            XCTAssertEqual(nativeDefault(.gpu), oldGPU)
+            assertNativeDefault(.cpu, equals: cpu.ctx)
+            assertNativeDefault(.gpu, equals: oldGPU)
             gpu.runWith {
-                XCTAssertEqual(nativeDefault(.cpu), cpu)
-                XCTAssertEqual(nativeDefault(.gpu), gpu)
+                assertNativeDefault(.cpu, equals: cpu.ctx)
+                assertNativeDefault(.gpu, equals: gpu.ctx)
             }
-            XCTAssertEqual(nativeDefault(.gpu), oldGPU)
+            assertNativeDefault(.gpu, equals: oldGPU)
         }
-        XCTAssertEqual(nativeDefault(.cpu), oldCPU)
-        XCTAssertEqual(nativeDefault(.gpu), oldGPU)
+        assertNativeDefault(.cpu, equals: oldCPU)
+        assertNativeDefault(.gpu, equals: oldGPU)
     }
 
     private final class CompileOwner: @unchecked Sendable {
