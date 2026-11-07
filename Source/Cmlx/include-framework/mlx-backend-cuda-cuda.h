@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 #include <Cmlx/mlx-api.h>
 
@@ -13,6 +14,9 @@ namespace mlx::core::cu {
 
 /* Check if the CUDA backend is available. */
 MLX_API bool is_available();
+
+/* Get the CUDA architectures MLX was compiled for. */
+MLX_API std::vector<std::string> get_arch_list();
 
 /* Get information about a CUDA device. */
 MLX_API const

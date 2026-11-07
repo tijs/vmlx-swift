@@ -41,6 +41,7 @@ for x in \
     backend/cuda/cuda.h \
     backend/metal/metal.h \
     compile.h \
+    config.h \
     device.h \
     distributed/distributed.h \
     distributed/ops.h \
@@ -74,7 +75,7 @@ for x in \
     primitives.h \
     backend/metal/device.h \
     backend/metal/resident.h \
-    backend/common/metal_kernel.h \
+    backend/common/custom_kernel.h \
     backend/common/utils.h \
     backend/cpu/encoder.h \
     backend/gpu/eval.h

@@ -60,7 +60,6 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/metal/utils.cpp",
         "mlx/mlx/backend/metal/kernels",  // Exclude kernels directory
         "mlx/mlx/backend/metal/jit",  // Exclude jit directory
-        "mlx/mlx/backend/metal/tests",  // Exclude standalone SDPA-admission doctest
 
         "mlx/mlx/backend/gpu",  // Exclude GPU backend on Linux, use no_gpu instead
         "mlx/mlx/backend/no_cpu",  // Exclude no_cpu backend on Linux, use cpu instead
@@ -92,7 +91,6 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/no_gpu",
         "mlx/mlx/backend/no_cpu",
         "mlx/mlx/backend/metal/no_metal.cpp",
-        "mlx/mlx/backend/metal/tests",  // Exclude standalone SDPA-admission doctest
 
         // bnns instead of simd (accelerate)
         "mlx/mlx/backend/cpu/gemms/simd_fp16.cpp",
@@ -293,7 +291,7 @@ let cmlx = Target.target(
         .headerSearchPath("json/single_include/nlohmann"),
         .headerSearchPath("mlx/mlx/distributed/jaccl/lib"),
         .headerSearchPath("fmt/include"),
-        .define("MLX_VERSION", to: "\"0.32.4\""),
+        .define("MLX_VERSION", to: "\"0.32.5\""),
     ],
     linkerSettings: linkerSettings
 )
