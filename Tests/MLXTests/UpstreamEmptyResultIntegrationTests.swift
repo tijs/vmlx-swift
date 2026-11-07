@@ -17,19 +17,31 @@ final class UpstreamEmptyResultIntegrationTests: XCTestCase {
         XCTAssertTrue(padded.allSatisfy { !$0.isValid })
     }
 
-    func testFailedQuantizationThrowsInsteadOfIndexingEmptyResults() {
-        Device.withDefaultDevice(.cpu) {
+    func testFailedQuantizationThrowsInsteadOfIndexingEmptyResults() throws {
+        try Device.withDefaultDevice(.cpu) {
             XCTAssertThrowsError(try withError {
                 _ = quantized(MLXArray.zeros([3, 3]), groupSize: 64, bits: 4)
             })
         }
     }
 
-    func testFailedSVDThrowsInsteadOfIndexingEmptyResults() {
-        Device.withDefaultDevice(.cpu) {
+    func testFailedSVDThrowsInsteadOfIndexingEmptyResults() throws {
+        try Device.withDefaultDevice(.cpu) {
             XCTAssertThrowsError(try withError {
                 _ = MLXLinalg.svd(MLXArray(Float(1)))
             })
+        }
+    }
+
+    func testFailedIndexBroadcastInvalidatesAssignmentDestination() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let destination = MLXArray.zeros([3, 3])
+            let rows = MLXArray([0, 1])
+            let columns = MLXArray([0, 1, 2])
+            XCTAssertThrowsError(try withError {
+                destination[rows, columns] = MLXArray(Float(0))
+            })
+            XCTAssertFalse(destination.isValid)
         }
     }
 
