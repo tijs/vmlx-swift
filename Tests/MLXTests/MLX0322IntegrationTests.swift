@@ -133,7 +133,7 @@ final class MLX0322IntegrationTests: XCTestCase {
                 defer { finished.leave() }
                 autoreleasepool {
                     let function = owner.lock.withLock { owner.function! }
-                    let result = function.call([MLXArray(Float(5))])
+                    let result = function.call([MLXArray(Float(5))], expected: 1)
                     XCTAssertEqual(result[0].item(Float.self), 10)
                     owner.lock.withLock { _ = owner.cacheIDs.insert(mlx_detail_compile_cache_id()) }
                 }
@@ -182,8 +182,8 @@ final class MLX0322IntegrationTests: XCTestCase {
         let inner = CompiledFunction(inputs: [], outputs: [], shapeless: false,
                                      trusted: true) { [$0[0] * 3] }
         let outer = CompiledFunction(inputs: [], outputs: [], shapeless: false,
-                                     trusted: true) { inner.call($0).map { $0 + 1 } }
-        XCTAssertEqual(outer.call([MLXArray(Float(5))])[0].item(Float.self), 16)
+                                     trusted: true) { inner.call($0, expected: 1).map { $0 + 1 } }
+        XCTAssertEqual(outer.call([MLXArray(Float(5))], expected: 1)[0].item(Float.self), 16)
     }
 
     func testCustomKernelSourceIdentityAndCompiledOutputShapes() {
@@ -208,7 +208,7 @@ final class MLX0322IntegrationTests: XCTestCase {
                 add(args, grid: (width, 1, 1), threadGroup: (4, 1, 1),
                     outputShapes: [[width]], outputDTypes: [.float32])
             }
-            assertEqual(compiled.call([input])[0], input + 1, rtol: 0, atol: 0)
+            assertEqual(compiled.call([input], expected: 1)[0], input + 1, rtol: 0, atol: 0)
         }
     }
 
