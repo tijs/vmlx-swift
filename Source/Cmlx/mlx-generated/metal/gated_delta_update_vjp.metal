@@ -1,5 +1,4 @@
 #include "gated_delta_update_vjp.h"
-#include "gated_delta_update.h"
 #include "utils.h"
 
 using namespace metal;
