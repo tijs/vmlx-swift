@@ -185,6 +185,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 // MARK: - GatedDeltaNet
 
 final class Qwen35GatedDeltaNet: Module {
+    let layerIdx: Int
+    private var didLogExperimentalGDN = false
+    private var didLogExperimentalGDNVerify = false
+    private var didLogExperimentalBlockedGDN = false
     let hiddenSize: Int
     let numVHeads: Int
     let numKHeads: Int
@@ -389,7 +393,8 @@ final class Qwen35GatedDeltaNet: Module {
         return outputs.map { $0! }
     }
 
-    init(_ args: Qwen35TextConfiguration) {
+    init(_ args: Qwen35TextConfiguration, layerIdx: Int = 0) {
+        self.layerIdx = layerIdx
         self.hiddenSize = args.hiddenSize
         self.numVHeads = args.linearNumValueHeads
         self.numKHeads = args.linearNumKeyHeads
@@ -481,6 +486,54 @@ final class Qwen35GatedDeltaNet: Module {
             convState = MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: inputs.dtype)
         }
 
+        // Same defense as the conv slot: a mis-restored recurrent state with
+        // the wrong rank/head dims crashes inside `gatedDeltaUpdate`
+        // subscripts. Expected shape is [B, Hv, Dv, Dk].
+        let initialState: MLXArray?
+        if let cachedState = cache?[1] {
+            if cachedState.ndim == 4, cachedState.dim(0) == B,
+                cachedState.dim(1) == numVHeads, cachedState.dim(2) == headVDim,
+                cachedState.dim(3) == headKDim
+            {
+                initialState = cachedState
+            } else {
+                Self.warnDiscardedCacheState(slot: "recurrent", shape: cachedState.shape)
+                initialState = nil
+            }
+        } else {
+            initialState = nil
+        }
+        // Default-off, single-token eager path only. Multi-token verification,
+        // masks and compiled traces retain their existing cache policy.
+        var experimental: (MLXArray, MLXArray, MLXArray)?
+        var experimentalInputs: ExperimentalGDNInputs?
+        if ExperimentalFusedGDN.enabled, S == 1, mask == nil,
+            !recordPrefixCommitStates, !CompiledDecodeTrace.isActive,
+            cache?[1] == nil || initialState != nil
+        {
+            let fusedInputs = ExperimentalGDNInputs(
+                    qkv: qkv, z: z.reshaped(B, S, valueDim), beta: b, alpha: a,
+                    convState: convState, convWeight: conv1d.weight, aLog: aLog,
+                    dtBias: dtBias,
+                    recurrentState: initialState ?? MLXArray.zeros(
+                        [B, numVHeads, headVDim, headKDim], dtype: .float32),
+                    normWeight: norm.weight, normEps: norm.eps)
+            experimentalInputs = fusedInputs
+            experimental = ExperimentalFusedGDN.call(
+                fusedInputs, threadgroupY: 4, preciseConvolution: true)
+        }
+        if let experimental, !ExperimentalFusedGDN.verify {
+            cache?[0] = experimental.1
+            cache?[1] = experimental.2
+            if let cache { cache.offset += S }
+            if !didLogExperimentalGDN {
+                didLogExperimentalGDN = true
+                FileHandle.standardError.write(Data(
+                    "[Qwen35] mei_experimental_gdn=active layer=\(layerIdx)\n".utf8))
+            }
+            return outProj(experimental.0)
+        }
+
         if let mask {
             qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
         }
@@ -515,23 +568,6 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        // Same defense as the conv slot: a mis-restored recurrent state with
-        // the wrong rank/head dims crashes inside `gatedDeltaUpdate`
-        // subscripts. Expected shape is [B, Hv, Dv, Dk].
-        let initialState: MLXArray?
-        if let cachedState = cache?[1] {
-            if cachedState.ndim == 4, cachedState.dim(0) == B,
-                cachedState.dim(1) == numVHeads, cachedState.dim(2) == headVDim,
-                cachedState.dim(3) == headKDim
-            {
-                initialState = cachedState
-            } else {
-                Self.warnDiscardedCacheState(slot: "recurrent", shape: cachedState.shape)
-                initialState = nil
-            }
-        } else {
-            initialState = nil
-        }
         var state = initialState
         // Fused scaled rms_norm: bake the per-head-dim scale into the rms_norm
         // weight vector so MLXFast.rmsNorm does (scale * normed) in one Metal
@@ -549,19 +585,48 @@ final class Qwen35GatedDeltaNet: Module {
 
         var out: MLXArray
 
-        (out, state) = gatedDeltaUpdate(
-            q: qNormed,
-            k: kNormed,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: state,
-            mask: mask,
-            roundStateEachStep: recordPrefixCommitStates
-                && NativeMTPVerifierStatePolicy.shouldRoundGDNStateEachVerifierStep
-        )
+        let roundState = recordPrefixCommitStates
+            && NativeMTPVerifierStatePolicy.shouldRoundGDNStateEachVerifierStep
+        var blocked: (MLXArray, MLXArray)?
+        if ExperimentalBlockedGDN.enabled, B == 1,
+            S >= ExperimentalBlockedGDN.minimumServingTokens(for: qNormed.dtype),
+            numKHeads == 16, numVHeads == 32, headKDim == 128, headVDim == 128,
+            mask == nil, !ExperimentalBlockedGDN.forceStrict,
+            !CompiledDecodeTrace.isActive, !stageVerify, !recordPrefixCommitStates
+        {
+            blocked = ExperimentalBlockedGDN.call(
+                q: qNormed, k: kNormed, v: v,
+                g: computeGatedDeltaG(aLog, a, dtBias),
+                beta: sigmoid(b).asType(.float32), state: state,
+                roundStateEachStep: roundState, preserveReductionOrder: true)
+        }
+        if let blocked {
+            if ExperimentalBlockedGDN.verify {
+                let reference = gatedDeltaUpdate(
+                q: qNormed, k: kNormed, v: v, a: a, b: b, aLog: aLog,
+                dtBias: dtBias, state: state, mask: mask,
+                roundStateEachStep: roundState)
+                eval(reference.0, reference.1, blocked.0, blocked.1)
+                for (index, pair) in [(reference.0, blocked.0), (reference.1, blocked.1)].enumerated() {
+                    guard pair.0.asData(access: .copy).data == pair.1.asData(access: .copy).data else {
+                        let error = abs(pair.0.asType(.float32) - pair.1.asType(.float32)).max().item(Float.self)
+                        fatalError("blocked GDN real-value parity failed layer=\(layerIdx) tensor=\(index) max_abs=\(error)")
+                    }
+                }
+            }
+            (out, state) = blocked
+            if !didLogExperimentalBlockedGDN {
+                didLogExperimentalBlockedGDN = true
+                let status = ExperimentalBlockedGDN.verify ? "verified" : "active"
+                FileHandle.standardError.write(Data(
+                    "[Qwen35] mei_experimental_blocked_gdn=\(status) layer=\(layerIdx) rows=\(ExperimentalBlockedGDN.stockRows) dtype=\(qNormed.dtype) tokens=\(S)\n".utf8))
+            }
+        } else {
+            (out, state) = gatedDeltaUpdate(
+                q: qNormed, k: kNormed, v: v, a: a, b: b, aLog: aLog,
+                dtBias: dtBias, state: state, mask: mask,
+                roundStateEachStep: roundState)
+        }
         let finalState = state!
 
         if let cache {
@@ -618,6 +683,25 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         out = norm(out, gate: z)
+        if let experimental, ExperimentalFusedGDN.verify {
+            let reference = [out.reshaped(B, S, valueDim),
+                convInput[0..., S..., 0...], finalState]
+            let candidate = [experimental.0, experimental.1, experimental.2]
+            eval(reference + candidate)
+            for (index, pair) in zip(reference, candidate).enumerated() {
+                guard pair.0.asData(access: .copy).data == pair.1.asData(access: .copy).data else {
+                    ExperimentalFusedGDN.recordFailure(
+                        input: experimentalInputs!, reference: reference,
+                        candidate: candidate, layer: layerIdx)
+                    fatalError("experimental GDN real-value parity failed layer=\(layerIdx) tensor=\(index)")
+                }
+            }
+            if !didLogExperimentalGDNVerify {
+                didLogExperimentalGDNVerify = true
+                FileHandle.standardError.write(Data(
+                    "[Qwen35] mei_experimental_gdn=verified layer=\(layerIdx)\n".utf8))
+            }
+        }
         return outProj(out.reshaped(B, S, -1))
     }
 
@@ -878,6 +962,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     /// shared architecture/environment policy; MTP layers keep the eager
     /// default, matching the VLM's MTP path.
     let compileDecodeRegions: Bool
+    private var didReportExperimentalRouter = false
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -915,12 +1000,22 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         var gates = gate(x)
         gates = MLX.softmax(gates, axis: -1, precise: true)
 
-        let k = topK
-        let kth = gates.dim(-1) - k
-        let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, (kth)...]
-        var scores = MLX.takeAlong(gates, inds, axis: -1)
-        if normTopkProb {
-            scores = scores / scores.sum(axis: -1, keepDims: true)
+        let inds: MLXArray
+        let scores: MLXArray
+        if ExperimentalRouterTail.enabled,
+            let fused = ExperimentalRouterTail.call(gates, topK: topK, normalize: normTopkProb)
+        {
+            (inds, scores) = fused
+            if !didReportExperimentalRouter {
+                didReportExperimentalRouter = true
+                RuntimeDiagnostics.write(Data(
+                    "[Qwen35] mei_experimental_router_tail=active layer=\(layerIdx) dtype=\(gates.dtype) experts=\(numExperts) top_k=\(topK)\n".utf8))
+            }
+        } else {
+            let kth = gates.dim(-1) - topK
+            inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
+            let selected = MLX.takeAlong(gates, inds, axis: -1)
+            scores = normTopkProb ? selected / selected.sum(axis: -1, keepDims: true) : selected
         }
 
         let y = switchMLP(x, inds)
@@ -965,7 +1060,7 @@ final class Qwen35DecoderLayer: Module {
             linearValueHeadDim: args.linearValueHeadDim)
 
         if isLinear {
-            _linearAttn.wrappedValue = Qwen35GatedDeltaNet(args)
+            _linearAttn.wrappedValue = Qwen35GatedDeltaNet(args, layerIdx: layerIdx)
         } else {
             _selfAttn.wrappedValue = Qwen35Attention(args)
         }

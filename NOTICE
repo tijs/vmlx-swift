@@ -1,0 +1,3 @@
+Retained Rapid-MLX-derived kernel subset
+
+This fork retains selected precise router/GDN and stock-order blocked-prefill kernels derived from Rapid-MLX commit7d2b20c7f7fe4707f0690d3dd720be0b7b4f7725. See THIRD-PARTY-RAPID-NOTICES.md for exact retained-file provenance and LICENSE-RAPID-MLX, LICENSE-MLX-VLM-MIT and LICENSE-VMLX-MIT for full license terms. Existing upstream notices in each file are preserved. Other Rapid subsystems are not incorporated.

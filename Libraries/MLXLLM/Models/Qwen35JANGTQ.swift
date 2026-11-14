@@ -565,7 +565,7 @@ final class Qwen35JANGTQDecoderLayer: Module {
         // round-trip — see Qwen35JANGTQTextConfiguration.asAffine().
         let affine = args.asAffine()
         if isLinear {
-            _linearAttn.wrappedValue = Qwen35GatedDeltaNet(affine)
+            _linearAttn.wrappedValue = Qwen35GatedDeltaNet(affine, layerIdx: layerIdx)
         } else {
             _selfAttn.wrappedValue = Qwen35Attention(affine)
         }
