@@ -111,6 +111,7 @@ public enum LLMTypeRegistry {
                 return Qwen35MoEModel(config)
             },
             "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+            "sensenova_loop": create(SenseNovaLoopConfiguration.self, SenseNovaLoopModel.init),
         ]
     }
 
@@ -2027,6 +2028,14 @@ public final class LLMModelFactory: ModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        if baseConfig.modelType == "sensenova_loop",
+            let quantization = baseConfig.perLayerQuantization,
+            !quantization.perLayerQuantization.isEmpty
+        {
+            throw SenseNovaLoopConfiguration.ContractError.invalid(
+                "per-layer weight quantization overrides are unsupported")
+        }
+
         // Bonsai 2 Prism-Hadamard gate (portability slice, default OFF).
         // `prism_hadamard_qwen35` (root `model_type` OR nested
         // `text_config.model_type`) must never flow into the generic registry
@@ -2233,6 +2242,9 @@ public final class LLMModelFactory: ModelFactory {
                         requesting: configuration.requestedModalities)
                 }
             } catch {
+                // A Loop export cannot fall back to its nested Qwen types:
+                // that would discard the loop and its independent visit caches.
+                if baseConfig.modelType == "sensenova_loop" { throw error }
                 // A rejected custom bank must never fall back to an ordinary model.
                 if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || ricursiveJANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil || miniMaxM3JANGHPreparation != nil { throw error }
                 // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,

@@ -198,6 +198,11 @@ final class Qwen35GatedDeltaNet: Module {
     let valueDim: Int
     let convKernelSize: Int
     let convDim: Int
+    // SenseNova's authored reference uses rsqrt(sum(x*x) + eps), whereas
+    // the legacy Qwen path uses an RMS epsilon. Keep existing model arithmetic
+    // unchanged; only an explicit architecture owner opts into sum semantics.
+    let l2NormSumEpsilon: Float?
+    let usesFP32GDNReference: Bool
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
     @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
@@ -393,7 +398,10 @@ final class Qwen35GatedDeltaNet: Module {
         return outputs.map { $0! }
     }
 
-    init(_ args: Qwen35TextConfiguration, layerIdx: Int = 0) {
+    init(_ args: Qwen35TextConfiguration, layerIdx: Int = 0, l2NormSumEpsilon: Float? = nil,
+         usesFP32GDNReference: Bool = false) {
+        self.l2NormSumEpsilon = l2NormSumEpsilon
+        self.usesFP32GDNReference = usesFP32GDNReference
         self.layerIdx = layerIdx
         self.hiddenSize = args.hiddenSize
         self.numVHeads = args.linearNumValueHeads
@@ -463,11 +471,14 @@ final class Qwen35GatedDeltaNet: Module {
 
         // Decode-only fused input projections (see `fusedDecodeInputs`);
         // prefill and any non-token step keep the original four calls.
-        let projected = S == 1 ? fusedDecodeInputs(inputs) : nil
+        let projected = S == 1 && !usesFP32GDNReference ? fusedDecodeInputs(inputs) : nil
         var qkv = projected?[0] ?? inProjQKV(inputs)
         let z = (projected?[1] ?? inProjZ(inputs)).reshaped(B, S, numVHeads, headVDim)
         let b = projected?[2] ?? inProjB(inputs)
-        let a = projected?[3] ?? inProjA(inputs)
+        let rawA = projected?[3] ?? inProjA(inputs)
+        // Authored SenseNova/Qwen Torch reference promotes alpha before the
+        // dt_bias addition/softplus; keep the legacy Qwen path untouched.
+        let a = usesFP32GDNReference ? rawA.asType(.float32) : rawA
 
         // A restored cache (paged/hybrid restore, prefix commit) can hand back
         // a slot whose shape no longer matches this layer — an over- or
@@ -507,7 +518,7 @@ final class Qwen35GatedDeltaNet: Module {
         // masks and compiled traces retain their existing cache policy.
         var experimental: (MLXArray, MLXArray, MLXArray)?
         var experimentalInputs: ExperimentalGDNInputs?
-        if ExperimentalFusedGDN.enabled, S == 1, mask == nil,
+        if ExperimentalFusedGDN.enabled, l2NormSumEpsilon == nil, !usesFP32GDNReference, S == 1, mask == nil,
             !recordPrefixCommitStates, !CompiledDecodeTrace.isActive,
             cache?[1] == nil || initialState != nil
         {
@@ -564,9 +575,14 @@ final class Qwen35GatedDeltaNet: Module {
         // can surface. Bail with the input so the enclosing withError scope
         // throws the real diagnostic at exit. (Same guard as NemotronH.)
         guard convSplit.count == 3 else { return inputs }
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+        var q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        var k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        var v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+        if usesFP32GDNReference {
+            q = q.asType(.float32)
+            k = k.asType(.float32)
+            v = v.asType(.float32)
+        }
 
         var state = initialState
         // Fused scaled rms_norm: bake the per-head-dim scale into the rms_norm
@@ -580,15 +596,16 @@ final class Qwen35GatedDeltaNet: Module {
             kScaleWeight = MLXArray.full(
                 [headKDim], values: MLXArray(invScale, dtype: k.dtype), dtype: k.dtype)
         }
-        let qNormed = MLXFast.rmsNorm(q, weight: qScaleWeight!, eps: 1e-6)
-        let kNormed = MLXFast.rmsNorm(k, weight: kScaleWeight!, eps: 1e-6)
+        let qkRmsEpsilon = l2NormSumEpsilon.map { $0 / Float(headKDim) } ?? 1e-6
+        let qNormed = MLXFast.rmsNorm(q, weight: qScaleWeight!, eps: qkRmsEpsilon)
+        let kNormed = MLXFast.rmsNorm(k, weight: kScaleWeight!, eps: qkRmsEpsilon)
 
         var out: MLXArray
 
         let roundState = recordPrefixCommitStates
             && NativeMTPVerifierStatePolicy.shouldRoundGDNStateEachVerifierStep
         var blocked: (MLXArray, MLXArray)?
-        if ExperimentalBlockedGDN.enabled, B == 1,
+        if ExperimentalBlockedGDN.enabled, !usesFP32GDNReference, B == 1,
             S >= ExperimentalBlockedGDN.minimumServingTokens(for: qNormed.dtype),
             numKHeads == 16, numVHeads == 32, headKDim == 128, headVDim == 128,
             mask == nil, !ExperimentalBlockedGDN.forceStrict,
@@ -682,7 +699,21 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        out = norm(out, gate: z)
+        // Torch computes the recurrence in FP32, then casts its output back
+        // before gated RMS normalization. Beta retains its original BF16
+        // sigmoid rounding, matching the reference's b.sigmoid().
+        if usesFP32GDNReference {
+            out = out.asType(convOut.dtype)
+            let f = out.asType(.float32)
+            // The authored gated norm rounds the unweighted normalized value
+            // before multiplying its BF16 weight (unlike fused weighted RMS).
+            let normalized = (f * rsqrt((f * f).mean(axis: -1, keepDims: true) + norm.eps))
+                .asType(out.dtype)
+            let weighted = normalized * norm.weight
+            out = (weighted.asType(.float32) * silu(z.asType(.float32))).asType(out.dtype)
+        } else {
+            out = norm(out, gate: z)
+        }
         if let experimental, ExperimentalFusedGDN.verify {
             let reference = [out.reshaped(B, S, valueDim),
                 convInput[0..., S..., 0...], finalState]
@@ -868,6 +899,7 @@ final class Qwen35Attention: Module {
     let attentionHeads: Int
     let kvHeads: Int
     let scale: Float
+    let preservesNormInputDType: Bool
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -879,7 +911,8 @@ final class Qwen35Attention: Module {
 
     let rope: RoPELayer
 
-    init(_ args: Qwen35TextConfiguration) {
+    init(_ args: Qwen35TextConfiguration, preservesNormInputDType: Bool = false) {
+        self.preservesNormInputDType = preservesNormInputDType
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
         self.kvHeads = args.kvHeads
@@ -926,8 +959,13 @@ final class Qwen35Attention: Module {
         var keys = kProj(x)
         var values = vProj(x)
 
-        queries = qNorm(queries).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        if preservesNormInputDType {
+            queries = qNorm(queries).asType(queries.dtype).transposed(0, 2, 1, 3)
+            keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).asType(keys.dtype).transposed(0, 2, 1, 3)
+        } else {
+            queries = qNorm(queries).transposed(0, 2, 1, 3)
+            keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        }
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
