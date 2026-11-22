@@ -45,6 +45,12 @@ public class ToolCallProcessor {
     /// template control tokens that must not leak, but no tool was requested
     /// so none is reported.
     private let stripOnly: Bool
+    // Inkling's channel splitter forwards committed native-envelope chunks,
+    // including the final chunk. Consumers need that last fragment to finish
+    // incremental argument JSON before receiving the validated ToolCall.
+    var streamsInklingEnvelopeProgress: Bool {
+        !stripOnly && parser is InklingToolCallParser
+    }
     public let parsesToolCallsFromReasoningChannel: Bool
     public let usesTaggedOnlyReasoningExtraction: Bool
     public let preservesReasoningTextAroundToolCalls: Bool

@@ -136,6 +136,7 @@ public struct ReasoningParser: Sendable {
 
     /// Text not yet emitted because it might be a partial tag prefix.
     private var buffer: String = ""
+    private var inklingStream = InklingMessageStream()
 
     /// Whether we're currently inside a reasoning block.
     private var insideReasoning: Bool = false
@@ -161,7 +162,7 @@ public struct ReasoningParser: Sendable {
     /// (a.k.a. "trapped thinking") that some reasoning-trained models
     /// exhibit on validation-style prompts.
     public var isInsideReasoning: Bool {
-        insideReasoning
+        startTag == "<|content_thinking|>" ? inklingStream.isReasoning : insideReasoning
     }
 
     // MARK: Init
@@ -209,6 +210,7 @@ public struct ReasoningParser: Sendable {
     /// Feed an incoming token-stream chunk. Returns zero or more segments.
     public mutating func feed(_ chunk: String) -> [ReasoningSegment] {
         guard !chunk.isEmpty else { return [] }
+        if startTag == "<|content_thinking|>" { return inklingStream.feed(chunk) }
         buffer.append(chunk)
         if isHarmonyChannelParser {
             return drainHarmonyChannel()
@@ -219,6 +221,7 @@ public struct ReasoningParser: Sendable {
     /// Call once when the stream ends. Flushes any buffered partial text
     /// as `.content` (so we never silently drop tokens).
     public mutating func flush() -> [ReasoningSegment] {
+        if startTag == "<|content_thinking|>" { return inklingStream.feed("", final: true) }
         if isHarmonyChannelParser {
             var out = drainHarmonyChannel(allowPartialTagAtEnd: false)
             if !buffer.isEmpty {
@@ -994,6 +997,10 @@ extension ReasoningParser {
         let normalized = normalizedReasoningAlias(n)
         let compact = compactReasoningAlias(n)
 
+        if compact == "inkling2" || compact == "inkling2loop" {
+            return ReasoningParser(startTag: "<|content_thinking|>", endTag: "<|end_message|>")
+        }
+
         if normalized == "minicpm5" || normalized == "minicpm5_xml_function" {
             return ReasoningParser(preservesXMLFunctionPayloads: true)
         }
@@ -1288,6 +1295,7 @@ extension ReasoningParser {
         promptTail: String?
     ) -> ReasoningParser? {
         guard let base = fromCapabilityName(stampName) else { return nil }
+        if base.startTag == "<|content_thinking|>" { return base }
 
         // No prompt hint → use stamp default (whatever insideReasoning
         // was baked into `base` by fromCapabilityName).

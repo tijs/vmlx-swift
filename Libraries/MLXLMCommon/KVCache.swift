@@ -384,10 +384,12 @@ public protocol QuantizedKVCacheProtocol: KVCache {
 
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
+    /// Allow architecture-owned companion caches in model modules.
+    public init() {}
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
-    public func innerState() -> [MLXArray] { [] }
+    open func innerState() -> [MLXArray] { [] }
 
     open func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError("update(keys:values:) must be implemented by subclass")

@@ -112,6 +112,12 @@ public enum LLMTypeRegistry {
             },
             "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
             "sensenova_loop": create(SenseNovaLoopConfiguration.self, SenseNovaLoopModel.init),
+            "inkling2_loop": { data, requesting in
+                guard requesting == nil || requesting == [.text] else {
+                    throw Inkling2LoopConfiguration.ContractError.invalid("initial Inkling envelope is text-only")
+                }
+                return Inkling2LoopModel(try JSONDecoder.json5().decode(Inkling2LoopConfiguration.self, from: data))
+            },
         ]
     }
 
@@ -2244,7 +2250,7 @@ public final class LLMModelFactory: ModelFactory {
             } catch {
                 // A Loop export cannot fall back to its nested Qwen types:
                 // that would discard the loop and its independent visit caches.
-                if baseConfig.modelType == "sensenova_loop" { throw error }
+                if ["sensenova_loop", "inkling2_loop"].contains(baseConfig.modelType) { throw error }
                 // A rejected custom bank must never fall back to an ordinary model.
                 if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || ricursiveJANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil || miniMaxM3JANGHPreparation != nil { throw error }
                 // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,

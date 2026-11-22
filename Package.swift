@@ -1030,6 +1030,12 @@ let package = Package(
             ]
         ),
         .testTarget(
+            name: "Inkling2FocusedTests",
+            dependencies: ["MLX", "MLXNN", "MLXLMCommon", "MLXLLM"],
+            path: "Tests/Inkling2FocusedTests",
+            resources: [.copy("Resources/Inkling2Primitives.json"), .copy("Resources/InklingNVFP4.json"), .copy("Resources/InklingTinyModel.json"), .copy("Resources/InklingTinyBF16Model.json"), .copy("Resources/InklingPublishedInventory.json"), .copy("Resources/InklingResidualRounding.safetensors"), .copy("Resources/InklingShortConvolution.json"), .copy("Resources/InklingCompiledPrimitives.json")]
+        ),
+        .testTarget(
             name: "MLXLMCommonToolParserFocusedTests",
             dependencies: ["MLXLMCommon", "VMLXJinja"],
             path: "Tests/MLXLMCommonToolParserFocusedTests"

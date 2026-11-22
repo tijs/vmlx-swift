@@ -158,6 +158,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
     case json
 
+    /// Native Inkling invocation JSON (name + args), not OpenAI argument transport.
+    case inkling2
+
     /// LFM2/LFM2.5 Pythonic format with model-specific tags.
     /// Example: `<|tool_call_start|>[func(arg='value')]<|tool_call_end|>`
     case lfm2
@@ -259,6 +262,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// - Returns: A parser instance configured for this format
     public func createParser() -> any ToolCallParser {
         switch self {
+        case .inkling2:
+            return InklingToolCallParser()
         case .json:
             return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .lfm2:
@@ -321,7 +326,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             // Feeding it to the shared processor both executes examples and
             // contaminates its buffer before the real content-channel call.
             return false
-        case .dsml, .dsmlV41, .minicpm5, .k2Horizon:
+        case .dsml, .dsmlV41, .minicpm5, .k2Horizon, .inkling2:
             // These contracts place complete reasoning inside
             // <think>...</think> before any tool call. Tool-shaped examples or
             // malformed protocol text inside reasoning_content are therefore
@@ -373,6 +378,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         let type = modelType.lowercased()
         let normalized = normalizedAlias(type)
         let compact = compactAlias(type)
+
+        if compact == "inkling2loop" || compact == "inkling2looptext" { return .inkling2 }
 
         if compact == "k2horizon" { return .k2Horizon }
 

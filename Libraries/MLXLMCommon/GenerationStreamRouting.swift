@@ -26,6 +26,11 @@ public func routeGenerationText(
     var events: [Generation] = []
     let toolCallCountBeforeChunk = toolCallProcessor.toolCalls.count
     let collectingBeforeChunk = toolCallProcessor.collectingToolCallText
+    let inklingEnvelope = channel == .content && toolCallProcessor.streamsInklingEnvelopeProgress
+        && (collectingBeforeChunk != nil || text.hasPrefix("<|message_model|>"))
+    if inklingEnvelope {
+        events.append(.toolCallProgress(text))
+    }
     let visibleChunk: String?
     if channel == .reasoning, toolCallProcessor.usesTaggedOnlyReasoningExtraction {
         visibleChunk = toolCallProcessor.processTaggedProtocolChunk(text)
@@ -51,7 +56,7 @@ public func routeGenerationText(
     // `hasPrefix` guards the boundary where one call closed and the next
     // opened inside the same chunk — the buffer then holds unrelated text, so
     // the whole new buffer is the delta.
-    if let after = toolCallProcessor.collectingToolCallText, !after.isEmpty {
+    if !inklingEnvelope, let after = toolCallProcessor.collectingToolCallText, !after.isEmpty {
         if let before = collectingBeforeChunk, after.hasPrefix(before) {
             if after.count > before.count {
                 events.append(.toolCallProgress(String(after.dropFirst(before.count))))

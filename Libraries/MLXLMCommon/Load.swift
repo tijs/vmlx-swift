@@ -4,6 +4,11 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Model-owned strict checkpoint validation before generic parameter update.
+public protocol ThrowingWeightSanitizing {
+    func sanitizeWeights(_ weights: [String: MLXArray], metadata: [String: String]) throws -> [String: MLXArray]
+}
+
 /// Allows a model to keep file-backed auxiliary tensors out of the generic
 /// MLX weight loader. The predicate is evaluated against safetensors header
 /// names before tensor mappings or dtype-alignment copies are created.
@@ -780,7 +785,11 @@ public func loadWeights(
     {
         metadata[key] = value
     }
+    if let strict = model as? ThrowingWeightSanitizing {
+        weights = try strict.sanitizeWeights(weights, metadata: metadata)
+    } else {
     weights = model.sanitize(weights: weights, metadata: metadata)
+    }
 
     // Bonsai 2 Prism-Hadamard transform install (default-off portability
     // seam, `VMLX_BONSAI_PRISM_HADAMARD=1`). When a validated plan is passed
