@@ -642,12 +642,17 @@ private final class InklingHeadProjectionCache {
 public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,ThrowingWeightSanitizing {
     public let configuration:Inkling2LoopConfiguration
     private let headProjectionCache = InklingHeadProjectionCache()
+    private let boundedLocalKV = ProcessInfo.processInfo.environment["VMLX_INKLING_BOUNDED_LOCAL_KV"] != "0"
     @ModuleInfo(key:"language_model") var language:InklingLanguageModel
     public var preservesCheckpointParameterDTypes: Bool { true }
     public var vocabularySize:Int { configuration.text.unpaddedVocab }
     public var kvHeads:[Int] { configuration.text.schedule.map { configuration.text.sliding($0) ? configuration.text.localKVHeads:configuration.text.kvHeads } }
     public var loraLayers:[Module] { language.model.layers }
-    public var cacheStorageDTypeIdentity:String? { "inkling2mini-full-kv-four-fp32-conv-v1" }
+    public var cacheStorageDTypeIdentity: String? {
+        boundedLocalKV
+            ? "inkling2mini-window-\(configuration.text.window)-kv-four-fp32-conv-v1"
+            : "inkling2mini-full-kv-four-fp32-conv-v1"
+    }
     public var cacheComputationIdentity:String? { "inkling2mini-3pass-ar-float-activations-v1" }
     public init(_ configuration:Inkling2LoopConfiguration) {
         self.configuration=configuration;_language.wrappedValue=InklingLanguageModel(configuration);super.init()
@@ -682,7 +687,7 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
         return try super.update(parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
     public func newCache(parameters:GenerateParameters?)->[KVCache] {
-        makeVisitCaches(bounded: ProcessInfo.processInfo.environment["VMLX_INKLING_BOUNDED_LOCAL_KV"] != "0")
+        makeVisitCaches(bounded: boundedLocalKV)
     }
 
     func makeVisitCaches(bounded: Bool) -> [KVCache] {
