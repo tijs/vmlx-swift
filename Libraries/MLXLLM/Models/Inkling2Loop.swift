@@ -76,6 +76,8 @@ public struct Inkling2LoopConfiguration: Decodable, Sendable {
     }
     let modelType: String
     let text: Text
+    static let embeddingPath = "language_model.model.embed_tokens"
+    static let headPath = "language_model.lm_head"
     let quantization: [String: Quant]
     public enum ContractError: Error, CustomStringConvertible {
         case invalid(String)
@@ -122,6 +124,13 @@ public struct Inkling2LoopConfiguration: Decodable, Sendable {
             l.coreStart % t.block == 0, l.coreEnd % t.block == 0,
             l.passes == 3, !l.variable, l.gateRank > 0
         else { throw ContractError.invalid("unsupported or malformed fixed three-pass text topology") }
+        for path in [Self.embeddingPath, Self.headPath] {
+            if let q = qs.removeValue(forKey: path) {
+                guard q.mode == "affine", q.bits == 4, q.groupSize == 64, t.hidden % 64 == 0 else {
+                    throw ContractError.invalid("unsupported vocabulary quantization at \(path)")
+                }
+            }
+        }
         for (path, q) in qs {
             guard path.hasPrefix("language_model.model.layers."), path.contains(".mlp.switch_mlp."),
                 ["nvfp4", "mxfp8"].contains(q.mode),
@@ -575,7 +584,16 @@ final class InklingTextModel:Module {
     @ModuleInfo(key:"message_input") var messageInput:InklingMessageAttention
     let t:Inkling2LoopConfiguration.Text
     init(_ c:Inkling2LoopConfiguration) {
-        t=c.text;_embed.wrappedValue=Embedding(embeddingCount:t.vocab,dimensions:t.hidden)
+        t = c.text
+        if let q = c.quantization[Inkling2LoopConfiguration.embeddingPath] {
+            _embed.wrappedValue = QuantizedEmbedding(
+                weight: .zeros([t.vocab, t.hidden * q.bits / 32], dtype: .uint32),
+                scales: .zeros([t.vocab, t.hidden / q.groupSize], dtype: .bfloat16),
+                biases: .zeros([t.vocab, t.hidden / q.groupSize], dtype: .bfloat16),
+                groupSize: q.groupSize, bits: q.bits)
+        } else {
+            _embed.wrappedValue = Embedding(embeddingCount: t.vocab, dimensions: t.hidden)
+        }
         _embedNorm.wrappedValue=RMSNorm(dimensions:t.hidden,eps:t.eps)
         _layers.wrappedValue=(0..<t.layers).map { InklingDecoderLayer(c,layer:$0) }
         _finalInput.wrappedValue=InklingAttentionResidual(t);_norm.wrappedValue=RMSNorm(dimensions:t.hidden,eps:t.eps)
@@ -604,7 +622,18 @@ final class InklingLanguageModel:Module {
     @ModuleInfo var model:InklingTextModel
     @ModuleInfo(key:"lm_head") var head:Linear
     init(_ c:Inkling2LoopConfiguration) {
-        _model.wrappedValue=InklingTextModel(c);_head.wrappedValue=Linear(c.text.hidden,c.text.vocab,bias:false);super.init()
+        _model.wrappedValue = InklingTextModel(c)
+        if let q = c.quantization[Inkling2LoopConfiguration.headPath] {
+            let t = c.text
+            _head.wrappedValue = QuantizedLinear(
+                weight: .zeros([t.vocab, t.hidden * q.bits / 32], dtype: .uint32),
+                scales: .zeros([t.vocab, t.hidden / q.groupSize], dtype: .bfloat16),
+                biases: .zeros([t.vocab, t.hidden / q.groupSize], dtype: .bfloat16),
+                groupSize: q.groupSize, bits: q.bits)
+        } else {
+            _head.wrappedValue = Linear(c.text.hidden, c.text.vocab, bias: false)
+        }
+        super.init()
     }
 }
 private final class InklingHeadProjectionCache {
@@ -628,7 +657,9 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
         // The reference retains one FP32 head projection; repeatedly promoting
         // the full vocabulary table would rematerialize ~1.85GB every token.
         var logits: MLXArray
-        if Inkling2HeadProjection.enabled && language.model.embedNorm.weight.dtype == .bfloat16
+        if let head = language.head as? QuantizedLinear {
+            logits = head(h).asType(.float32)
+        } else if Inkling2HeadProjection.enabled && language.model.embedNorm.weight.dtype == .bfloat16
             && Inkling2HeadProjection.supports(h, weight: language.head.weight) {
             // Prefill still uses the authored FP32 matrix path. Release its
             // derived copy when decode can read BF16 storage directly.
@@ -677,7 +708,13 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
                 guard value.dtype==placeholder.dtype else { throw Inkling2LoopConfiguration.ContractError.invalid("packed dtype mismatch at \(key)") }
             } else {
                 guard value.dtype.isFloatingPoint else { throw Inkling2LoopConfiguration.ContractError.invalid("floating dtype required at \(key)") }
-                if key.hasSuffix(".gate_weight") {
+                if [Inkling2LoopConfiguration.headPath, Inkling2LoopConfiguration.embeddingPath].contains(where: {
+                    key == $0 + ".scales" || key == $0 + ".biases"
+                }) {
+                    guard value.dtype == .bfloat16 else {
+                        throw Inkling2LoopConfiguration.ContractError.invalid("expected BF16 affine metadata at \(key)")
+                    }
+                } else if key.hasSuffix(".gate_weight") {
                     // The published Mini checkpoint stores all 24 routers in
                     // BF16. Preserve that storage; InklingMoE promotes the
                     // operands to FP32 for routing, as the reference does.
