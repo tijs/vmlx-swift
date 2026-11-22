@@ -41,6 +41,33 @@ final class InklingCacheEvaluationTests: XCTestCase {
         XCTAssertEqual(cache.trim(1), 0)
     }
 
+    func testEvictionPreservesChunkKeysAndAbsolutePositionAcrossCopyAndRestore() {
+        Device.withDefaultDevice(.cpu) {
+            let cache = Inkling2VisitCache(window: 3)
+            for i in 0..<4 { cache.convolutions[i] = MLXArray([Float(i)]) }
+            func append(_ rows: [Int32], to cache: Inkling2VisitCache) -> [Int32] {
+                let keys = MLXArray(rows, [1, 1, rows.count, 1])
+                let (allKeys, allValues) = cache.update(keys: keys, values: keys + 1)
+                XCTAssertEqual(allValues.asArray(Int32.self), allKeys.asArray(Int32.self).map { $0 + 1 })
+                return allKeys.asArray(Int32.self)
+            }
+            XCTAssertEqual(append([0, 1, 2, 3, 4], to: cache), [0, 1, 2, 3, 4])
+            XCTAssertEqual(append([5, 6], to: cache), [2, 3, 4, 5, 6])
+            XCTAssertEqual(cache.state[0].asArray(Int32.self), [4, 5, 6])
+            let copy = cache.copy() as! Inkling2VisitCache
+            let restored = Inkling2VisitCache(window: 3)
+            restored.state = cache.state
+            restored.metaState = cache.metaState
+            for branch in [copy, restored] {
+                XCTAssertEqual(branch.offset, 7)
+                XCTAssertEqual(append([7], to: branch), [4, 5, 6, 7])
+                XCTAssertEqual(branch.state[0].asArray(Int32.self), [5, 6, 7])
+                XCTAssertEqual(branch.offset, 8)
+            }
+            XCTAssertEqual(cache.offset, 7)
+        }
+    }
+
     func testChunkBoundaryMaterializesKVAndAllConvolutionStatesCPU() {
         Device.withDefaultDevice(.cpu) { checkChunkBoundaryEvaluation() }
     }

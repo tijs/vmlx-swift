@@ -134,6 +134,28 @@ final class Inkling2LoopTests: XCTestCase {
             let b=m(tokens[0...,2..<5],cache:cache)
             XCTAssertLessThan(difference(full,concatenated([a,b],axis:1)),2e-5)
             XCTAssertTrue(cache.allSatisfy { $0.offset==5 && $0.state.count==6 })
+            // The three-token local window wraps repeatedly. Compare every
+            // logit after a large prefill, chunked continuations, and decode.
+            let sequence = MLXArray((1...14).map(Int32.init), [1,14])
+            let referenceFull = m(sequence, cache: nil)
+            let bounded = m.makeVisitCaches(bounded: true)
+            var start = 0
+            for end in [5, 8, 9, 14] {
+                let logits = m(sequence[0...,start..<end], cache: bounded)
+                XCTAssertLessThan(difference(logits, referenceFull[0...,start..<end,0...]), 2e-5)
+                for (visit, physical) in m.configuration.text.schedule.enumerated() {
+                    let local = m.configuration.text.localLayers.contains(physical)
+                    XCTAssertEqual(bounded[visit].offset, end)
+                    XCTAssertEqual(bounded[visit].state[0].dim(2), local ? 3 : end)
+                }
+                start = end
+            }
+            let clone = bounded.map { $0.copy() }
+            let next = MLXArray([Int32(15)], [1,1])
+            let cloned = m(next, cache: clone)
+            XCTAssertTrue(bounded.allSatisfy { $0.offset == 14 })
+            XCTAssertLessThan(difference(cloned, m(next, cache: bounded)), 1e-6)
+            XCTAssertEqual(clone[0].state[0].dim(2), 3)
         }
     }
     func testPublishedCheckpointMetadataMatchesEveryNativeParameter() throws {

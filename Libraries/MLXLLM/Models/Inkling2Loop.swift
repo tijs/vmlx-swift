@@ -144,11 +144,23 @@ public struct Inkling2LoopConfiguration: Decodable, Sendable {
     }
 }
 
-/// K/V remain chronological. Initial envelope uses full KV up to a 4K request
-/// cap and masks local attention; it deliberately does not claim ring eviction,
-/// trim, speculative rollback, or disk-prefix persistence support.
+/// Chronological K/V for one execution visit. The absolute offset includes
+/// evicted positions and remains independent for each pass through the loop.
 public final class Inkling2VisitCache: BaseKVCache {
     private var keys: MLXArray?, values: MLXArray?
+    private let window: Int?
+
+    public override init() {
+        self.window = nil
+        super.init()
+    }
+
+    init(window: Int) {
+        precondition(window > 0)
+        self.window = window
+        super.init()
+    }
+
     var convolutions: [MLXArray?] = Array(repeating: nil, count: 4)
     // Generic chunked prefill evaluates the cache through Evaluatable, not
     // through its serialized state getter. Include every owned backing array.
@@ -156,10 +168,20 @@ public final class Inkling2VisitCache: BaseKVCache {
         [keys, values].compactMap { $0 } + convolutions.compactMap { $0 }
     }
     override public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
-        keys = keys.map { concatenated([$0, newKeys], axis: 2) } ?? newKeys
-        values = values.map { concatenated([$0, newValues], axis: 2) } ?? newValues
+        let chunkKeys = keys.map { concatenated([$0, newKeys], axis: 2) } ?? newKeys
+        let chunkValues = values.map { concatenated([$0, newValues], axis: 2) } ?? newValues
         offset += newKeys.dim(2)
-        return (keys!, values!)
+        if let window, chunkKeys.dim(2) > window {
+            let start = chunkKeys.dim(2) - window
+            keys = contiguous(chunkKeys[0..., 0..., start..., 0...])
+            values = contiguous(chunkValues[0..., 0..., start..., 0...])
+        } else {
+            keys = chunkKeys
+            values = chunkValues
+        }
+        // The first query in a multi-token chunk can still see history that
+        // the last query has passed. Evict only from next call's saved state.
+        return (chunkKeys, chunkValues)
     }
     override public var state: [MLXArray] {
         get { [keys, values].compactMap { $0 } + convolutions.compactMap { $0 } }
@@ -179,7 +201,7 @@ public final class Inkling2VisitCache: BaseKVCache {
         set { if newValue.count == 2, newValue[0] == "inkling2-visit-v1", let n = Int(newValue[1]) { offset = n } }
     }
     override public func copy() -> any KVCache {
-        let c = Inkling2VisitCache()
+        let c = window.map { Inkling2VisitCache(window: $0) } ?? Inkling2VisitCache()
         c.keys = keys.map { $0 * 1 }; c.values = values.map { $0 * 1 }
         c.convolutions = convolutions.map { $0.map { $0 * 1 } }; c.offset = offset
         return c
@@ -375,7 +397,9 @@ final class InklingAttention: Module {
         value=value.transposed(0,2,1,3)
         if let cache { (keys,value)=cache.update(keys:keys,values:value) }
         let count=keys.dim(2)
-        let mask=inklingBandedMask(relative:relative,projection:relProjection.asType(dtype),offset:oldOffset,count:count,window:local ? t.window:0,extent:extent)
+        // Mask distances are relative to the oldest returned key. Position
+        // scaling above still uses the absolute offset, including evictions.
+        let mask=inklingBandedMask(relative:relative,projection:relProjection.asType(dtype),offset:count-n,count:count,window:local ? t.window:0,extent:extent)
         let sinks=sink(x).transposed(0,2,1).expandedDimensions(axis:-1)
         let additive=concatenated([mask,sinks],axis:-1)
         keys=concatenated([keys,.zeros([b,kvHeads,1,dim],dtype:dtype)],axis:2)
@@ -627,7 +651,17 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
         return try super.update(parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
     public func newCache(parameters:GenerateParameters?)->[KVCache] {
-        configuration.text.schedule.map { _ in Inkling2VisitCache() }
+        makeVisitCaches(bounded: ProcessInfo.processInfo.environment["VMLX_INKLING_BOUNDED_LOCAL_KV"] != "0")
+    }
+
+    func makeVisitCaches(bounded: Bool) -> [KVCache] {
+        let text = configuration.text
+        return text.schedule.map { physical in
+            if bounded && text.localLayers.contains(physical) {
+                return Inkling2VisitCache(window: text.window)
+            }
+            return Inkling2VisitCache()
+        }
     }
     public func sanitizeWeights(_ weights:[String:MLXArray],metadata:[String:String]) throws ->[String:MLXArray] {
         // Published target bundle is already sanitized. Only its explicitly
