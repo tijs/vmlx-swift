@@ -1,6 +1,7 @@
 // Copyright © 2026. Apache-2.0.
 import MLX
 import MLXNN
+import MLXLMCommon
 
 /// Tokens in [lower, upper) use an affine table. The original BF16 rows
 /// for both outer ranges are concatenated in their original order.
@@ -14,7 +15,7 @@ struct InklingVocabularyRange: Decodable, Sendable, Equatable {
     }
 }
 
-final class InklingTieredEmbedding: QuantizedEmbedding {
+final class InklingTieredEmbedding: QuantizedEmbedding, ModelOwnedQuantizedModule {
     @ParameterInfo(key: "bf16_edges") var edges: MLXArray
     let range: InklingVocabularyRange
 
@@ -38,7 +39,7 @@ final class InklingTieredEmbedding: QuantizedEmbedding {
     }
 }
 
-final class InklingTieredHead: QuantizedLinear {
+final class InklingTieredHead: QuantizedLinear, ModelOwnedQuantizedModule {
     @ParameterInfo(key: "bf16_edges") var edges: MLXArray
     let range: InklingVocabularyRange
 

@@ -9,6 +9,10 @@ public protocol ThrowingWeightSanitizing {
     func sanitizeWeights(_ weights: [String: MLXArray], metadata: [String: String]) throws -> [String: MLXArray]
 }
 
+/// A checkpoint-specific quantized module that already declares its complete
+/// packed inventory. The generic loader updates its parameters in place.
+public protocol ModelOwnedQuantizedModule: AnyObject {}
+
 /// Allows a model to keep file-backed auxiliary tensors out of the generic
 /// MLX weight loader. The predicate is evaluated against safetensors header
 /// names before tensor mappings or dtype-alignment copies are created.
@@ -1166,6 +1170,7 @@ public func loadWeights(
 
         // Inline quantize with error logging instead of try! crash
         let updates = model.leafModules().flattened().compactMap { (path, m) -> (String, Module)? in
+            guard !(m is ModelOwnedQuantizedModule) else { return nil }
             let baseCandidates = quantizedWeightBaseCandidates(path)
             let matchedBase = baseCandidates.first {
                 weights["\($0).weight"] != nil && weights["\($0).scales"] != nil
