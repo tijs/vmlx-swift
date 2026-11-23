@@ -4,6 +4,28 @@ import XCTest
 @testable import MLXLLM
 
 final class InklingTieredVocabularyTests: XCTestCase {
+    func testShortContextHistoryTransitionsToLocalWindowAndCopiesOffset() {
+        Device.withDefaultDevice(.cpu) {
+            let cache = Inkling2VisitCache(window: 2, fullHistoryThrough: 4)
+            func update(_ cache: Inkling2VisitCache, _ positions: [Float]) -> [Float] {
+                let block = MLXArray(positions, [1, 1, positions.count, 1])
+                let (keys, values) = cache.update(keys: block, values: block)
+                XCTAssertEqual(keys.asArray(Float.self), values.asArray(Float.self))
+                return keys.asArray(Float.self)
+            }
+            XCTAssertEqual(update(cache, [1, 2, 3]), [1, 2, 3])
+            XCTAssertEqual(update(cache, [4]), [1, 2, 3, 4])
+            XCTAssertEqual(cache.state[0].dim(2), 4)
+            let copy = cache.copy() as! Inkling2VisitCache
+            for c in [cache, copy] {
+                XCTAssertEqual(update(c, [5, 6]), [1, 2, 3, 4, 5, 6])
+                XCTAssertEqual(c.state[0].asArray(Float.self), [5, 6])
+                XCTAssertEqual(update(c, [7]), [5, 6, 7])
+                XCTAssertEqual(c.offset, 7)
+            }
+        }
+    }
+
     func testRowsAtBothBoundariesAndAllLogits() throws {
         try Device.withDefaultDevice(.cpu) {
             let vocab = 160, width = 128

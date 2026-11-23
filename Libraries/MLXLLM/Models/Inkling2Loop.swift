@@ -166,15 +166,18 @@ public struct Inkling2LoopConfiguration: Decodable, Sendable {
 public final class Inkling2VisitCache: BaseKVCache {
     private var keys: MLXArray?, values: MLXArray?
     private let window: Int?
+    private let fullHistoryThrough: Int
 
     public override init() {
         self.window = nil
+        self.fullHistoryThrough = 0
         super.init()
     }
 
-    init(window: Int) {
-        precondition(window > 0)
+    init(window: Int, fullHistoryThrough: Int = 0) {
+        precondition(window > 0 && fullHistoryThrough >= 0)
         self.window = window
+        self.fullHistoryThrough = fullHistoryThrough
         super.init()
     }
 
@@ -188,7 +191,7 @@ public final class Inkling2VisitCache: BaseKVCache {
         let chunkKeys = keys.map { concatenated([$0, newKeys], axis: 2) } ?? newKeys
         let chunkValues = values.map { concatenated([$0, newValues], axis: 2) } ?? newValues
         offset += newKeys.dim(2)
-        if let window, chunkKeys.dim(2) > window {
+        if let window, offset > fullHistoryThrough, chunkKeys.dim(2) > window {
             let start = chunkKeys.dim(2) - window
             keys = contiguous(chunkKeys[0..., 0..., start..., 0...])
             values = contiguous(chunkValues[0..., 0..., start..., 0...])
@@ -218,7 +221,7 @@ public final class Inkling2VisitCache: BaseKVCache {
         set { if newValue.count == 2, newValue[0] == "inkling2-visit-v1", let n = Int(newValue[1]) { offset = n } }
     }
     override public func copy() -> any KVCache {
-        let c = window.map { Inkling2VisitCache(window: $0) } ?? Inkling2VisitCache()
+        let c = window.map { Inkling2VisitCache(window: $0, fullHistoryThrough: fullHistoryThrough) } ?? Inkling2VisitCache()
         c.keys = keys.map { $0 * 1 }; c.values = values.map { $0 * 1 }
         c.convolutions = convolutions.map { $0.map { $0 * 1 } }; c.offset = offset
         return c
@@ -657,14 +660,17 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
     public let configuration:Inkling2LoopConfiguration
     private let headProjectionCache = InklingHeadProjectionCache()
     private let boundedLocalKV = ProcessInfo.processInfo.environment["VMLX_INKLING_BOUNDED_LOCAL_KV"] != "0"
+    private let fullLocalHistoryThrough = max(0, Int(
+        ProcessInfo.processInfo.environment["VMLX_INKLING_LOCAL_KV_FULL_THROUGH"] ?? "0") ?? 0)
     @ModuleInfo(key:"language_model") var language:InklingLanguageModel
     public var preservesCheckpointParameterDTypes: Bool { true }
     public var vocabularySize:Int { configuration.text.unpaddedVocab }
     public var kvHeads:[Int] { configuration.text.schedule.map { configuration.text.sliding($0) ? configuration.text.localKVHeads:configuration.text.kvHeads } }
     public var loraLayers:[Module] { language.model.layers }
     public var cacheStorageDTypeIdentity: String? {
-        boundedLocalKV
-            ? "inkling2mini-window-\(configuration.text.window)-kv-four-fp32-conv-v1"
+        let prefix = fullLocalHistoryThrough > 0 ? "-full-through-\(fullLocalHistoryThrough)" : ""
+        return boundedLocalKV
+            ? "inkling2mini-window-\(configuration.text.window)\(prefix)-kv-four-fp32-conv-v1"
             : "inkling2mini-full-kv-four-fp32-conv-v1"
     }
     public var cacheComputationIdentity:String? { "inkling2mini-3pass-ar-float-activations-v1" }
@@ -708,7 +714,7 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
         let text = configuration.text
         return text.schedule.map { physical in
             if bounded && text.localLayers.contains(physical) {
-                return Inkling2VisitCache(window: text.window)
+                return Inkling2VisitCache(window: text.window, fullHistoryThrough: fullLocalHistoryThrough)
             }
             return Inkling2VisitCache()
         }
