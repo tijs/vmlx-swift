@@ -13,6 +13,52 @@ enum Inkling2InferenceKernels {
     static let fusedShortConvolutionEnabled =
         ProcessInfo.processInfo.environment["VMLX_INKLING_FUSED_SHORT_CONV"] == "1"
 
+    static let fusedMaskEnabled =
+        ProcessInfo.processInfo.environment["VMLX_INKLING_FUSED_MASK"] == "1"
+
+    // Keep the projection matmul intact. Map each query/key pair to its
+    // trained bias in one dispatch without materializing an index tensor.
+    private static let maskKernel = MLXFast.metalKernel(
+        name: "vmlx_inkling2_banded_mask",
+        inputNames: ["projected", "parameters"], outputNames: ["out"],
+        source: """
+            uint i = thread_position_in_grid.x;
+            int count = parameters[0], offset = parameters[1], window = parameters[2];
+            int n = projected_shape[2], heads = projected_shape[1];
+            int extent = projected_shape[3];
+            uint row = i / count;
+            uint batchHead = row / n;
+            if (batchHead >= uint(projected_shape[0] * heads)) return;
+            int q = row % n;
+            int distance = offset + q - int(i % count);
+            if (distance < 0 || (window > 0 && distance >= window)) {
+                out[i] = T(-1e30f);
+            } else if (distance >= extent) {
+                out[i] = T(0);
+            } else {
+                out[i] = projected[(batchHead / heads) * projected_strides[0]
+                    + (batchHead % heads) * projected_strides[1]
+                    + q * projected_strides[2] + distance * projected_strides[3]];
+            }
+            """, ensureRowContiguous: false)
+
+    static func bandedMask(
+        _ projected: MLXArray, count: Int, offset: Int, window: Int, extent: Int
+    ) -> MLXArray? {
+        // The shader uses 32-bit indices for the grid and the signed relative distance.
+        guard projected.ndim == 4, extent > 0, projected.dim(3) == extent,
+              count > 0, count <= Int(Int32.max),
+              (0...Int(Int32.max)).contains(window), offset >= 0,
+              offset <= Int(Int32.max) - projected.dim(2) else { return nil }
+        let rows = projected.size / extent
+        guard rows > 0, rows <= Int(Int32.max) / count else { return nil }
+        let shape = Array(projected.shape.prefix(3)) + [count]
+        return maskKernel(
+            [projected, MLXArray([Int32(count), Int32(offset), Int32(window)])],
+            template: [("T", projected.dtype)], grid: (rows * count, 1, 1),
+            threadGroup: (256, 1, 1), outputShapes: [shape], outputDTypes: [projected.dtype])[0]
+    }
+
     // Cmlx's custom-kernel CompileOptions default to MathMode::Safe, matching
     // the authored kernel's explicit math_mode=safe. Preserve tap order and
     // FP32 intermediates before the final cast to the input dtype.

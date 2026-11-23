@@ -423,6 +423,11 @@ final class InklingAttention: Module {
 func inklingBandedMask(relative: MLXArray, projection: MLXArray, offset: Int, count: Int, window: Int, extent: Int) -> MLXArray {
     let n=relative.dim(1), b=relative.dim(0), h=relative.dim(2)
     let projected=matmul(relative,projection).transposed(0,2,1,3)
+    if Inkling2InferenceKernels.fusedMaskEnabled, Device.defaultDevice().deviceType == .gpu,
+       let mask = Inkling2InferenceKernels.bandedMask(
+           projected, count: count, offset: offset, window: window, extent: extent) {
+        return mask.asType(relative.dtype)
+    }
     let qp=MLXArray(Int32(offset)..<Int32(offset+n)).expandedDimensions(axis:1)
     let kp=MLXArray(Int32(0)..<Int32(count)).expandedDimensions(axis:0)
     let distance=qp-kp
