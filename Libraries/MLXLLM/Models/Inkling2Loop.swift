@@ -126,7 +126,7 @@ public struct Inkling2LoopConfiguration: Decodable, Sendable {
         else { throw ContractError.invalid("unsupported or malformed fixed three-pass text topology") }
         for path in [Self.embeddingPath, Self.headPath] {
             if let q = qs.removeValue(forKey: path) {
-                guard q.mode == "affine", q.bits == 4, q.groupSize == 64, t.hidden % 64 == 0 else {
+                guard q.mode == "affine", [4, 6].contains(q.bits), q.groupSize == 64, t.hidden % 64 == 0 else {
                     throw ContractError.invalid("unsupported vocabulary quantization at \(path)")
                 }
             }
