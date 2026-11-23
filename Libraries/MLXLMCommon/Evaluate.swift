@@ -2074,6 +2074,11 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.model = model
         self.y = input.text
+        let visitModel = model as? any AlignedVisitPrefixModel
+        let visitCoordinator = cacheCoordinator?.config.useAlignedVisitSnapshots == true && visitModel != nil
+            ? cacheCoordinator : nil
+        // This cache stores whole visit states. Generic paged KV cannot represent those arrays.
+        let cacheCoordinator = visitCoordinator == nil ? cacheCoordinator : nil
         self.cacheCoordinator = cacheCoordinator
         // dSpark: attach the draft head BEFORE prefill, so the prefill runs with the head resident
         // (its chunk size accounts for it) and records the draft-window tail into the cache.
@@ -2621,6 +2626,32 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
+        var visitCapture: (CacheCoordinator.VisitPrefixKey, UInt64, LMInput, LMInput)?
+        var restoredVisitPrefix = false
+        if let visitCoordinator, let visitModel {
+            let length = visitModel.alignedVisitPrefixLength
+            let step = effectiveParameters.prefillStepSize
+            if [128, 256].contains(step), length.isMultiple(of: step),
+               promptTokenCount > length, promptTokenCount <= 4096,
+               input.cachePromptIntent == .generation, input.cacheRestorePolicy == .standard,
+               !input.hasMediaContent, input.text.mask == nil, !input.requiresPostPrepareCacheKey,
+               self.cache.count == 48, self.cache.allSatisfy({ $0.offset == 0 }),
+               let split = boundarySplit(of: input, at: length, inputStart: 0), let head = split.head {
+                let key = CacheCoordinator.VisitPrefixKey(tokens: Array(promptTokenIds.prefix(length)),
+                    step: step, salt: mediaSalt, model: visitModel.alignedVisitPrefixIdentity)
+                let (generation, entry) = visitCoordinator.beginVisitPrefix(key)
+                if let entry {
+                    self.cache = makePromptBoundaryCacheSnapshot(from: entry.cache)
+                    acceptedCacheRestoreDetail = .memory
+                    inputForPrepare = split.tail
+                    restoredVisitPrefix = true
+                } else {
+                    visitCapture = (key, generation, head, split.tail)
+                }
+            } else {
+                _ = visitCoordinator.beginVisitPrefix(nil)
+            }
+        }
         let remainingPromptUnits = Swift.max(0, inputForPrepare.text.tokens.size)
         let completedBeforePrefill = Swift.max(0, promptTokenCount - remainingPromptUnits)
         if RuntimeReceipts.isEnabled {
@@ -2726,9 +2757,18 @@ public struct TokenIterator: TokenIteratorProtocol {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
                 try CanonicalTextPrefillCheckpointReporter.withCapture(canonicalCapture) {
                     try PrefillProgressReporter.withHandler(modelPrepareProgressHandler) {
-                        try prepare(
-                            input: inputForPrepare,
-                            windowSize: effectiveParameters.prefillStepSize)
+                        if let (key, generation, head, tail) = visitCapture, let visitCoordinator {
+                            try prepareBoundaryHead(head, windowSize: key.step)
+                            try Task.checkCancellation()
+                            visitCoordinator.storeVisitPrefix(key, generation: generation, cache: self.cache)
+                            try prepareRemainder(input: tail, windowSize: key.step,
+                                                 promptTokensForProcessor: input.text.tokens)
+                        } else if restoredVisitPrefix {
+                            try prepareRemainder(input: inputForPrepare, windowSize: effectiveParameters.prefillStepSize,
+                                                 promptTokensForProcessor: input.text.tokens)
+                        } else {
+                            try prepare(input: inputForPrepare, windowSize: effectiveParameters.prefillStepSize)
+                        }
                     }
                 }
             }

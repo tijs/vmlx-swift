@@ -656,3 +656,9 @@ extension LanguageModel where Self: KVCacheDimensionProvider {
         }
     }
 }
+
+/// Models with qualified independent copies of all visit and convolution state at this boundary.
+public protocol AlignedVisitPrefixModel: AnyObject {
+    var alignedVisitPrefixIdentity: UUID { get }
+    var alignedVisitPrefixLength: Int { get }
+}

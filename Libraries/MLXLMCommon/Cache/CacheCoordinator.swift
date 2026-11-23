@@ -119,6 +119,45 @@ public final class CacheCoordinator: @unchecked Sendable {
 
     // MARK: - Properties
 
+    struct VisitPrefixKey: Equatable {
+        let tokens: [Int]
+        let step: Int
+        let salt: String?
+        let model: UUID
+    }
+
+    private let visitLock = NSLock()
+    private var visitEntry: (key: VisitPrefixKey, snapshot: RetainedPromptCacheSnapshot)?
+    private var visitGeneration: UInt64 = 0
+    private var visitHits = 0
+    private var visitMisses = 0
+
+    public var alignedVisitStats: (hits: Int, misses: Int)? {
+        guard initialConfig.useAlignedVisitSnapshots else { return nil }
+        return visitLock.withLock { (visitHits, visitMisses) }
+    }
+
+    // A lookup invalidates an in-flight store. Copies are evaluated outside the lock.
+    func beginVisitPrefix(_ key: VisitPrefixKey?) -> (UInt64, RetainedPromptCacheSnapshot?) {
+        visitLock.withLock {
+            visitGeneration &+= 1
+            if let key {
+                if visitEntry?.key == key { visitHits += 1 } else { visitMisses += 1 }
+            }
+            if visitEntry?.key != key { visitEntry = nil }
+            return (visitGeneration, visitEntry?.snapshot)
+        }
+    }
+
+    func storeVisitPrefix(_ key: VisitPrefixKey, generation: UInt64, cache: [KVCache]) {
+        guard cache.count == 48,
+              cache.allSatisfy({ $0.offset == key.tokens.count && $0.state.count == 6 }),
+              let snapshot = retainPromptSnapshot(from: cache, copy: true) else { return }
+        visitLock.withLock {
+            if visitGeneration == generation { visitEntry = (key, snapshot) }
+        }
+    }
+
     private let initialConfig: CacheCoordinatorConfig
 
     /// Creation settings with the current shared disk quota. A live size
@@ -649,9 +688,13 @@ public final class CacheCoordinator: @unchecked Sendable {
     func retainExactPromptSnapshot(from cache: [KVCache], copy: Bool = true) -> RetainedPromptCacheSnapshot? {
         guard canPersistBoundaries,
             diskCache != nil || !cacheCannotUsePagedCoordinatorRestore(cache)
-                || cacheCanUsePagedWithRotatingCompanion(cache),
-            promptSnapshotStoreAdmission(cache)
+                || cacheCanUsePagedWithRotatingCompanion(cache)
         else { return nil }
+        return retainPromptSnapshot(from: cache, copy: copy)
+    }
+
+    private func retainPromptSnapshot(from cache: [KVCache], copy: Bool) -> RetainedPromptCacheSnapshot? {
+        guard promptSnapshotStoreAdmission(cache) else { return nil }
         // Most copies compact `state`; innerState also covers occupied
         // recurrent slots not included in serialized state. Charge the larger
         // estimate, with the same per-buffer slack as the other retained tiers.
@@ -2308,6 +2351,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// must not delete the persistent L2 disk entries. Hosts rely on those
     /// entries to survive model eviction and app restarts for prefix reuse.
     public func releaseVolatile() {
+        if initialConfig.useAlignedVisitSnapshots { _ = beginVisitPrefix(nil) }
         pagedCache?.clear()
         ssmStateCache.clear()
         // The disk tier's resident payloads are RAM copies of files that stay on the SSD.

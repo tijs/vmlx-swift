@@ -645,6 +645,7 @@ private final class InklingHeadProjectionCache {
     var weight: MLXArray?
 }
 public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,ThrowingWeightSanitizing {
+    public let alignedVisitPrefixIdentity = UUID()
     public let configuration:Inkling2LoopConfiguration
     private let headProjectionCache = InklingHeadProjectionCache()
     private let boundedLocalKV = ProcessInfo.processInfo.environment["VMLX_INKLING_BOUNDED_LOCAL_KV"] != "0"
@@ -742,4 +743,8 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
         }
         return out
     }
+}
+
+extension Inkling2LoopModel: AlignedVisitPrefixModel {
+    public var alignedVisitPrefixLength: Int { 1024 }
 }

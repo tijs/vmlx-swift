@@ -32,6 +32,9 @@ public struct CacheCoordinatorConfig: Sendable {
     /// Whether the in-memory paged KV cache is enabled.
     public var usePagedCache: Bool
 
+    /// Keep one aligned recurrent prompt state instead of paged or disk KV.
+    public var useAlignedVisitSnapshots = false
+
     /// Whether the on-disk L2 cache (SQLite + safetensors) is enabled.
     public var enableDiskCache: Bool
 
