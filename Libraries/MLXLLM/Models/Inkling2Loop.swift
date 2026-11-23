@@ -78,12 +78,13 @@ public struct Inkling2LoopConfiguration: Decodable, Sendable {
     let text: Text
     static let embeddingPath = "language_model.model.embed_tokens"
     static let headPath = "language_model.lm_head"
+    let vocabularyRange: InklingVocabularyRange?
     let quantization: [String: Quant]
     public enum ContractError: Error, CustomStringConvertible {
         case invalid(String)
         public var description: String { switch self { case .invalid(let s): "inkling2_loop: \(s)" } }
     }
-    enum CodingKeys: String, CodingKey { case modelType = "model_type", text = "text_config", quantization }
+    enum CodingKeys: String, CodingKey { case modelType = "model_type", text = "text_config", quantization, vocabularyRange = "mei_affine_vocabulary_range" }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         modelType = try c.decode(String.self, forKey: .modelType)
@@ -100,6 +101,13 @@ public struct Inkling2LoopConfiguration: Decodable, Sendable {
             let q = try c.nestedContainer(keyedBy: Key.self, forKey: .quantization)
             for key in q.allKeys where !["group_size", "bits", "mode"].contains(key.stringValue) {
                 qs[key.stringValue] = try q.decode(Quant.self, forKey: key)
+            }
+        }
+        vocabularyRange = try c.decodeIfPresent(InklingVocabularyRange.self, forKey: .vocabularyRange)
+        if let range = vocabularyRange {
+            guard range.validate(vocabularySize: text.vocab), qs[Self.embeddingPath] != nil,
+                  qs[Self.headPath] != nil else {
+                throw ContractError.invalid("invalid split vocabulary range or missing quantization descriptor")
             }
         }
         quantization = qs
@@ -585,7 +593,10 @@ final class InklingTextModel:Module {
     let t:Inkling2LoopConfiguration.Text
     init(_ c:Inkling2LoopConfiguration) {
         t = c.text
-        if let q = c.quantization[Inkling2LoopConfiguration.embeddingPath] {
+        if let range = c.vocabularyRange, let q = c.quantization[Inkling2LoopConfiguration.embeddingPath] {
+            _embed.wrappedValue = InklingTieredEmbedding(vocab: t.vocab, hidden: t.hidden, range: range,
+                                                         group: q.groupSize, bits: q.bits)
+        } else if let q = c.quantization[Inkling2LoopConfiguration.embeddingPath] {
             _embed.wrappedValue = QuantizedEmbedding(
                 weight: .zeros([t.vocab, t.hidden * q.bits / 32], dtype: .uint32),
                 scales: .zeros([t.vocab, t.hidden / q.groupSize], dtype: .bfloat16),
@@ -623,7 +634,10 @@ final class InklingLanguageModel:Module {
     @ModuleInfo(key:"lm_head") var head:Linear
     init(_ c:Inkling2LoopConfiguration) {
         _model.wrappedValue = InklingTextModel(c)
-        if let q = c.quantization[Inkling2LoopConfiguration.headPath] {
+        if let range = c.vocabularyRange, let q = c.quantization[Inkling2LoopConfiguration.headPath] {
+            _head.wrappedValue = InklingTieredHead(vocab: c.text.vocab, hidden: c.text.hidden, range: range,
+                                                   group: q.groupSize, bits: q.bits)
+        } else if let q = c.quantization[Inkling2LoopConfiguration.headPath] {
             let t = c.text
             _head.wrappedValue = QuantizedLinear(
                 weight: .zeros([t.vocab, t.hidden * q.bits / 32], dtype: .uint32),
@@ -714,7 +728,7 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
             } else {
                 guard value.dtype.isFloatingPoint else { throw Inkling2LoopConfiguration.ContractError.invalid("floating dtype required at \(key)") }
                 if [Inkling2LoopConfiguration.headPath, Inkling2LoopConfiguration.embeddingPath].contains(where: {
-                    key == $0 + ".scales" || key == $0 + ".biases"
+                    key == $0 + ".scales" || key == $0 + ".biases" || key == $0 + ".bf16_edges"
                 }) {
                     guard value.dtype == .bfloat16 else {
                         throw Inkling2LoopConfiguration.ContractError.invalid("expected BF16 affine metadata at \(key)")
