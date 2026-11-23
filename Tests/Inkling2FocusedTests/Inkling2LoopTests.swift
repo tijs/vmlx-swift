@@ -61,6 +61,40 @@ final class Inkling2LoopTests: XCTestCase {
             }
         }
     }
+    func testMixedVocabularySurvivesProductionWeightLoading() throws {
+        try Device.withDefaultDevice(.cpu) {
+            var root = try XCTUnwrap(JSONSerialization.jsonObject(with: configurationData()) as? [String: Any])
+            var text = try XCTUnwrap(root["text_config"] as? [String: Any])
+            text["hidden_size"] = 64
+            text["vocab_size"] = 160
+            text["unpadded_vocab_size"] = 159
+            root["text_config"] = text
+            root["mei_affine_vocabulary_range"] = ["lower": 32, "upper": 128]
+            let descriptor: [String: Any] = ["mode": "affine", "bits": 4, "group_size": 64]
+            root["quantization"] = [Inkling2LoopConfiguration.embeddingPath: descriptor,
+                                    Inkling2LoopConfiguration.headPath: descriptor]
+            let data = try JSONSerialization.data(withJSONObject: root)
+            let config = try JSONDecoder().decode(Inkling2LoopConfiguration.self, from: data)
+            let original = Inkling2LoopModel(config)
+            var weights = Dictionary(uniqueKeysWithValues: original.parameters().flattened())
+            for path in [Inkling2LoopConfiguration.embeddingPath, Inkling2LoopConfiguration.headPath] {
+                weights[path + ".bf16_edges"] = MLXArray.ones([64, 64], dtype: .bfloat16)
+            }
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            try data.write(to: directory.appendingPathComponent("config.json"))
+            try MLX.save(arrays: weights, url: directory.appendingPathComponent("model.safetensors"))
+            let loaded = Inkling2LoopModel(config)
+            try loadWeights(modelDirectory: directory, model: loaded,
+                            quantization: .init(groupSize: 64, bits: 4, mode: .affine))
+            XCTAssertTrue(loaded.language.model.embed is InklingTieredEmbedding)
+            XCTAssertTrue(loaded.language.head is InklingTieredHead)
+            let values = loaded.language.model.embed(MLXArray([Int32(0), 159]))
+            XCTAssertTrue(all(values .== 1).item(Bool.self))
+        }
+    }
+
     func testScheduleAndRejectMalformedLoop() throws {
         let c=try config()
         XCTAssertEqual(c.text.schedule,[0,1,2,1,2,1,2,3])
