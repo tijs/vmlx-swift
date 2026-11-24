@@ -237,6 +237,9 @@ private let inklingCompiledRawResidual = vmlxTrustedCompile { arrays in
     [inklingAttentionResidualEager(arrays[0], query: arrays[1], normalizeValues: false)]
 }
 func inklingAttentionResidual(_ states: MLXArray, query: MLXArray, normalizeValues: Bool) -> MLXArray {
+    if let mixed = Inkling2InferenceKernels.depthMix(states, query, normalized: normalizeValues) {
+        return mixed
+    }
     if inklingCompileResidual && Device.defaultDevice().deviceType == .gpu {
         return (normalizeValues ? inklingCompiledNormalizedResidual : inklingCompiledRawResidual)([states, query])[0]
     }

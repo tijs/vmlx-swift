@@ -59,6 +59,81 @@ enum Inkling2InferenceKernels {
             threadGroup: (256, 1, 1), outputShapes: [shape], outputDTypes: [projected.dtype])[0]
     }
 
+    private static let depthMixEnabled = ProcessInfo.processInfo.environment["VMLX_INKLING_DEPTH_MIX"] == "1"
+
+    // One group per depth state. All learned queries share its squared norm
+    // and the same state reads. The number of queries is a small model constant.
+    private static let depthScore = MLXFast.metalKernel(
+        name: "mei_inkling_depth_scores",
+        inputNames: ["states", "queries"], outputNames: ["scores", "norms"],
+        source: """
+            uint lane = thread_position_in_threadgroup.x;
+            uint row = threadgroup_position_in_grid.x;
+            float sums[Q + 1] = {};
+            for (uint i = lane; i < H; i += 256) {
+                float x = float(states[row * H + i]);
+                sums[Q] += x * x;
+                for (uint q = 0; q < Q; q++) {
+                    sums[q] += x * float(queries[q * H + i]);
+                }
+            }
+            threadgroup float scratch[(Q + 1) * 8];
+            for (uint q = 0; q <= Q; q++) {
+                float sum = simd_sum(sums[q]);
+                if (lane % 32 == 0) scratch[q * 8 + lane / 32] = sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane < 32) {
+                float norm = simd_sum(lane < 8 ? scratch[Q * 8 + lane] : 0.0f);
+                float inverse = rsqrt(norm / float(H) + 1e-6f);
+                if (lane == 0) norms[row] = inverse;
+                for (uint q = 0; q < Q; q++) {
+                    float value = simd_sum(lane < 8 ? scratch[q * 8 + lane] : 0.0f);
+                    if (lane == 0) scores[row * Q + q] = value * inverse * rsqrt(float(H));
+                }
+            }
+            """)
+
+    private static let depthMerge = MLXFast.metalKernel(
+        name: "mei_inkling_depth_merge",
+        inputNames: ["states", "scores", "norms"], outputNames: ["out"],
+        source: """
+            uint x = thread_position_in_grid.x;
+            uint q = threadgroup_position_in_grid.y;
+            uint lane = thread_position_in_threadgroup.x;
+            threadgroup float factors[32];
+            if (lane < 32) {
+                float score = lane < S ? scores[lane * Q + q] : -INFINITY;
+                float maximum = simd_max(score);
+                float weight = exp(score - maximum);
+                float total = simd_sum(weight);
+                if (lane < S) factors[lane] = weight / total * (NORMALIZED ? norms[lane] : 1.0f);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float sum = 0;
+            for (uint i = 0; i < S; i++) sum += float(states[i * H + x]) * factors[i];
+            out[q * H + x] = sum;
+            """)
+
+    static func depthMix(_ states: MLXArray, _ query: MLXArray, normalized: Bool) -> MLXArray? {
+        guard depthMixEnabled, Device.defaultDevice().deviceType == .gpu,
+              states.ndim == 4, states.dim(0) == 1, states.dim(1) == 1,
+              (1...32).contains(states.dim(2)), states.dim(3) == 2304 else { return nil }
+        let width = states.dim(3)
+        let depth = states.dim(2)
+        let queries = query.size / width
+        guard [1, 3, 4].contains(queries), query.size == width * queries else { return nil }
+        let partial = depthScore(
+            [states, query], template: [("H", width), ("Q", queries)],
+            grid: (256 * depth, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[depth, queries], [depth]], outputDTypes: [.float32, .float32])
+        return depthMerge(
+            [states, partial[0], partial[1]],
+            template: [("H", width), ("Q", queries), ("S", depth), ("NORMALIZED", normalized ? 1 : 0)],
+            grid: (width, queries, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 1, queries, width]], outputDTypes: [.float32])[0]
+    }
+
     // Cmlx's custom-kernel CompileOptions default to MathMode::Safe, matching
     // the authored kernel's explicit math_mode=safe. Preserve tap order and
     // FP32 intermediates before the final cast to the input dtype.
