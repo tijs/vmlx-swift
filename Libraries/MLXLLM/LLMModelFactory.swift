@@ -2457,6 +2457,8 @@ public final class LLMModelFactory: ModelFactory {
             loadPreservedMTP: loadNativeMTP,
             bonsaiTransform: bonsaiPlan)
 
+        (model as? Inkling2LoopModel)?.prepareAttentionWeightsForInference()
+
         let tokenizer = try await tokenizerTask
 
         let messageGenerator =

@@ -686,6 +686,22 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
         if cap>0 { logits=tanh(logits/cap)*cap }
         return logits[.ellipsis,0..<vocabularySize]
     }
+    /// Convert only fully loaded attention projections in the vocabulary-Q4 profile.
+    func prepareAttentionWeightsForInference() {
+        guard ProcessInfo.processInfo.environment["VMLX_INKLING_ATTENTION_BITS"] == "8",
+              configuration.text.hidden == 2304,
+              configuration.quantization[Inkling2LoopConfiguration.embeddingPath]?.bits == 4,
+              configuration.quantization[Inkling2LoopConfiguration.headPath]?.bits == 4 else { return }
+        let projections: Set<String> = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"]
+        for layer in language.model.layers {
+            quantize(model: layer.attention, groupSize: 64, bits: 8, mode: .affine, filter: { name, module in
+                guard let linear = module as? Linear, !(linear is QuantizedLinear) else { return false }
+                return projections.contains(name) && linear.weight.dtype == .bfloat16
+            })
+        }
+        MLX.eval(self)
+    }
+
     @discardableResult
     public override func update(parameters: ModuleParameters, verify: Module.VerifyUpdate,
                                 path: [String] = [], modulePath: [String] = []) throws -> Self {
