@@ -87,6 +87,41 @@ final class Inkling2LoopTests: XCTestCase {
         }
     }
 
+    func testIndexedVisitStorageMatchesFullAndWindowedHistoryAcrossReallocationAndRestore() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = Inkling2LoopModel(try config())
+            let indexed = model.makeVisitCaches(bounded: true, indexedHistory: true)
+            let ordinary = model.makeVisitCaches(bounded: true)
+            for (fast, reference) in zip(indexed.prefix(2), ordinary.prefix(2)) {
+                let cache = try XCTUnwrap(fast as? Inkling2VisitCache)
+                let baseline = try XCTUnwrap(reference as? Inkling2VisitCache)
+                for index in 0..<4 {
+                    cache.convolutions[index] = MLXArray(index)
+                    baseline.convolutions[index] = MLXArray(index)
+                }
+                func append(_ start: Int, _ count: Int, _ dst: Inkling2VisitCache) -> [[Int32]] {
+                    let keys = MLXArray((start..<(start + count)).map(Int32.init), [1, 1, count, 1])
+                    let (k, v) = dst.update(keys: keys, values: keys + 5)
+                    return [k.asArray(Int32.self), v.asArray(Int32.self)]
+                }
+                var offset = 0
+                for count in [127, 1, 1, 128, 1] {
+                    XCTAssertEqual(append(offset, count, cache), append(offset, count, baseline))
+                    offset += count
+                    XCTAssertEqual(cache.offset, offset)
+                }
+                let branch = try XCTUnwrap(cache.copy() as? Inkling2VisitCache)
+                let expected = append(offset, 1, baseline)
+                XCTAssertEqual(append(offset, 1, branch), expected)
+                let state = cache.state, meta = cache.metaState
+                _ = append(offset, 3, cache)
+                cache.state = state
+                cache.metaState = meta
+                XCTAssertEqual(append(offset, 1, cache), expected)
+            }
+        }
+    }
+
     func testCacheCopiesAllCompanionStatesAndCannotTrim() throws {
         Device.withDefaultDevice(.cpu) {
             let c=Inkling2VisitCache()

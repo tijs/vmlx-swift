@@ -160,6 +160,10 @@ public final class Inkling2VisitCache: BaseKVCache {
     private let window: Int?
     // A copied prefix keeps the arithmetic selected for its prefill step.
     fileprivate(set) var sharedDepth = false
+    fileprivate var indexedHistory = false
+    private var backingKeys: MLXArray?
+    private var backingValues: MLXArray?
+    private var writeIndex = 0
 
     public override init() {
         self.window = nil
@@ -179,6 +183,34 @@ public final class Inkling2VisitCache: BaseKVCache {
         [keys, values].compactMap { $0 } + convolutions.compactMap { $0 }
     }
     override public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+        if indexedHistory {
+            let saved = keys?.dim(2) ?? 0
+            let incoming = newKeys.dim(2)
+            if backingKeys == nil || writeIndex + incoming > (backingKeys?.dim(2) ?? 0) {
+                let capacity = ((saved + incoming + 127) / 128) * 128
+                func extend(_ history: MLXArray?, like new: MLXArray) -> MLXArray {
+                    var shape = new.shape
+                    shape[2] = capacity - saved
+                    let extra = MLXArray.zeros(shape, dtype: new.dtype)
+                    return history.map { concatenated([$0, extra], axis: 2) } ?? extra
+                }
+                backingKeys = extend(keys, like: newKeys)
+                backingValues = extend(values, like: newValues)
+                writeIndex = saved
+            }
+            let start = writeIndex - saved
+            let end = writeIndex + incoming
+            backingKeys![.ellipsis, writeIndex..<end, 0...] = newKeys
+            backingValues![.ellipsis, writeIndex..<end, 0...] = newValues
+            let chunkKeys = backingKeys![.ellipsis, start..<end, 0...]
+            let chunkValues = backingValues![.ellipsis, start..<end, 0...]
+            let retained = window.map { max(start, end - $0) } ?? start
+            keys = backingKeys![.ellipsis, retained..<end, 0...]
+            values = backingValues![.ellipsis, retained..<end, 0...]
+            writeIndex = end
+            offset += incoming
+            return (chunkKeys, chunkValues)
+        }
         let chunkKeys = keys.map { concatenated([$0, newKeys], axis: 2) } ?? newKeys
         let chunkValues = values.map { concatenated([$0, newValues], axis: 2) } ?? newValues
         offset += newKeys.dim(2)
@@ -199,6 +231,11 @@ public final class Inkling2VisitCache: BaseKVCache {
         set {
             // State setters are used by scheduler-owned copy/update, never
             // advertised as a standalone serialized restore contract.
+            if newValue.isEmpty || newValue.count == 6 {
+                backingKeys = nil
+                backingValues = nil
+                writeIndex = 0
+            }
             if newValue.isEmpty { keys = nil; values = nil; convolutions = Array(repeating: nil, count: 4); offset = 0 }
             else if newValue.count == 6 {
                 keys = newValue[0]; values = newValue[1]
@@ -213,6 +250,7 @@ public final class Inkling2VisitCache: BaseKVCache {
     }
     override public func copy() -> any KVCache {
         let c = window.map { Inkling2VisitCache(window: $0) } ?? Inkling2VisitCache()
+        c.indexedHistory = indexedHistory
         c.sharedDepth = sharedDepth
         c.keys = keys.map { $0 * 1 }; c.values = values.map { $0 * 1 }
         c.convolutions = convolutions.map { $0.map { $0 * 1 } }; c.offset = offset
@@ -716,8 +754,13 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
         return try super.update(parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
     public func newCache(parameters:GenerateParameters?)->[KVCache] {
+        newCache(parameters: parameters, indexedHistory: false)
+    }
+
+    /// Allocate visit-local history in blocks when the caller selects long generation.
+    public func newCache(parameters: GenerateParameters?, indexedHistory: Bool) -> [KVCache] {
         let sharedDepth = Self.useSharedDepth(policy: Self.depthPolicy, step: parameters?.prefillStepSize)
-        return makeVisitCaches(bounded: boundedLocalKV, sharedDepth: sharedDepth)
+        return makeVisitCaches(bounded: boundedLocalKV, sharedDepth: sharedDepth, indexedHistory: indexedHistory)
     }
 
     private static let depthPolicy = ProcessInfo.processInfo.environment["VMLX_INKLING_DEPTH_MIX"]
@@ -726,11 +769,12 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
         policy == "1" || (policy == "step256" && step == 256)
     }
 
-    func makeVisitCaches(bounded: Bool, sharedDepth: Bool = false) -> [KVCache] {
+    func makeVisitCaches(bounded: Bool, sharedDepth: Bool = false, indexedHistory: Bool = false) -> [KVCache] {
         let text = configuration.text
         return text.schedule.map { physical in
             let cache = bounded && text.localLayers.contains(physical)
                 ? Inkling2VisitCache(window: text.window) : Inkling2VisitCache()
+            cache.indexedHistory = indexedHistory
             cache.sharedDepth = sharedDepth
             return cache
         }
