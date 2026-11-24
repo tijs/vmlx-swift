@@ -158,6 +158,8 @@ public struct Inkling2LoopConfiguration: Decodable, Sendable {
 public final class Inkling2VisitCache: BaseKVCache {
     private var keys: MLXArray?, values: MLXArray?
     private let window: Int?
+    // A copied prefix keeps the arithmetic selected for its prefill step.
+    fileprivate(set) var sharedDepth = false
 
     public override init() {
         self.window = nil
@@ -211,6 +213,7 @@ public final class Inkling2VisitCache: BaseKVCache {
     }
     override public func copy() -> any KVCache {
         let c = window.map { Inkling2VisitCache(window: $0) } ?? Inkling2VisitCache()
+        c.sharedDepth = sharedDepth
         c.keys = keys.map { $0 * 1 }; c.values = values.map { $0 * 1 }
         c.convolutions = convolutions.map { $0.map { $0 * 1 } }; c.offset = offset
         return c
@@ -236,8 +239,8 @@ private let inklingCompiledNormalizedResidual = vmlxTrustedCompile { arrays in
 private let inklingCompiledRawResidual = vmlxTrustedCompile { arrays in
     [inklingAttentionResidualEager(arrays[0], query: arrays[1], normalizeValues: false)]
 }
-func inklingAttentionResidual(_ states: MLXArray, query: MLXArray, normalizeValues: Bool) -> MLXArray {
-    if let mixed = Inkling2InferenceKernels.depthMix(states, query, normalized: normalizeValues) {
+func inklingAttentionResidual(_ states: MLXArray, query: MLXArray, normalizeValues: Bool, sharedDepth: Bool = false) -> MLXArray {
+    if sharedDepth, let mixed = Inkling2InferenceKernels.depthMix(states, query, normalized: normalizeValues) {
         return mixed
     }
     if inklingCompileResidual && Device.defaultDevice().deviceType == .gpu {
@@ -258,8 +261,8 @@ final class InklingAttentionResidual: Module {
         _query.wrappedValue = .zeros(queries == 1 ? [t.hidden] : [queries, t.hidden])
         super.init()
     }
-    func callAsFunction(_ blocks: [MLXArray], _ partial: MLXArray) -> MLXArray {
-        inklingAttentionResidual(stacked(blocks + [partial], axis: -2), query: query, normalizeValues: normalizeValues)
+    func callAsFunction(_ blocks: [MLXArray], _ partial: MLXArray, sharedDepth: Bool = false) -> MLXArray {
+        inklingAttentionResidual(stacked(blocks + [partial], axis: -2), query: query, normalizeValues: normalizeValues, sharedDepth: sharedDepth)
     }
 }
 
@@ -291,8 +294,8 @@ final class InklingMessageAttention: Module {
         _query.wrappedValue = .zeros([t.loop.coreEnd - t.loop.coreStart, 4, t.hidden])
         super.init()
     }
-    func callAsFunction(_ blocks: [MLXArray], _ partial: MLXArray, layer: Int) -> MLXArray {
-        inklingAttentionResidual(stacked(blocks + [partial], axis: -2), query: query[layer], normalizeValues: true)
+    func callAsFunction(_ blocks: [MLXArray], _ partial: MLXArray, layer: Int, sharedDepth: Bool = false) -> MLXArray {
+        inklingAttentionResidual(stacked(blocks + [partial], axis: -2), query: query[layer], normalizeValues: true, sharedDepth: sharedDepth)
     }
 }
 
@@ -568,7 +571,7 @@ final class InklingDecoderLayer:Module {
         super.init()
     }
     func callAsFunction(_ x:MLXArray,blocks:inout [MLXArray],cache:Inkling2VisitCache?,messages:MLXArray?)->MLXArray {
-        let mixed=attentionInput?(blocks,x) ?? x.expandedDimensions(axis:-2)
+        let mixed=attentionInput?(blocks,x,sharedDepth: cache?.sharedDepth ?? false) ?? x.expandedDimensions(axis:-2)
         var parts=(0..<3).map { mixed[.ellipsis,min($0,mixed.dim(-2)-1),0...] }
         if let messages {
             parts=zip(parts,[qMessage!,kMessage!,vMessage!]).enumerated().map { i,pair in pair.1(pair.0,messages[.ellipsis,i,0...]) }
@@ -577,7 +580,7 @@ final class InklingDecoderLayer:Module {
         let a=attention(normalized[0],keyInput:normalized[1],valueInput:normalized[2],cache:cache)
         var residual=attnConv(a,cache).asType(.float32)
         if boundary { blocks.append(x) } else { residual=residual+x.asType(.float32) }
-        var h=mlpInput(blocks,residual)[.ellipsis,0,0...]
+        var h=mlpInput(blocks,residual,sharedDepth: cache?.sharedDepth ?? false)[.ellipsis,0,0...]
         if let messages { h=mlpMessage!(h,messages[.ellipsis,3,0...]) }
         h=mlp(postNorm(h).asType(x.dtype))
         return (residual+mlpConv(h,cache).asType(.float32)).asType(x.dtype)
@@ -608,6 +611,7 @@ final class InklingTextModel:Module {
         _messageInput.wrappedValue=InklingMessageAttention(t);super.init()
     }
     func callAsFunction(_ input:MLXArray,cache:[KVCache]?)->MLXArray {
+        let sharedDepth = (cache?.first as? Inkling2VisitCache)?.sharedDepth ?? false
         var x=embedNorm(embed(input)),blocks:[MLXArray]=[]
         var preLoop:(MLXArray,[MLXArray])?,previous:([MLXArray],MLXArray)?
         for (visit,physical) in t.schedule.enumerated() {
@@ -619,11 +623,11 @@ final class InklingTextModel:Module {
             }
             let messages:MLXArray?
             if let previous, physical<t.loop.coreEnd {
-                messages=messageInput(previous.0,previous.1,layer:physical-t.loop.coreStart)
+                messages=messageInput(previous.0,previous.1,layer:physical-t.loop.coreStart,sharedDepth:sharedDepth)
             } else { messages=nil }
             x=layers[physical](x,blocks:&blocks,cache:cache?[visit] as? Inkling2VisitCache,messages:messages)
         }
-        return norm(finalInput(blocks,x)[.ellipsis,0,0...]).asType(embedNorm.weight.dtype)
+        return norm(finalInput(blocks,x,sharedDepth:sharedDepth)[.ellipsis,0,0...]).asType(embedNorm.weight.dtype)
     }
 }
 final class InklingLanguageModel:Module {
@@ -712,16 +716,23 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
         return try super.update(parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
     public func newCache(parameters:GenerateParameters?)->[KVCache] {
-        makeVisitCaches(bounded: boundedLocalKV)
+        let sharedDepth = Self.useSharedDepth(policy: Self.depthPolicy, step: parameters?.prefillStepSize)
+        return makeVisitCaches(bounded: boundedLocalKV, sharedDepth: sharedDepth)
     }
 
-    func makeVisitCaches(bounded: Bool) -> [KVCache] {
+    private static let depthPolicy = ProcessInfo.processInfo.environment["VMLX_INKLING_DEPTH_MIX"]
+
+    static func useSharedDepth(policy: String?, step: Int?) -> Bool {
+        policy == "1" || (policy == "step256" && step == 256)
+    }
+
+    func makeVisitCaches(bounded: Bool, sharedDepth: Bool = false) -> [KVCache] {
         let text = configuration.text
         return text.schedule.map { physical in
-            if bounded && text.localLayers.contains(physical) {
-                return Inkling2VisitCache(window: text.window)
-            }
-            return Inkling2VisitCache()
+            let cache = bounded && text.localLayers.contains(physical)
+                ? Inkling2VisitCache(window: text.window) : Inkling2VisitCache()
+            cache.sharedDepth = sharedDepth
+            return cache
         }
     }
     public func sanitizeWeights(_ weights:[String:MLXArray],metadata:[String:String]) throws ->[String:MLXArray] {

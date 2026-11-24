@@ -59,7 +59,6 @@ enum Inkling2InferenceKernels {
             threadGroup: (256, 1, 1), outputShapes: [shape], outputDTypes: [projected.dtype])[0]
     }
 
-    private static let depthMixEnabled = ProcessInfo.processInfo.environment["VMLX_INKLING_DEPTH_MIX"] == "1"
 
     // One group per depth state. All learned queries share its squared norm
     // and the same state reads. The number of queries is a small model constant.
@@ -116,7 +115,7 @@ enum Inkling2InferenceKernels {
             """)
 
     static func depthMix(_ states: MLXArray, _ query: MLXArray, normalized: Bool) -> MLXArray? {
-        guard depthMixEnabled, Device.defaultDevice().deviceType == .gpu,
+        guard Device.defaultDevice().deviceType == .gpu,
               states.ndim == 4, states.dim(0) == 1, states.dim(1) == 1,
               (1...32).contains(states.dim(2)), states.dim(3) == 2304 else { return nil }
         let width = states.dim(3)

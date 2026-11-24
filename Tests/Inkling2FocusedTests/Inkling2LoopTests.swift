@@ -72,6 +72,21 @@ final class Inkling2LoopTests: XCTestCase {
             XCTAssertThrowsError(try JSONDecoder().decode(Inkling2LoopConfiguration.self,from:JSONSerialization.data(withJSONObject:root)))
         }
     }
+    func testSharedDepthFollowsRequestStepAndSurvivesPrefixCopy() throws {
+        XCTAssertTrue(Inkling2LoopModel.useSharedDepth(policy: "step256", step: 256))
+        XCTAssertFalse(Inkling2LoopModel.useSharedDepth(policy: "step256", step: 128))
+        XCTAssertFalse(Inkling2LoopModel.useSharedDepth(policy: "step256", step: nil))
+        XCTAssertTrue(Inkling2LoopModel.useSharedDepth(policy: "1", step: 128))
+        XCTAssertFalse(Inkling2LoopModel.useSharedDepth(policy: "0", step: 256))
+        let model = Inkling2LoopModel(try config())
+        for enabled in [true, false] {
+            for visit in model.makeVisitCaches(bounded: true, sharedDepth: enabled) {
+                let copy = try XCTUnwrap(visit.copy() as? Inkling2VisitCache)
+                XCTAssertEqual(copy.sharedDepth, enabled)
+            }
+        }
+    }
+
     func testCacheCopiesAllCompanionStatesAndCannotTrim() throws {
         Device.withDefaultDevice(.cpu) {
             let c=Inkling2VisitCache()
