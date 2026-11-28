@@ -1503,6 +1503,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var nativeMTPStats: NativeMTPGenerationStats? { get }
     var dflash2GenerationStats: DFlash2GenerationStats? { get }
     var generationFailure: GenerationFailure? { get }
+    var activeKVSpillUsage: ActiveKVSpillUsage? { get }
     var structuredOutputComplete: Bool? { get }
     /// CPU-only end-of-generation bookkeeping needed to BUILD the completion
     /// info (e.g. the native-MTP stats snapshot). Split from
@@ -1531,6 +1532,7 @@ extension TokenIteratorProtocol {
     public var nativeMTPStats: NativeMTPGenerationStats? { nil }
     public var dflash2GenerationStats: DFlash2GenerationStats? { nil }
     public var generationFailure: GenerationFailure? { nil }
+    public var activeKVSpillUsage: ActiveKVSpillUsage? { nil }
     public var structuredOutputComplete: Bool? { nil }
 
     public mutating func finalizeGenerationStats(generatedTokenIds: [Int]) {}
@@ -1812,6 +1814,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
     var cache: [KVCache]
     public private(set) var generationFailure: GenerationFailure? = nil
+    private var activeKVSpillPrefillBytesRead: UInt64 = 0
+    public var activeKVSpillUsage: ActiveKVSpillUsage? {
+        ActiveKVSpillUsage.measure(cache: cache, prefillBytesRead: activeKVSpillPrefillBytesRead)
+    }
     public var structuredOutputComplete: Bool? {
         logitConstraintCompletion(processor)
     }
@@ -2068,17 +2074,28 @@ public struct TokenIterator: TokenIteratorProtocol {
         prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil,
         additionalProcessor: LogitProcessor? = nil,
         tokenizer: (any Tokenizer)? = nil,
-        stopTokenIDs: Set<Int> = []
+        stopTokenIDs: Set<Int> = [],
+        activeSpillPrefixCache: ActiveKVSpillPrefixCache? = nil
     ) throws {
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
         self.model = model
         self.y = input.text
+        let usesActiveSpill = cache?.contains {
+            ($0 as? any ActiveKVSpillCache)?.usesActiveKVSpill == true
+        } ?? false
+        if usesActiveSpill, input.hasMediaContent || parameters.draftStrategy != nil
+            || parameters.kvBits != nil || parameters.kvMode != .none {
+            throw GenerationFailure(
+                stage: .preparation,
+                cause: "Active SSD KV requires eager text generation with the model's native KV precision")
+        }
+        let reusableCoordinator = usesActiveSpill ? nil : cacheCoordinator
         let visitModel = model as? any AlignedVisitPrefixModel
-        let visitCoordinator = cacheCoordinator?.config.useAlignedVisitSnapshots == true && visitModel != nil
-            ? cacheCoordinator : nil
+        let visitCoordinator = reusableCoordinator?.config.useAlignedVisitSnapshots == true && visitModel != nil
+            ? reusableCoordinator : nil
         // This cache stores whole visit states. Generic paged KV cannot represent those arrays.
-        let cacheCoordinator = visitCoordinator == nil ? cacheCoordinator : nil
+        let cacheCoordinator = visitCoordinator == nil ? reusableCoordinator : nil
         self.cacheCoordinator = cacheCoordinator
         // dSpark: attach the draft head BEFORE prefill, so the prefill runs with the head resident
         // (its chunk size accounts for it) and records the draft-window tail into the cache.
@@ -2628,6 +2645,31 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         var visitCapture: (CacheCoordinator.VisitPrefixKey, UInt64, LMInput, LMInput)?
         var restoredVisitPrefix = false
+#if canImport(Darwin)
+        let spillPrefix = usesActiveSpill && input.cachePromptIntent == .generation
+            && input.cacheRestorePolicy == .standard && !input.hasMediaContent
+            && input.text.mask == nil && !input.requiresPostPrepareCacheKey ? activeSpillPrefixCache : nil
+        let spillStep = effectiveParameters.prefillStepSize
+        let spillBoundary = spillStep > 0 ? promptTokenCount - promptTokenCount % spillStep : 0
+        if let spillPrefix {
+            let matched = spillPrefix.matchingTokenCount(
+                model: model, tokens: promptTokenIds,
+                step: spillStep, salt: mediaSalt)
+            if matched > 0,
+               let split = boundarySplit(of: input, at: matched, inputStart: 0),
+               let restored = spillPrefix.restore(into: self.cache) {
+                self.cache = restored
+                inputForPrepare = split.tail
+                acceptedCacheRestoreDetail = .disk
+                restoredVisitPrefix = true
+            }
+            // Keep a compatible checkpoint when this request adds only part
+            // of a chunk. Drop it before capturing any later boundary.
+            if !restoredVisitPrefix || matched < spillBoundary {
+                spillPrefix.discard()
+            }
+        }
+#endif
         if let visitCoordinator, let visitModel {
             let length = visitModel.alignedVisitPrefixLength
             let step = effectiveParameters.prefillStepSize
@@ -2757,6 +2799,17 @@ public struct TokenIterator: TokenIteratorProtocol {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
                 try CanonicalTextPrefillCheckpointReporter.withCapture(canonicalCapture) {
                     try PrefillProgressReporter.withHandler(modelPrepareProgressHandler) {
+#if canImport(Darwin)
+                        if let spillPrefix, spillBoundary > completedBeforePrefill,
+                           let split = boundarySplit(of: inputForPrepare, at: spillBoundary),
+                           let head = split.head {
+                            try prepareBoundaryHead(head, windowSize: spillStep)
+                            try captureActiveSpillPrefix(spillPrefix, tokenCount: spillBoundary, step: spillStep)
+                            try prepareRemainder(input: split.tail, windowSize: spillStep,
+                                                 promptTokensForProcessor: input.text.tokens)
+                            return
+                        }
+#endif
                         if let (key, generation, head, tail) = visitCapture, let visitCoordinator {
                             try prepareBoundaryHead(head, windowSize: key.step)
                             try Task.checkCancellation()
@@ -2773,6 +2826,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
         }
+#if canImport(Darwin)
+        if let spillPrefix, spillBoundary == promptTokenCount {
+            try captureActiveSpillPrefix(spillPrefix, tokenCount: spillBoundary, step: spillStep)
+        }
+#endif
         if canonicalCapture?.snapshot != nil {
             try Task.checkCancellation()
             self.canonicalStablePrefillCapture = canonicalCapture
@@ -2782,6 +2840,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             completedUnitCount: promptTokenCount,
             totalUnitCount: promptTokenCount,
             detail: "decode_ready"))
+        if usesActiveSpill {
+            activeKVSpillPrefillBytesRead = activeKVSpillUsage?.bytesRead ?? 0
+        }
         MemoryStageTrace.log("prefill-complete", tokens: promptTokenCount)
         // The prefill-captured N-1 state is the only prompt checkpoint an
         // exact DSV4 replay can consume safely. Keep one retained snapshot,
@@ -2813,7 +2874,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             "prompt-snapshot", tokens: promptTokenCount,
             detail: promptCacheSnapshot == nil ? "none" : "retained")
 
-        if effectiveParameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model) {
+        if !usesActiveSpill, effectiveParameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model) {
             // The Compilable caches are FIXED-size buffers with no overflow
             // path — a run that outgrows them would clamp writes silently.
             // The iterator knows the whole run's extent here, so size the
@@ -3481,13 +3542,28 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
             try error.check()
             if case .tokens(let remaining) = prepared {
-                _ = model(remaining[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: nil)
+                _ = try model.generationForward(remaining[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: nil)
                 try error.check()
             }
             MLX.eval(cache)
             try error.check()
         }
     }
+
+#if canImport(Darwin)
+    private func captureActiveSpillPrefix(
+        _ prefix: ActiveKVSpillPrefixCache, tokenCount: Int, step: Int
+    ) throws {
+        do {
+            try prefix.capture(
+                model: model, tokens: Array(promptTokenIds.prefix(tokenCount)), step: step,
+                salt: mediaSalt, cache: cache)
+        } catch {
+            try Task.checkCancellation()
+            Self.logger.warning("Active SSD KV prefix capture failed; generation can continue without reuse")
+        }
+    }
+#endif
 
     /// A hybrid-pool cache with no recurrent state (DeepSeek-V4 / V4.1): its
     /// stable system / tool boundaries are captured while prefill crosses them,
@@ -3683,7 +3759,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
             // evaluate the remainder of the prompt -- this primes the pump
             let result = try withError { error in
-                let result = forwardUncompiled(previous: y)
+                let result = try forwardUncompiled(previous: y)
                 // The remainder projection is part of preparation too. Check
                 // its originating MLX error before indexing its output array.
                 try error.check()
@@ -3916,7 +3992,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     /// Evaluate the next token and return the new token (y), updating cache state
-    mutating func step(previous: LMInput.Text) -> MLXArray {
+    mutating func step(previous: LMInput.Text) throws -> MLXArray {
         if self.compiledForward != nil {
             let input = previous.tokens
             var compiledInputs = [input]
@@ -3950,18 +4026,18 @@ public struct TokenIterator: TokenIteratorProtocol {
             self.compiledExternalInputModel = nil
         }
 
-        return sampleUncompiledResult(forwardUncompiled(previous: previous))
+        return try sampleUncompiledResult(forwardUncompiled(previous: previous))
     }
 
-    private func forwardUncompiled(previous: LMInput.Text) -> LMOutput {
+    private func forwardUncompiled(previous: LMInput.Text) throws -> LMOutput {
         // Models expect [B, L] input. If the caller passed 1D tokens [L], add a batch
         // axis. If they passed 2D [B, L] already (some VLM bench/test paths), use as-is —
         // adding another newAxis would produce 3D and break QuantizedLinear matmul on
         // pure-LLM model paths (Llama, Mistral, Phi, etc).
         let stepInput: LMInput.Text =
             previous.tokens.ndim == 1 ? previous[text: .newAxis] : previous
-        return MLXPressGenerationProfile.time("decode.model_forward") {
-            model(stepInput, cache: cache.isEmpty ? nil : cache, state: state)
+        return try MLXPressGenerationProfile.time("decode.model_forward") {
+            try model.generationForward(stepInput, cache: cache.isEmpty ? nil : cache, state: state)
         }
     }
 
@@ -3999,8 +4075,16 @@ public struct TokenIterator: TokenIteratorProtocol {
             return previousY.tokens.item(Int.self)
         }
 
-        let token = MLXPressGenerationProfile.time("decode.step_build") {
-            step(previous: previousY)
+        let token: MLXArray
+        do {
+            token = try MLXPressGenerationProfile.time("decode.step_build") {
+                try step(previous: previousY)
+            }
+        } catch {
+            if !(error is CancellationError) {
+                generationFailure = GenerationFailure(stage: .decoding, cause: error.localizedDescription)
+            }
+            return nil
         }
         y = .init(tokens: token)
 
@@ -6354,7 +6438,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                         ? GenerationFailure(
                             stage: .decoding,
                             cause: "Structured output stopped before its schema was complete")
-                        : nil)
+                        : nil),
+                activeKVSpillUsage: iterator.activeKVSpillUsage
             )
             _ = continuation.yield(handler.infoEvent(info))
             if RuntimeReceipts.isEnabled {
@@ -6521,6 +6606,7 @@ public struct GenerateCompletionInfo: Sendable {
     /// metadata as a successful or user-cancelled completion. The legacy stop
     /// reason remains cancelled for source compatibility with older consumers.
     public let generationFailure: GenerationFailure?
+    public let activeKVSpillUsage: ActiveKVSpillUsage?
 
     /// The number of tokens processed per second during the prompt phase.
     ///
@@ -6555,7 +6641,8 @@ public struct GenerateCompletionInfo: Sendable {
         nativeMTPStats: NativeMTPGenerationStats? = nil,
         dflash2Stats: DFlash2GenerationStats? = nil,
         toolCallProtocolFailure: ToolCallProtocolFailure? = nil,
-        generationFailure: GenerationFailure? = nil
+        generationFailure: GenerationFailure? = nil,
+        activeKVSpillUsage: ActiveKVSpillUsage? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
@@ -6569,6 +6656,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.nativeMTPStats = nativeMTPStats
         self.dflash2Stats = dflash2Stats
         self.generationFailure = generationFailure
+        self.activeKVSpillUsage = activeKVSpillUsage
     }
 
     public func summary() -> String {

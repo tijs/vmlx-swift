@@ -155,7 +155,17 @@ public struct Inkling2LoopConfiguration: Decodable, Sendable {
 
 /// Chronological K/V for one execution visit. The absolute offset includes
 /// evicted positions and remains independent for each pass through the loop.
-public final class Inkling2VisitCache: BaseKVCache {
+public final class Inkling2VisitCache: BaseKVCache, ActiveKVSpillCache {
+#if canImport(Darwin)
+    fileprivate var spillHistory: ActiveKVSpillHistory?
+#endif
+    package var usesActiveKVSpill: Bool {
+#if canImport(Darwin)
+        spillHistory != nil
+#else
+        false
+#endif
+    }
     private var keys: MLXArray?, values: MLXArray?
     private let window: Int?
     // A copied prefix keeps the arithmetic selected for its prefill step.
@@ -180,7 +190,12 @@ public final class Inkling2VisitCache: BaseKVCache {
     // Generic chunked prefill evaluates the cache through Evaluatable, not
     // through its serialized state getter. Include every owned backing array.
     public override func innerState() -> [MLXArray] {
-        [keys, values].compactMap { $0 } + convolutions.compactMap { $0 }
+#if canImport(Darwin)
+        if let spillHistory {
+            return spillHistory.residentState + convolutions.compactMap { $0 }
+        }
+#endif
+        return [keys, values].compactMap { $0 } + convolutions.compactMap { $0 }
     }
     override public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         if indexedHistory {
@@ -429,7 +444,7 @@ final class InklingAttention: Module {
         }
         super.init()
     }
-    func callAsFunction(_ x: MLXArray, keyInput: MLXArray, valueInput: MLXArray, cache: Inkling2VisitCache?) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, keyInput: MLXArray, valueInput: MLXArray, cache: Inkling2VisitCache?) throws -> MLXArray {
         let b=x.dim(0), n=x.dim(1), dtype=x.dtype
         let key = local ? (keyConvolution as! InklingShortConvolution)(k(keyInput),cache) : (keyConvolution as! InklingDynamicConvolution)(k(keyInput),input:keyInput,cache:cache)
         let val = local ? (valueConvolution as! InklingShortConvolution)(v(valueInput),cache) : (valueConvolution as! InklingDynamicConvolution)(v(valueInput),input:valueInput,cache:cache)
@@ -446,22 +461,48 @@ final class InklingAttention: Module {
             relative=(relative.asType(.float32)*tau.reshaped([1,n,1,1])).asType(dtype)
         }
         query=query.transposed(0,2,1,3)
-        var keys=keyClipped.transposed(0,2,1,3)
+        let keys=keyClipped.transposed(0,2,1,3)
         value=value.transposed(0,2,1,3)
-        if let cache { (keys,value)=cache.update(keys:keys,values:value) }
-        let count=keys.dim(2)
-        // Mask distances are relative to the oldest returned key. Position
-        // scaling above still uses the absolute offset, including evictions.
-        let mask=inklingBandedMask(relative:relative,projection:relProjection.asType(dtype),offset:count-n,count:count,window:local ? t.window:0,extent:extent)
         let sinks=sink(x).transposed(0,2,1).expandedDimensions(axis:-1)
-        let additive=concatenated([mask,sinks],axis:-1)
-        keys=concatenated([keys,.zeros([b,kvHeads,1,dim],dtype:dtype)],axis:2)
-        value=concatenated([value,.zeros([b,kvHeads,1,dim],dtype:dtype)],axis:2)
-        var output=MLXFast.scaledDotProductAttention(queries:query,keys:keys,values:value,scale:1/sqrt(Float(dim)),mask:.array(additive))
+        let projection = relProjection.asType(dtype)
+        var output: MLXArray
+#if canImport(Darwin)
+        if let cache, let history = cache.spillHistory {
+            output = try inklingSpilledAttention(
+                queries: query, keys: keys, values: value, relative: relative,
+                projection: projection, sinks: sinks, history: history, extent: extent)
+            cache.offset = history.count
+        } else {
+            output = residentAttention(
+                query: query, keys: keys, values: value, relative: relative,
+                projection: projection, sinks: sinks, cache: cache)
+        }
+#else
+        output = residentAttention(
+            query: query, keys: keys, values: value, relative: relative,
+            projection: projection, sinks: sinks, cache: cache)
+#endif
         output=output.transposed(0,2,1,3).reshaped([b,n,heads*dim])
         output=(output.asType(.float32)*sigmoid(gate(x).asType(.float32))).asType(dtype)
         return o(output)
     }
+
+    private func residentAttention(
+        query: MLXArray, keys: MLXArray, values: MLXArray, relative: MLXArray,
+        projection: MLXArray, sinks: MLXArray, cache: Inkling2VisitCache?
+    ) -> MLXArray {
+        let (keys, values) = cache?.update(keys: keys, values: values) ?? (keys, values)
+        let count = keys.dim(2)
+        let mask = inklingBandedMask(
+            relative: relative, projection: projection, offset: count - query.dim(2),
+            count: count, window: local ? t.window : 0, extent: extent)
+        let zero = MLXArray.zeros([query.dim(0), kvHeads, 1, dim], dtype: values.dtype)
+        return MLXFast.scaledDotProductAttention(
+            queries: query, keys: concatenated([keys, zero], axis: 2),
+            values: concatenated([values, zero], axis: 2), scale: 1 / sqrt(Float(dim)),
+            mask: .array(concatenated([mask, sinks], axis: -1)))
+    }
+
 }
 
 func inklingBandedMask(relative: MLXArray, projection: MLXArray, offset: Int, count: Int, window: Int, extent: Int) -> MLXArray {
@@ -608,14 +649,14 @@ final class InklingDecoderLayer:Module {
         }
         super.init()
     }
-    func callAsFunction(_ x:MLXArray,blocks:inout [MLXArray],cache:Inkling2VisitCache?,messages:MLXArray?)->MLXArray {
+    func callAsFunction(_ x:MLXArray,blocks:inout [MLXArray],cache:Inkling2VisitCache?,messages:MLXArray?) throws -> MLXArray {
         let mixed=attentionInput?(blocks,x,sharedDepth: cache?.sharedDepth ?? false) ?? x.expandedDimensions(axis:-2)
         var parts=(0..<3).map { mixed[.ellipsis,min($0,mixed.dim(-2)-1),0...] }
         if let messages {
             parts=zip(parts,[qMessage!,kMessage!,vMessage!]).enumerated().map { i,pair in pair.1(pair.0,messages[.ellipsis,i,0...]) }
         }
         let normalized=zip(parts,local ? [localNorm!,localNorm!,localNorm!]:[qNorm!,kNorm!,vNorm!]).map { $0.1($0.0).asType(x.dtype) }
-        let a=attention(normalized[0],keyInput:normalized[1],valueInput:normalized[2],cache:cache)
+        let a=try attention(normalized[0],keyInput:normalized[1],valueInput:normalized[2],cache:cache)
         var residual=attnConv(a,cache).asType(.float32)
         if boundary { blocks.append(x) } else { residual=residual+x.asType(.float32) }
         var h=mlpInput(blocks,residual,sharedDepth: cache?.sharedDepth ?? false)[.ellipsis,0,0...]
@@ -648,7 +689,7 @@ final class InklingTextModel:Module {
         _finalInput.wrappedValue=InklingAttentionResidual(t);_norm.wrappedValue=RMSNorm(dimensions:t.hidden,eps:t.eps)
         _messageInput.wrappedValue=InklingMessageAttention(t);super.init()
     }
-    func callAsFunction(_ input:MLXArray,cache:[KVCache]?)->MLXArray {
+    func callAsFunction(_ input:MLXArray,cache:[KVCache]?) throws -> MLXArray {
         let sharedDepth = (cache?.first as? Inkling2VisitCache)?.sharedDepth ?? false
         var x=embedNorm(embed(input)),blocks:[MLXArray]=[]
         var preLoop:(MLXArray,[MLXArray])?,previous:([MLXArray],MLXArray)?
@@ -663,7 +704,7 @@ final class InklingTextModel:Module {
             if let previous, physical<t.loop.coreEnd {
                 messages=messageInput(previous.0,previous.1,layer:physical-t.loop.coreStart,sharedDepth:sharedDepth)
             } else { messages=nil }
-            x=layers[physical](x,blocks:&blocks,cache:cache?[visit] as? Inkling2VisitCache,messages:messages)
+            x=try layers[physical](x,blocks:&blocks,cache:cache?[visit] as? Inkling2VisitCache,messages:messages)
         }
         return norm(finalInput(blocks,x,sharedDepth:sharedDepth)[.ellipsis,0,0...]).asType(embedNorm.weight.dtype)
     }
@@ -708,8 +749,21 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
     public init(_ configuration:Inkling2LoopConfiguration) {
         self.configuration=configuration;_language.wrappedValue=InklingLanguageModel(configuration);super.init()
     }
-    public func callAsFunction(_ inputs:MLXArray,cache:[KVCache]?)->MLXArray {
-        let h=language.model(inputs,cache:cache).asType(.float32)
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        precondition(cache?.contains { ($0 as? Inkling2VisitCache)?.usesActiveKVSpill == true } != true,
+                     "Inkling SSD KV requires generationForward")
+        // The resident path performs no fallible spill I/O.
+        return try! forward(inputs, cache: cache)
+    }
+
+    public func generationForward(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) throws -> LMOutput {
+        LMOutput(logits: try forward(input.tokens, cache: cache))
+    }
+
+    private func forward(_ inputs: MLXArray, cache: [KVCache]?) throws -> MLXArray {
+        let h = try language.model(inputs, cache: cache).asType(.float32)
         // The reference retains one FP32 head projection; repeatedly promoting
         // the full vocabulary table would rematerialize ~1.85GB every token.
         var logits: MLXArray
@@ -762,6 +816,32 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
         let sharedDepth = Self.useSharedDepth(policy: Self.depthPolicy, step: parameters?.prefillStepSize)
         return makeVisitCaches(bounded: boundedLocalKV, sharedDepth: sharedDepth, indexedHistory: indexedHistory)
     }
+
+#if canImport(Darwin)
+    /// Private live history for an admitted eager request. The caller reserves
+    /// the complete request's disk allowance before creating the visit caches.
+    public func newSpillCache(
+        parameters: GenerateParameters?, directory: URL, pageTokens: Int, byteLimit: Int
+    ) throws -> [KVCache] {
+        let globalVisits = configuration.text.schedule.filter { !configuration.text.sliding($0) }.count
+        guard globalVisits > 0, pageTokens > 0, byteLimit >= globalVisits else {
+            throw GenerationFailure(stage: .preparation, cause: "Invalid Inkling SSD KV allowance")
+        }
+        let sharedDepth = Self.useSharedDepth(policy: Self.depthPolicy, step: parameters?.prefillStepSize)
+        return configuration.text.schedule.map { physical in
+            if configuration.text.sliding(physical) {
+                let visit = Inkling2VisitCache(window: configuration.text.window)
+                visit.sharedDepth = sharedDepth
+                return visit
+            }
+            let visit = Inkling2VisitCache()
+            visit.sharedDepth = sharedDepth
+            visit.spillHistory = ActiveKVSpillHistory(
+                directory: directory, pageTokens: pageTokens, byteLimit: byteLimit / globalVisits)
+            return visit
+        }
+    }
+#endif
 
     private static let depthPolicy = ProcessInfo.processInfo.environment["VMLX_INKLING_DEPTH_MIX"]
 
@@ -822,3 +902,38 @@ public final class Inkling2LoopModel:Module,LLMModel,KVCacheDimensionProvider,Th
 extension Inkling2LoopModel: AlignedVisitPrefixModel {
     public var alignedVisitPrefixLength: Int { 1024 }
 }
+
+#if canImport(Darwin)
+extension Inkling2LoopModel: ActiveKVSpillModel {
+    public var activeKVSpillGeometry: ActiveKVSpillGeometry? {
+        let text = configuration.text
+        let local = text.schedule.filter { text.sliding($0) }.count
+        let global = text.schedule.count - local
+        guard global > 0 else { return nil }
+        // Four bytes per element also covers float32 model exports.
+        let globalToken = text.kvHeads * text.headDim * 2 * 4
+        let localToken = text.localKVHeads * text.localHeadDim * 2 * 4
+        // Stage several 128-token attention reductions in one disk read.
+        let page = 1024
+        let step = 128
+        let localBytes = localToken * (text.window + step) * local
+        let pageAndStaging = globalToken * page * (global + 6)
+        let scoreTile = text.heads * step * page * MemoryLayout<Float>.size * 4
+        return ActiveKVSpillGeometry(
+            pageTokens: page, prefillStepSize: step, diskBytesPerToken: globalToken * global,
+            residentBytesPerToken: 0, fixedResidentBytes: localBytes + pageAndStaging + scoreTile)
+    }
+}
+#endif
+
+#if canImport(Darwin)
+extension Inkling2VisitCache: ActiveKVSpillPrefixLayer {
+    package var activeKVSpillHistory: ActiveKVSpillHistory? { spillHistory }
+
+    package func prefixCopy(spillHistory: ActiveKVSpillHistory) -> any KVCache {
+        let saved = copy() as! Inkling2VisitCache
+        saved.spillHistory = spillHistory
+        return saved
+    }
+}
+#endif

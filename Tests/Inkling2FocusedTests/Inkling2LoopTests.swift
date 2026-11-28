@@ -3,6 +3,7 @@ import MLX
 import MLXFast
 import MLXLMCommon
 import MLXNN
+import os
 import XCTest
 @testable import MLXLLM
 
@@ -26,6 +27,82 @@ final class Inkling2LoopTests: XCTestCase {
     }
     func config() throws -> Inkling2LoopConfiguration { try JSONDecoder().decode(Inkling2LoopConfiguration.self,from:configurationData()) }
     func difference(_ a:MLXArray,_ b:MLXArray)->Float { max(abs(a.asType(.float32)-b.asType(.float32))).item(Float.self) }
+#if canImport(Darwin)
+    func testInklingSpilledAttentionThroughFullModelPreservesVisitLogits() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = Inkling2LoopModel(try config())
+            let resident = model.newCache(parameters: nil)
+            let spilled = try model.newSpillCache(
+                parameters: nil, directory: FileManager.default.temporaryDirectory,
+                pageTokens: 2, byteLimit: 65536)
+            for tokens in [[1, 3, 5], [7, 9], [11]] {
+                let input = MLXArray(tokens).expandedDimensions(axis: 0)
+                let expected = model(input, cache: resident)
+                let actual = try model.generationForward(.init(tokens: input), cache: spilled, state: nil)
+                XCTAssertLessThan(difference(expected, actual.logits), 0.001)
+                XCTAssertEqual(spilled.map(\.offset), resident.map(\.offset))
+            }
+        }
+    }
+
+    func testSpilledPrefixRestoresCompleteChunksFromAnUnalignedSeed() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = Inkling2LoopModel(try config())
+            let parameters = GenerateParameters(maxTokens: 2, temperature: 0, prefillStepSize: 2)
+            let prefixCache = ActiveKVSpillPrefixCache(maxResidentBytes: 1 << 20)
+            func freshCache() throws -> [KVCache] {
+                try model.newSpillCache(
+                    parameters: parameters, directory: FileManager.default.temporaryDirectory,
+                    pageTokens: 2, byteLimit: 65536)
+            }
+            let seed = [1, 3, 5, 7, 9]
+            var previous = try TokenIterator(
+                input: LMInput(tokens: MLXArray(seed)), model: model, cache: freshCache(),
+                parameters: parameters, activeSpillPrefixCache: prefixCache)
+            _ = previous.next()
+            _ = previous.next()
+
+            let extensionPrompt = seed + [11, 13]
+            let restored = OSAllocatedUnfairLock(initialState: 0)
+            var warm = try TokenIterator(
+                input: LMInput(tokens: MLXArray(extensionPrompt)), model: model, cache: freshCache(),
+                parameters: parameters,
+                prefillProgressHandler: { progress in
+                    if progress.stage == .cacheRestore {
+                        restored.withLock { $0 = progress.completedUnitCount }
+                    }
+                }, activeSpillPrefixCache: prefixCache)
+            var cold = try TokenIterator(
+                input: LMInput(tokens: MLXArray(extensionPrompt)), model: model, cache: freshCache(),
+                parameters: parameters)
+            XCTAssertEqual(restored.withLock { $0 }, 4)
+            XCTAssertEqual(warm.next(), cold.next())
+            XCTAssertEqual(warm.next(), cold.next())
+            let warmUsage = try XCTUnwrap(warm.activeKVSpillUsage)
+            let coldUsage = try XCTUnwrap(cold.activeKVSpillUsage)
+            XCTAssertLessThan(warmUsage.bytesWritten, coldUsage.bytesWritten)
+            XCTAssertGreaterThan(warmUsage.prefillBytesRead, 0)
+        }
+    }
+
+    func testInklingSpilledAttentionTurnsIOFailureIntoTerminalGenerationFailure() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = Inkling2LoopModel(try config())
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let parameters = GenerateParameters(maxTokens: 3, temperature: 0)
+            let cache = try model.newSpillCache(
+                parameters: parameters, directory: directory, pageTokens: 2, byteLimit: 65536)
+            var iterator = try TokenIterator(
+                input: LMInput(tokens: MLXArray([1])), model: model,
+                cache: cache, parameters: parameters)
+            XCTAssertNil(iterator.next())
+            XCTAssertEqual(iterator.generationFailure?.stage, .decoding)
+            XCTAssertTrue(iterator.generationFailure?.cause.contains("open live KV spill file") == true)
+            XCTAssertNil(iterator.next())
+        }
+    }
+#endif
+
     // Generated from the pinned authored Python primitives and separately
     // cross-checked against NumPy; fixture is not a Swift self-oracle.
     func testAuthoredMessageGateAndAttentionResidualGolden() throws {

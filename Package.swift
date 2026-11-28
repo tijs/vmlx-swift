@@ -887,6 +887,8 @@ let package = Package(
             dependencies: ["MLX", "MLXLMCommon", "MLXLLM", "MLXVLM", "VMLXJinja", "VMLX"],
             path: "Tests/MLXLMCommonFocusedTests",
             sources: [
+                "ActiveKVSpillFileTests.swift",
+                "KVTileSoftmaxTests.swift",
                 "MultiRowDecodeAttentionTests.swift",
                 "ProposalHeadStampTests.swift",
                 "DFlash2TreeAndTopKAcceptanceTests.swift",

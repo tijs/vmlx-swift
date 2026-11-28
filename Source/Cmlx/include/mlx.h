@@ -2,3 +2,4 @@
 #include "mlx/c/transforms_impl.h"
 #include "mlx/c/linalg.h"
 #include "mlx/c/fast.h"
+#include "vmlx_inkling_metal.h"

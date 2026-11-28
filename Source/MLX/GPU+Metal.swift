@@ -72,6 +72,30 @@ public enum GPU {
         }
     }
 
+    package static func inklingPagedPrefillPipeline(
+        alignedQueries: Bool, alignedKeys: Bool
+    ) throws -> (any MTLComputePipelineState)? {
+        try withError { error in
+            let raw = vmlx_inkling_paged_prefill_pipeline(alignedQueries, alignedKeys)
+            try error.check()
+            guard let raw else { return nil }
+            return Unmanaged<AnyObject>.fromOpaque(raw).takeUnretainedValue() as? any MTLComputePipelineState
+        }
+    }
+
+    package static func inklingPagedVectorMerge(
+        partials: MLXArray, sums: MLXArray, maxima: MLXArray
+    ) throws -> MLXArray {
+        try withError { error in
+            var result = mlx_array_new()
+            vmlx_inkling_paged_vector_merge(
+                &result, partials.ctx, sums.ctx, maxima.ctx, StreamOrDevice.default.ctx)
+            let output = MLXArray(result)
+            try error.check()
+            return output
+        }
+    }
+
     /// Return a snapshot of memory stats -- see ``Memory/Snapshot`` for more details.
     ///
     /// Get the current memory use.  This can be used to measure before/after and current memory use:

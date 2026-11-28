@@ -75,7 +75,7 @@ extension LLMModel {
                 let chunkTokens = flatTokens[..<prefillStepSize][.newAxis, 0...]
                 let chunkMask = flatMask.map { $0[..<prefillStepSize] }
                 let chunkText = LMInput.Text(tokens: chunkTokens, mask: chunkMask)
-                _ = self(chunkText, cache: cache.isEmpty ? nil : cache, state: nil)
+                _ = try generationForward(chunkText, cache: cache.isEmpty ? nil : cache, state: nil)
                 try error.check()
                 MLX.eval(cache)
                 try error.check()

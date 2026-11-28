@@ -88,6 +88,11 @@ template <
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
     const device T* sinks [[buffer(7), function_constant(has_sinks)]],
     device float* lse [[buffer(8), function_constant(save_lse)]],
+#ifdef VMLX_PAGED_STEEL_ATTENTION
+    const device float* prior_state [[buffer(9)]],
+    device float* next_state [[buffer(10)]],
+    const constant uint& page_phase [[buffer(11)]],
+#endif
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -330,6 +335,35 @@ template <
       sum_score[i] = 1;
     }
   }
+
+#ifdef VMLX_PAGED_STEEL_ATTENTION
+  constexpr int state_columns = kFragSize / MMAFrag_acc_t::kElemCols;
+  const int state_stride = BV + 2 * state_columns;
+  // The native row reductions remain in lane-local registers.
+  const int state_col = sn / MMAFrag_acc_t::kElemCols;
+  const ulong state_offset =
+      ((tidl.z * params->H + tidl.y) * params->qL + tidl.x * BQ) * state_stride;
+  const bool partial_q = !align_Q && int(tid.x) == params->NQ_aligned;
+  const int tile_rows = partial_q ? params->qL_rem : BQ;
+  const int first_row = tm + sm;
+  if ((page_phase & 1u) && first_row < tile_rows) {
+    const device float* tile =
+        prior_state + state_offset + first_row * state_stride + d_half * BVh + sn;
+    if (partial_q) {
+      Otile.template load_safe<float, 1, 1>(tile, state_stride,
+          short2(BVh - sn, tile_rows - first_row));
+    } else {
+      Otile.template load<float, 1, 1>(tile, state_stride);
+    }
+    for (int row = 0; row < kRowsPT; ++row) {
+      const int r = first_row + row * decltype(Stile)::kFragRows;
+      if (r < tile_rows) {
+        max_score[row] = prior_state[state_offset + r * state_stride + BV + state_col];
+        sum_score[row] = prior_state[state_offset + r * state_stride + BV + state_columns + state_col];
+      }
+    }
+  }
+#endif
 
   // Loop over KV seq length
   for (int kb = kb_start; kb < kb_lim; kb++) {
@@ -584,6 +618,31 @@ template <
     loader_k.next();
     loader_v.next();
   }
+
+#ifdef VMLX_PAGED_STEEL_ATTENTION
+  if (page_phase & 2u) {
+    if (first_row < tile_rows) {
+      device float* tile =
+          next_state + state_offset + first_row * state_stride + d_half * BVh + sn;
+      if (partial_q) {
+        Otile.template store_safe<float, 1, 1>(tile, state_stride,
+            short2(BVh - sn, tile_rows - first_row));
+      } else {
+        Otile.template store<float, 1, 1>(tile, state_stride);
+      }
+      if (d_half == 0) {
+        for (int row = 0; row < kRowsPT; ++row) {
+          const int r = first_row + row * decltype(Stile)::kFragRows;
+          if (r < tile_rows) {
+            next_state[state_offset + r * state_stride + BV + state_col] = max_score[row];
+            next_state[state_offset + r * state_stride + BV + state_columns + state_col] = sum_score[row];
+          }
+        }
+      }
+    }
+    return;
+  }
+#endif
 
   // Normalize output
   Otile.template row_bin_op<DivOp>(sum_score);

@@ -27,7 +27,7 @@ final class InklingLayerProbeTests: XCTestCase {
             stages["01-mixed"] = mixed
             let normalized = layer.localNorm!(mixed[.ellipsis, 0, 0...]).asType(x.dtype)
             stages["02-normalized"] = normalized
-            let attn = layer.attention(normalized, keyInput: normalized, valueInput: normalized, cache: nil)
+            let attn = try layer.attention(normalized, keyInput: normalized, valueInput: normalized, cache: nil)
             stages["03-attention"] = attn
             let conv = layer.attnConv(attn, nil)
             stages["04-attn-convolution"] = conv
@@ -53,7 +53,7 @@ final class InklingLayerProbeTests: XCTestCase {
             let result = (residual + mlpConv.asType(.float32)).asType(x.dtype)
             stages["14-result"] = result
             var blocks = [block]
-            let ordinary = layer(x, blocks: &blocks, cache: nil, messages: nil)
+            let ordinary = try layer(x, blocks: &blocks, cache: nil, messages: nil)
             eval(result, ordinary)
             XCTAssertEqual(max(abs(result.asType(.float32)-ordinary.asType(.float32))).item(Float.self), 0)
             try save(arrays: stages, url: output.appendingPathComponent("layer-stages.safetensors"))

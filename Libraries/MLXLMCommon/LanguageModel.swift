@@ -548,6 +548,12 @@ public protocol LanguageModel: Module {
     func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
 
+    /// Eager single-request forward for backends that can fail during I/O.
+    /// The default uses the existing resident forward. Compiled and speculative
+    /// callers use the regular forward and cannot consume storage-backed caches.
+    func generationForward(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?) throws
+        -> LMOutput
+
     /// Models may implement this simplified interface if they do not produce any ``LMOutput/State``
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
 
@@ -598,6 +604,12 @@ extension LanguageModel {
     public var maximumSupportedDecodeBatchSize: Int? { nil }
 
     public var recommendedPrefillStepSize: Int? { nil }
+
+    public func generationForward(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) throws -> LMOutput {
+        self(input, cache: cache, state: state)
+    }
 
     public func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput

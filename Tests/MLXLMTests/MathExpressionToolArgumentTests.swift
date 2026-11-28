@@ -57,6 +57,8 @@ struct MathExpressionToolArgumentTests {
     static func wire(_ format: ToolCallFormat, _ e: String) -> String {
         let jsonArgs = "{\"expression\": \(jsonString(e))}"
         switch format {
+        case .inkling2:
+            return "<|message_model|>calculate<|content_invoke_tool_json|>{\"name\":\"calculate\",\"args\":\(jsonArgs)}<|end_message|>"
         case .json:
             return "<tool_call>{\"name\": \"calculate\", \"arguments\": \(jsonArgs)}</tool_call>"
         case .mimo:

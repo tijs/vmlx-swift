@@ -70,7 +70,7 @@ final class InklingFullWeightProbeTests: XCTestCase {
                         messages = text.messageInput(previous.0, previous.1, layer: physical - t.loop.coreStart)
                     } else { messages = nil }
                     captures[String(format: "visit-%02d", visit)] = x
-                    x = text.layers[physical](x, blocks: &blocks,
+                    x = try text.layers[physical](x, blocks: &blocks,
                         cache: traceCache[visit] as? Inkling2VisitCache, messages: messages)
                 }
                 let prehead = text.norm(text.finalInput(blocks, x)[.ellipsis, 0, 0...])
